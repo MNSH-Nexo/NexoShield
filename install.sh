@@ -3847,7 +3847,14 @@ BAN_CONN_THRESHOLD=300  # active connections from one IP = immediate throttle+ba
 OBSERVE_SECONDS=45    # seconds to watch before throttle (tolerates legit spikes)
 THROTTLE_MBPS=100    # throttle bandwidth in Mbps (must match tc class 1:30 = 100mbit)
 BAN_HOURS=4          # hours to ban after throttle
-SAMPLE_INTERVAL=4    # seconds per measurement
+# Sample cadence. 2s (was 4s): churn rate is already normalized per-second, so
+# scoring bands are unchanged, but short <4s bursts from a 120+ conn IP are now
+# caught instead of being averaged out. Recovery of well-behaved IPs is also 2x
+# faster. The CONN_THRESHOLD=120 gate means normal users are never touched.
+# (One-way bytes tracking was deliberately NOT added: on a SOCKS5/tunnel proxy,
+# server→client relay makes "sent>>received" the NORMAL heavy-download pattern,
+# so it would false-positive on legitimate heavy users.)
+SAMPLE_INTERVAL=2    # seconds per measurement
 
 # ── Subnet /24 botnet detection ──────────────────────────────
 # Botnet distributes connections across many IPs in same /24 subnet.
