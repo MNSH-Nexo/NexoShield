@@ -1541,13 +1541,18 @@ show_stats() {
     OUT_B=$(iptables -L OUTPUT -v -n -x 2>/dev/null | grep "3proxy_stats_out" | awk '{print $2}' | head -1)
 
     _fmt() {
-        local b=${1:-0}
-        [ "$b" -ge 1073741824 ] 2>/dev/null && { echo "$(echo "scale=2; $b/1073741824" | bc) GB"; return; }
-        [ "$b" -ge 1048576 ]    2>/dev/null && { echo "$(echo "scale=2; $b/1048576" | bc) MB"; return; }
-        echo "${b:-0} B"
+        # Format bytes without depending on `bc` (absent on some systems → used to show blank)
+        awk -v n="${1:-0}" 'BEGIN{
+            if (n>=1073741824) printf "%.2f GB\n", n/1073741824;
+            else if (n>=1048576) printf "%.2f MB\n", n/1048576;
+            else if (n>=1024) printf "%.2f KB\n", n/1024;
+            else printf "%d B\n", n;
+        }'
     }
-    echo -e "  Traffic in  : ${GREEN}$(_fmt "$OUT_B")${NC}"
-    echo -e "  Traffic out : ${GREEN}$(_fmt "$IN_B")${NC}"
+    # 3proxy_stats_in  = bytes clients SENT to proxy (upload)
+    # 3proxy_stats_out = bytes proxy   SENT to clients (download)
+    echo -e "  Download (proxy -> client): ${GREEN}$(_fmt "$OUT_B")${NC}"
+    echo -e "  Upload   (client -> proxy): ${GREEN}$(_fmt "$IN_B")${NC}"
 
     # tc stats
     MAIN_IF=$(ip route show default 2>/dev/null | awk '/default/{print $5}' | head -1)
@@ -2322,15 +2327,20 @@ _proxy_stats() {
     echo -e "  Active connections: ${G}$ACTIVE${NC}"
 
     _fmt() {
-        local b=${1:-0}
-        [ "$b" -ge 1073741824 ] 2>/dev/null && { echo "$(echo "scale=2; $b/1073741824" | bc) GB"; return; }
-        [ "$b" -ge 1048576 ]    2>/dev/null && { echo "$(echo "scale=2; $b/1048576" | bc) MB"; return; }
-        echo "${b:-0} B"
+        # Format bytes without depending on `bc` (absent on some systems → used to show blank)
+        awk -v n="${1:-0}" 'BEGIN{
+            if (n>=1073741824) printf "%.2f GB\n", n/1073741824;
+            else if (n>=1048576) printf "%.2f MB\n", n/1048576;
+            else if (n>=1024) printf "%.2f KB\n", n/1024;
+            else printf "%d B\n", n;
+        }'
     }
     IN_B=$(iptables -L INPUT -v -n -x 2>/dev/null | grep "3proxy_stats_in" | awk '{print $2}' | head -1)
     OUT_B=$(iptables -L OUTPUT -v -n -x 2>/dev/null | grep "3proxy_stats_out" | awk '{print $2}' | head -1)
-    echo -e "  Traffic in  : ${G}$(_fmt "$IN_B")${NC}"
-    echo -e "  Traffic out : ${G}$(_fmt "$OUT_B")${NC}"
+    # 3proxy_stats_in  = bytes clients SENT to proxy (upload)
+    # 3proxy_stats_out = bytes proxy   SENT to clients (download)
+    echo -e "  Download (proxy -> client): ${G}$(_fmt "$OUT_B")${NC}"
+    echo -e "  Upload   (client -> proxy): ${G}$(_fmt "$IN_B")${NC}"
 
     # Banned IPs (auto-ban)
     if [ -f /var/log/auto-ban.log ]; then
