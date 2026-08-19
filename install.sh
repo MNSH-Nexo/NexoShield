@@ -1365,15 +1365,6 @@ EOF
 uninstall_proxy() {
     sep; echo -e "${RED}Removing 3proxy...${NC}"; sep
 
-    # ── Confirm ───────────────────────────────────────────
-    # When called from the main menu, confirmation already happened, so
-    # UNINSTALL_CONFIRMED=1 skips this second prompt (which otherwise
-    # reads nothing and times out into "Cancelled.").
-    if [ "${UNINSTALL_CONFIRMED:-0}" != "1" ]; then
-        read -t 30 -rp "Are you sure? (y/N): " CONF_C < /dev/tty 2>/dev/null || CONF_C=""
-        [[ "$CONF_C" != "y" && "$CONF_C" != "Y" ]] && echo "Cancelled." && return
-    fi
-
     echo -e "${YELLOW}Stopping services...${NC}"
 
     # ── Stop & disable 3proxy ─────────────────────────────
@@ -1616,7 +1607,8 @@ while true; do
     printf '%s' "  Enter choice: " >/dev/tty; read -r CH </dev/tty || CH=""
     case "$CH" in
         1) install_proxy; printf '%s\n' "  Press Enter to continue..." >/dev/tty; read -r _PE </dev/tty 2>/dev/null || true ;;
-        2) uninstall_proxy ;;
+        2) printf '%s' "  Remove 3proxy completely? (y/N): " >/dev/tty; read -r _RC2 </dev/tty || _RC2=""
+           [[ "$_RC2" == "y" || "$_RC2" == "Y" ]] && uninstall_proxy || echo -e "  ${DIM}Cancelled.${NC}" ;;
         3) systemctl stop 3proxy 2>/dev/null && \
                echo -e "${GREEN}Stopped${NC}" || \
                echo -e "${RED}Error stopping${NC}"; sleep 1 ;;
@@ -2284,7 +2276,7 @@ menu_proxy() {
             1) bash "$PROXY_SCRIPT" --install < /dev/tty; press_enter ;;
             2) echo ""
                printf '%s' "  Remove 3proxy completely? (y/N): " >/dev/tty; read -r _RC </dev/tty || _RC=""
-               [[ "$_RC" == "y" || "$_RC" == "Y" ]] && UNINSTALL_CONFIRMED=1 bash "$PROXY_SCRIPT" --remove < /dev/tty || echo -e "  ${DIM}Cancelled.${NC}"
+               [[ "$_RC" == "y" || "$_RC" == "Y" ]] && bash "$PROXY_SCRIPT" --remove < /dev/tty || echo -e "  ${DIM}Cancelled.${NC}"
                press_enter ;;
             3) bash "$PROXY_SCRIPT" --start; press_enter ;;
             4) bash "$PROXY_SCRIPT" --stop;  press_enter ;;
