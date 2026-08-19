@@ -884,6 +884,7 @@ setup_tc() {
     tc class add dev "$IF" parent 1:1 classid 1:10 htb rate $BW  ceil $BW   burst 25Mb  # CF: unlimited
     tc class add dev "$IF" parent 1:1 classid 1:20 htb rate 500mbit ceil 500mbit burst 6400Kb  # normal
     tc class add dev "$IF" parent 1:1 classid 1:30 htb rate 100mbit ceil 100mbit burst 1280Kb  # throttled
+    tc class add dev "$IF" parent 1:1 classid 1:40 htb rate 50mbit  ceil 50mbit  burst 640Kb   # hard-throttled
 
     # Cloudflare IPs → class 1:10 (unlimited)
     local HANDLE=10
@@ -1693,6 +1694,7 @@ tc class add dev "$IF" parent 1: classid 1:1  htb rate 1gbit ceil 1gbit
 tc class add dev "$IF" parent 1:1 classid 1:10 htb rate 1gbit  ceil 1gbit  burst 25Mb
 tc class add dev "$IF" parent 1:1 classid 1:20 htb rate 500mbit ceil 500mbit burst 6400Kb
 tc class add dev "$IF" parent 1:1 classid 1:30 htb rate 100mbit ceil 100mbit burst 1280Kb
+tc class add dev "$IF" parent 1:1 classid 1:40 htb rate 50mbit  ceil 50mbit  burst 640Kb
 HANDLE=10
 for CF in "${CF_RANGES[@]}"; do
     tc filter add dev "$IF" parent 1: protocol ip prio $HANDLE \
@@ -2099,6 +2101,7 @@ uninstall_proxy() {
     rm -rf "$PROXY_LOG_DIR"
     rm -f  /etc/logrotate.d/3proxy
     rm -rf /etc/antiddos
+    rm -rf /var/lib/antiddos
     rm -f  /var/log/antiddos.log
     rm -f  /tmp/autoban_watch /tmp/autoban_throttle /tmp/autoban_banned 2>/dev/null || true
 
@@ -2409,6 +2412,10 @@ take_snapshot() {
     } > "$SNAPSHOT_PATH/our_keys.txt"
     cp /etc/sysctl.conf "$SNAPSHOT_PATH/sysctl.conf" 2>/dev/null || true
     [ -d /etc/sysctl.d ] && cp -r /etc/sysctl.d "$SNAPSHOT_PATH/sysctl.d" 2>/dev/null || true
+    # Record the exact list of sysctl.d files present at snapshot time.
+    # Used by rollback to remove files that OUR script added after this snapshot,
+    # without touching unrelated system files.
+    ls /etc/sysctl.d/ 2>/dev/null > "$SNAPSHOT_PATH/sysctl_d_list.txt" || true
     cat > "$SNAPSHOT_PATH/meta.txt" << EOF
 SNAPSHOT_ID=$SNAPSHOT_ID
 DATE=$(date)
@@ -2590,7 +2597,28 @@ do_rollback() {
     rm -f "$TARGET_FILE"
     success "Removed: $TARGET_FILE"
 
-    # ── Step 2: Restore .conf files from snapshot ────────
+    # ── Step 2: Remove any of OUR config files added after this snapshot ──
+    # TARGET_FILE was already removed above. This also catches leftover files
+    # from OLDER installs of this script that are NOT in the snapshot's list,
+    # without touching unrelated system files in /etc/sysctl.d/.
+    if [ -f "$SPATH/sysctl_d_list.txt" ]; then
+        local TBASE="$(basename "$TARGET_FILE")"
+        while IFS= read -r CURF; do
+            [ -z "$CURF" ] && continue
+            # Only remove files that belong to OUR script (match TARGET_FILE name
+            # or the standard 99-vpn pattern) AND were not present in snapshot.
+            if ! grep -qxF "$CURF" "$SPATH/sysctl_d_list.txt" 2>/dev/null; then
+                case "$CURF" in
+                    "$TBASE"|99-vpn-*.conf)
+                        rm -f "/etc/sysctl.d/$CURF" 2>/dev/null && \
+                            success "Removed stale: /etc/sysctl.d/$CURF" || true
+                        ;;
+                esac
+            fi
+        done < <(ls /etc/sysctl.d/ 2>/dev/null)
+    fi
+
+    # ── Step 3: Restore .conf files from snapshot ────────
     if [ -f "$SPATH/sysctl.conf" ]; then
         cp "$SPATH/sysctl.conf" /etc/sysctl.conf 2>/dev/null && \
             success "Restored: /etc/sysctl.conf" || warn "Could not restore sysctl.conf"
@@ -2608,7 +2636,7 @@ do_rollback() {
         done
     fi
 
-    # ── Step 3: Re-apply sysctl values live ──────────────
+    # ── Step 4: Re-apply sysctl values live ──────────────
     # Use our_keys.txt (targeted — only keys we changed)
     # Fall back to sysctl_values.txt only if our_keys.txt missing (old snapshot)
     R=0; F=0; SKIP=0
@@ -3640,7 +3668,7 @@ cat > "$INSTALL_DIR/antiddos.sh" << 'ANTIDDOS_SCRIPT'
 #    - tc must work on SRC IP (not DST), else tunnel breaks
 #    - keepalive_time=30s detects dead connections fast (Slowloris)
 #    - conntrack established=120s cleans dead conns quickly
-#    - auto-ban: 80 active conns = watch, 200 conns = instant ban (4h)
+#    - auto-ban: 120 active conns = watch, 300 conns = instant ban (4h)
 # ============================================================
 set -euo pipefail
 
@@ -5029,7 +5057,7 @@ EOF
 
 # ════════════════════════════════════════════════
 # LAYER 4: Smart throttle+ban (auto-ban.sh)
-# Pipeline: watch (30s) → throttle 50Mbps → ban 4h
+# Pipeline: watch (45s) → throttle 100Mbps → ban 4h
 # CF IPs: ALWAYS exempt
 # ════════════════════════════════════════════════
 setup_autoban() {
@@ -5046,7 +5074,7 @@ setup_autoban() {
 #!/bin/bash
 # ============================================================
 #  Smart Throttle+Ban — Anti-DDoS Layer 4
-#  Pipeline: watch(80 conns) → throttle(50Mbps) → ban(4h) | instant ban: 200 conns
+#  Pipeline: watch(120 conns) → throttle(100Mbps) → ban(4h) | instant ban: 300 conns
 #  CF IPs + server own IPs: ALWAYS exempt
 # ============================================================
 
@@ -5055,15 +5083,40 @@ BANNED_LIST="/etc/antiddos/banned.list"
 WATCH_LIST="/tmp/autoban_watch"
 THROTTLE_LIST="/tmp/autoban_throttle"
 
+# ── Reputation scoring state (persistent across cycles) ────
+# Each scored IP keeps: score, last connection count, last timestamp.
+# Persisted to disk so the value survives the short-lived shell arrays
+# and survives service restarts.
+SCORE_DIR="/var/lib/antiddos/scores"
+SCORE_FILE="$SCORE_DIR/reputation.dat"
+# Bands (see research: adaptive/graduated enforcement beats one-shot ban):
+#  100-80 NORMAL    no action (only watched if above CONN_THRESHOLD)
+#   79-60 SUSPECT   watch only, no penalty
+#   59-40 THROTTLED move to class 1:30 (100Mbps)
+#   39-20 HARD      move to class 1:40 (50Mbps)
+#   <20  BANNED     ban_ip (4h)
+SCORE_BAN=20
+SCORE_HARD=40
+SCORE_THROTTLE=60
+SCORE_SUSPECT=80
+# Recovery: how fast a well-behaved IP regains reputation (per cycle).
+SCORE_RECOVER=3
+# When connections are counted we snapshot the previous sample to derive the
+# new-connection rate (attacker signature) without per-packet overhead.
+PREV_SAMPLE=4
+
 # Thresholds
 # THRESHOLD: minimum active connections from one IP to start watching.
 # Normal user: 5-20 connections (browser + download + streaming).
-# Attacker: hundreds to thousands of connections.
-# Set to 80 connections = well above any normal user, way below any flood.
-CONN_THRESHOLD=80    # active connections from one IP = start watching
-BAN_CONN_THRESHOLD=200  # active connections from one IP = immediate throttle+ban
-OBSERVE_SECONDS=30   # seconds to watch before throttle (faster response)
-THROTTLE_MBPS=50     # throttle bandwidth in Mbps (lower = less CPU from heavy attacks)
+# Heaviest legitimate user (multiple download managers + several services):
+# ~50-60 connections. Attacker: hundreds to thousands.
+# Set CONN_THRESHOLD well above ANY legitimate user so normal speed is never
+# limited, but far below a flood. OBSERVE allows brief legit spikes (a download
+# manager burst) to pass untouched before any action.
+CONN_THRESHOLD=120    # active connections from one IP = start watching (safe margin)
+BAN_CONN_THRESHOLD=300  # active connections from one IP = immediate throttle+ban
+OBSERVE_SECONDS=45    # seconds to watch before throttle (tolerates legit spikes)
+THROTTLE_MBPS=100    # throttle bandwidth in Mbps (must match tc class 1:30 = 100mbit)
 BAN_HOURS=4          # hours to ban after throttle
 SAMPLE_INTERVAL=4    # seconds per measurement
 
@@ -5072,9 +5125,10 @@ SAMPLE_INTERVAL=4    # seconds per measurement
 # Each IP stays under single-IP threshold, but total subnet load is high.
 # SUBNET_CONN_THRESHOLD: total connections from a /24 subnet = start watching.
 # Normal ISP: ~5-10 users behind NAT/CGNAT, each ~20 conns = ~200 total.
-# Botnet with 50 IPs × 70 conns = 3500 → way above threshold.
-SUBNET_THRESHOLD=300       # total conns from /24 = start watching subnet
-SUBNET_BAN_THRESHOLD=800   # total conns from /24 = block subnet
+# A very heavy CGNAT node (many legit users) could reach ~400.
+# Botnet with 50 IPs × 100+ conns = 5000 → way above threshold.
+SUBNET_THRESHOLD=400       # total conns from /24 = start watching subnet
+SUBNET_BAN_THRESHOLD=1000  # total conns from /24 = block subnet
 SUBNET_WATCH_LIST="/tmp/autoban_subnet_watch"
 touch "$SUBNET_WATCH_LIST" 2>/dev/null || true
 
@@ -5916,6 +5970,24 @@ throttle_ip() {
     log " THROTTLE: $ip -> 100Mbps (will ban in ${OBSERVE_SECONDS}s if continues)"
 }
 
+# Hard-throttle: move an IP to class 1:40 (50Mbps). Used by the reputation
+# scoring system when score falls into the worst (pre-ban) band but the IP is
+# not yet confirmed as an attack. Keeps the connection open (legit heavy user
+# stays online) while crushing throughput so a flood can't starve the box.
+# Class 1:40 must exist (added by install alongside 1:30). If it does not,
+# fall back to 100Mbps class 1:30 rather than failing.
+hard_throttle_ip() {
+    local ip="$1"
+    is_exempt "$ip" && return 0
+    local HANDLE
+    HANDLE=$(( 300 + ( RANDOM % 4000 ) ))
+    tc filter add dev "$IF" parent 1: protocol ip prio $HANDLE \
+        u32 match ip src "$ip/32" flowid 1:40 2>/dev/null || \
+    tc filter add dev "$IF" parent 1: protocol ip prio $HANDLE \
+        u32 match ip src "$ip/32" flowid 1:30 2>/dev/null || true
+    log " HARD-THROTTLE: $ip -> 50Mbps (reputation low)"
+}
+
 ban_ip() {
     local ip="$1"
     is_exempt "$ip" && return 0
@@ -5928,6 +6000,123 @@ ban_ip() {
     # Remove throttle filter
     tc filter del dev "$IF" parent 1: 2>/dev/null || true
     log " BANNED: $ip | unban: $UNBAN_TIME"
+}
+
+# ════════════════════════════════════════════════════════════
+# Reputation scoring — heuristic behavior-based scoring.
+# Idea: instead of a hard 80/200 connection cut, score each IP 100..0 and
+# escalate gradually. Human/browser traffic opens connections slowly and holds
+# them; bots open many new short-lived connections rapidly. We derive the
+# new-connection rate from successive connection-count samples (no per-packet
+# cost), which is the strongest single discriminator.
+#   - well-behaved  → score recovers (auto-release of throttle)
+#   - rapid churn   → score drops fast → graduated penalty → ban
+# ════════════════════════════════════════════════════════════
+
+# ensure SCORE_DIR exists and SCORE_FILE is readable
+score_init() {
+    mkdir -p "$SCORE_DIR" 2>/dev/null || true
+    touch "$SCORE_FILE" 2>/dev/null || true
+}
+
+# load_reputation <ip> -> sets REP_SCORE, REP_PREV_CNT, REP_TS (or defaults)
+load_reputation() {
+    local ip="$1"
+    REP_SCORE=100
+    REP_PREV_CNT=0
+    REP_TS=0
+    local line prev
+    line=$(grep -F "$ip " "$SCORE_FILE" 2>/dev/null | tail -1 || true)
+    [ -z "$line" ] && return 0
+    # format: IP SCORE PREV_CNT TS
+    REP_SCORE=$(echo "$line" | awk '{print $2}')
+    prev=$(echo "$line" | awk '{print $3}')
+    REP_TS=$(echo "$line" | awk '{print $4}')
+    REP_SCORE="${REP_SCORE:-100}"; REP_SCORE="${REP_SCORE//[^0-9]/}"; REP_SCORE="${REP_SCORE:-100}"
+    REP_PREV_CNT="${prev:-0}"; REP_PREV_CNT="${REP_PREV_CNT//[^0-9]/}"; REP_PREV_CNT="${REP_PREV_CNT:-0}"
+    REP_TS="${REP_TS:-0}"; REP_TS="${REP_TS//[^0-9]/}"; REP_TS="${REP_TS:-0}"
+    [ "$REP_SCORE" -gt 100 ] && REP_SCORE=100
+    [ "$REP_SCORE" -lt 0 ] && REP_SCORE=0
+}
+
+save_reputation() {
+    local ip="$1"
+    sed -i "/^$ip /d" "$SCORE_FILE" 2>/dev/null || true
+    echo "$ip $REP_SCORE $REP_PREV_CNT $(date +%s)" >> "$SCORE_FILE"
+}
+
+# clear_reputation <ip> — remove score after ban/unban/cleanup
+clear_reputation() {
+    local ip="$1"
+    sed -i "/^$ip /d" "$SCORE_FILE" 2>/dev/null || true
+}
+
+# update_score <ip> <current_conn_count> <elapsed_seconds_since_last>
+# Adjusts REP_SCORE based on behavior, then enforces the matching band.
+update_score() {
+    local ip="$1" cur="$2" dt="$3"
+    [ "$dt" -lt 1 ] && dt=1
+    is_exempt "$ip" && { clear_reputation "$ip"; return 0; }
+    grep -qF "$ip " "$SCORE_FILE" 2>/dev/null || echo "$ip 100 0 0" >> "$SCORE_FILE" 2>/dev/null || true
+
+    load_reputation "$ip"
+    local new_rate=0  # new connections per second
+    if [ "$REP_PREV_CNT" -gt 0 ] && [ "$cur" -ge "$REP_PREV_CNT" ]; then
+        new_rate=$(( (cur - REP_PREV_CNT) / dt ))
+    fi
+
+    # ── Score adjustment (deltas per cycle) ──────────────
+    local drop=0
+    # 1) Connection churn — the attacker signature. Rapid new-connection rate.
+    if   [ "$new_rate" -ge 50 ]; then drop=$(( drop + 18 ))
+    elif [ "$new_rate" -ge 25 ]; then drop=$(( drop + 12 ))
+    elif [ "$new_rate" -ge 10 ]; then drop=$(( drop + 6 ))
+    elif [ "$new_rate" -ge 5  ]; then drop=$(( drop + 2 ))
+    fi
+    # 2) Sustained high concurrent connections (holding many, near-flood)
+    if   [ "$cur" -ge 800 ]; then drop=$(( drop + 15 ))
+    elif [ "$cur" -ge 400 ]; then drop=$(( drop + 8 ))
+    elif [ "$cur" -ge 200 ]; then drop=$(( drop + 4 ))
+    elif [ "$cur" -gt "$CONN_THRESHOLD" ]; then drop=$(( drop + 1 ))
+    fi
+    # 3) Time-based decay: a hot IP that stays hot loses a little each cycle
+    #    (prevents an IP hovering at a band boundary forever).
+    if [ "$drop" -gt 0 ]; then
+        drop=$(( drop + 1 ))
+    fi
+
+    # Recover if this cycle was clean (below churn, below flood, low enough)
+    if [ "$drop" -eq 0 ]; then
+        REP_SCORE=$(( REP_SCORE + SCORE_RECOVER ))
+        [ "$REP_SCORE" -gt 100 ] && REP_SCORE=100
+    else
+        REP_SCORE=$(( REP_SCORE - drop ))
+        [ "$REP_SCORE" -lt 0 ] && REP_SCORE=0
+    fi
+    REP_PREV_CNT="$cur"
+    save_reputation "$ip"
+
+    # ── Enforce band (graduated, only escalate; never penalize a NORMAL IP) ──
+    if [ "$REP_SCORE" -lt "$SCORE_BAN" ]; then
+        if ! grep -qF "$ip" "$BANNED_LIST" 2>/dev/null; then
+            log " REP-BAN: $ip | score $REP_SCORE (below $SCORE_BAN) → ban ${BAN_HOURS}h"
+            throttle_ip "$ip"
+            ban_ip "$ip"
+        fi
+        clear_reputation "$ip"
+    elif [ "$REP_SCORE" -lt "$SCORE_HARD" ]; then
+        hard_throttle_ip "$ip"
+        log " REP-HARD: $ip | score $REP_SCORE → 50Mbps"
+    elif [ "$REP_SCORE" -lt "$SCORE_THROTTLE" ]; then
+        throttle_ip "$ip"
+        log " REP-THROTTLE: $ip | score $REP_SCORE → 100Mbps"
+    elif [ "$REP_SCORE" -lt "$SCORE_SUSPECT" ]; then
+        # SUSPECT band: watch only, no bandwidth penalty. But ensure it is on
+        # the watch list so the classic per-IP path can escalate it if it grows.
+        if ! grep -qF "$ip" "$WATCH_LIST" 2>/dev/null; then
+            echo "$ip $(date +%s)" >> "$WATCH_LIST" 2>/dev/null || true
+        fi
+    fi
 }
 
 # ── Subnet /24 ban — blocks entire /24 CIDR ──────────────────
@@ -5994,6 +6183,8 @@ unban_expired() {
 
 log " Smart throttle+ban started (conn_threshold:${CONN_THRESHOLD} ban_threshold:${BAN_CONN_THRESHOLD} subnet_threshold:${SUBNET_THRESHOLD} observe:${OBSERVE_SECONDS}s throttle:${THROTTLE_MBPS}Mbps ban:${BAN_HOURS}h)"
 
+score_init
+
 CYCLE=0
 while true; do
     CYCLE=$((CYCLE + 1))
@@ -6026,6 +6217,10 @@ while true; do
 
         # Skip already banned
         grep -qF "$ip" "$BANNED_LIST" 2>/dev/null && continue
+
+        # Reputation scoring: adjust score for this sample and enforce band.
+        # Uses the connection count and the interval since the last sample.
+        update_score "$ip" "$count" "$SAMPLE_INTERVAL"
 
         # Immediate action if way over limit (≥ BAN_CONN_THRESHOLD conns)
         if [ "${count:-0}" -ge "$BAN_CONN_THRESHOLD" ]; then
@@ -6076,6 +6271,32 @@ while true; do
             sed -i "/$ip/d" "$WATCH_LIST" 2>/dev/null || true
         fi
     done < "$WATCH_LIST" 2>/dev/null || true
+
+    # ── Auto-release throttled IPs that have calmed down ──
+    # A throttled IP that drops back below the safe threshold (e.g. a legit heavy
+    # download that ended) should be released back to the normal class instead of
+    # being held forever. This is the "recover reputation" half of scoring.
+    # CF + own IPs are always exempt; banned IPs stay banned until expiry.
+    while IFS=' ' read -r ip ts; do
+        [ -z "$ip" ] && continue
+        is_exempt "$ip" && continue
+        grep -qF "$ip" "$BANNED_LIST" 2>/dev/null && continue
+        # Still hot → keep throttled, let scoring manage it.
+        [ "${CONN_COUNT[$ip]:-0}" -ge "$CONN_THRESHOLD" ] && continue
+        # Not banned, no longer hot → release to normal class (1:20).
+        # We remove the throttle entry and let the next cycle re-throttle only
+        # if it misbehaves again. The tc filter for 1:30 stays until the qdisc is
+        # rebuilt, but a fresh normal filter on the next misbehavior wins because
+        # HTB matches highest prio first; simplest robust approach is to restore
+        # it to class 1:20 explicitly.
+        _RELEASE_HANDLE=$(( 500 + ( RANDOM % 3000 ) ))
+        tc filter add dev "$IF" parent 1: protocol ip prio $_RELEASE_HANDLE \
+            u32 match ip src "$ip/32" flowid 1:20 2>/dev/null || true
+        sed -i "/$ip/d" "$THROTTLE_LIST" 2>/dev/null || true
+        sed -i "/$ip/d" "$WATCH_LIST" 2>/dev/null || true
+        clear_reputation "$ip"
+        log " AUTO-RELEASE: $ip (calmed down) → normal class"
+    done < "$THROTTLE_LIST" 2>/dev/null || true
 
     # ── Subnet /24 botnet detection ──────────────────────────
     # Aggregate connections by /24 subnet to detect distributed botnets
@@ -6181,6 +6402,7 @@ setup_tc() {
     tc class add dev "$MAIN_IF" parent 1:1 classid 1:10 htb rate 1gbit  ceil 1gbit  burst 25Mb    # CF unlimited
     tc class add dev "$MAIN_IF" parent 1:1 classid 1:20 htb rate 500mbit ceil 500mbit burst 6400Kb # normal
     tc class add dev "$MAIN_IF" parent 1:1 classid 1:30 htb rate 100mbit ceil 100mbit burst 1280Kb # throttled
+    tc class add dev "$MAIN_IF" parent 1:1 classid 1:40 htb rate 50mbit  ceil 50mbit  burst 640Kb  # hard-throttled
 
     # CF IPs → class 1:10 (match by SRC IP)
     local HANDLE=10
@@ -6967,6 +7189,7 @@ tc class add dev "$IF" parent 1: classid 1:1  htb rate 1gbit ceil 1gbit
 tc class add dev "$IF" parent 1:1 classid 1:10 htb rate 1gbit  ceil 1gbit  burst 25Mb
 tc class add dev "$IF" parent 1:1 classid 1:20 htb rate 500mbit ceil 500mbit burst 6400Kb
 tc class add dev "$IF" parent 1:1 classid 1:30 htb rate 100mbit ceil 100mbit burst 1280Kb
+tc class add dev "$IF" parent 1:1 classid 1:40 htb rate 50mbit  ceil 50mbit  burst 640Kb
 H=10
 for CF in "${CF_RANGES[@]}"; do
     tc filter add dev "$IF" parent 1: protocol ip prio $H \
@@ -7249,7 +7472,7 @@ EOF
     echo -e "    ${GREEN}✓${NC}  ICMP Flood  - rate-limited per source"
     echo -e "    ${GREEN}✓${NC}  Port Scans  - NULL/XMAS/FIN/bogus dropped"
     echo -e "    ${GREEN}✓${NC}  RST Flood   - rate-limited"
-    echo -e "    ${GREEN}✓${NC}  Smart Ban   - watch(30s)->throttle(50M)->ban(4h)"
+    echo -e "    ${GREEN}✓${NC}  Smart Ban   - watch(45s)->throttle(100M)->ban(4h)"
     echo -e "    ${GREEN}✓${NC}  CF Users    - ALWAYS unlimited, never throttled/banned"
     echo -e "    ${GREEN}✓${NC}  Bandwidth   - CF=unlimited, non-CF=500Mbps max"
     echo -e "    ${GREEN}✓${NC}  Slowloris   - keepalive_time=30s"
@@ -7266,13 +7489,16 @@ show_thresholds() {
     printf "  %-35s ${WHITE}%s${NC}\n" "New conn rate limit:"   "${NEW_CONN_RATE:-N/A} (burst: ${NEW_CONN_BURST:-N/A})"
     printf "  %-35s ${WHITE}%s${NC}\n" "Per-IP bandwidth cap:"  "${BW_PER_IP_MBIT:-N/A} Mbps"
     printf "  %-35s ${WHITE}%s${NC}\n" "HTTP conns/non-CF IP:"  "$CONN_LIMIT_PER_IP"
-    printf "  %-35s ${WHITE}%s${NC}\n" "Auto-ban watch threshold:"   "80 active conns/IP"
-    printf "  %-35s ${WHITE}%s${NC}\n" "Auto-ban instant-ban:"       "200 active conns/IP"
-    printf "  %-35s ${WHITE}%s${NC}\n" "Auto-ban subnet watch:"      "300 total conns from /24"
-    printf "  %-35s ${WHITE}%s${NC}\n" "Auto-ban subnet ban:"        "800 total conns from /24"
-    printf "  %-35s ${WHITE}%s${NC}\n" "Auto-ban observe:"           "30s watch before throttle"
-    printf "  %-35s ${WHITE}%s${NC}\n" "Auto-ban throttle:"          "50Mbps"
+    printf "  %-35s ${WHITE}%s${NC}\n" "Auto-ban watch threshold:"   "120 active conns/IP"
+    printf "  %-35s ${WHITE}%s${NC}\n" "Auto-ban instant-ban:"       "300 active conns/IP"
+    printf "  %-35s ${WHITE}%s${NC}\n" "Auto-ban subnet watch:"      "400 total conns from /24"
+    printf "  %-35s ${WHITE}%s${NC}\n" "Auto-ban subnet ban:"        "1000 total conns from /24"
+    printf "  %-35s ${WHITE}%s${NC}\n" "Auto-ban observe:"           "45s watch before throttle"
+    printf "  %-35s ${WHITE}%s${NC}\n" "Auto-ban throttle:"          "100Mbps"
     printf "  %-35s ${WHITE}%s${NC}\n" "Auto-ban duration:"          "4 hours"
+    printf "  %-35s ${WHITE}%s${NC}\n" "Reputation scoring:"         "ON (100→0, human-vs-bot)"
+    printf "  %-35s ${WHITE}%s${NC}\n" "  bands:"                    "80+normal 60+watch 40+100M 20+50M <20 ban"
+    printf "  %-35s ${WHITE}%s${NC}\n" "  auto-release:"             "ON (throttled→normal when calmed)"
     printf "  %-35s ${WHITE}%s${NC}\n" "fail2ban 3proxy:"       "100 req/60s -> 24h ban"
     printf "  %-35s ${WHITE}%s${NC}\n" "fail2ban HTTP burst:"    "200 req/30s -> 24h ban"
     printf "  %-35s ${WHITE}%s${NC}\n" "fail2ban conn-flood:"    "20 drops/10s -> 24h ban"
