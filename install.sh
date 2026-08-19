@@ -3715,18 +3715,27 @@ ignoreregex =
 EOF
 
     # ── Jails ─────────────────────────────────────────
+    # Build ignoreip from the FULL CF range list (753 ranges), chunked 6 per
+    # line, so fail2ban NEVER bans a Cloudflare IP. Previously only 16 legacy
+    # ranges were listed here, so CF IPs from newer ranges could get false bans.
+    _F2B_IGNORE="127.0.0.1/8 ::1"
+    _F2B_CF_N=0
+    for _F2B_CF in "${CF_RANGES[@]}"; do
+        _F2B_CF_N=$((_F2B_CF_N + 1))
+        if [ $((_F2B_CF_N % 6)) -eq 1 ]; then
+            _F2B_IGNORE="$(printf '%s\n            %s' "$_F2B_IGNORE" "$_F2B_CF")"
+        else
+            _F2B_IGNORE="$(printf '%s %s' "$_F2B_IGNORE" "$_F2B_CF")"
+        fi
+    done
+
     cat > "$F2B_JAIL_DIR/antiddos.conf" << EOF
 # Anti-DDoS fail2ban jails — generated $(date)
 # CF IPs are ignored via ignoreip (no false bans)
 
 [DEFAULT]
-# Add CF ranges to ignoreip so CF IPs are never banned by fail2ban
-ignoreip = 127.0.0.1/8 ::1
-           103.21.244.0/22 103.22.200.0/22 103.31.4.0/22
-           104.16.0.0/13 104.24.0.0/14 108.162.192.0/18
-           131.0.72.0/22 141.101.64.0/18 162.158.0.0/15
-           172.64.0.0/13 173.245.48.0/20 188.114.96.0/20
-           190.93.240.0/20 197.234.240.0/22 198.41.128.0/17
+# ignoreip built from the full CF range list (${#CF_RANGES[@]} ranges)
+ignoreip = ${_F2B_IGNORE}
 
 [3proxy-ddos]
 enabled   = true
