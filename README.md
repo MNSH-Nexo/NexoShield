@@ -1,21 +1,23 @@
 <div align="center">
 
-# 🛡️ NexoShield
+<img src="https://bty-reactus-resource-prod.s3.us-east-1.amazonaws.com/reactus/llm_server/5fb952001e1c4d37870f2a5824cbc4c5/image2/fa2b80c24aa04989896493af2e817c20.png" width="120" alt="NexoShield Logo" />
+
+# NexoShield
 
 **Professional Server Hardening & Anti-DDoS Toolkit**
 
 *Secure any Ubuntu server in minutes — with optional SOCKS5 proxy management*
 
-[![Platform](https://img.shields.io/badge/Platform-Ubuntu%2020%2B-orange.svg)](https://ubuntu.com)
-[![Shell](https://img.shields.io/badge/Shell-Bash%205%2B-green.svg)](https://www.gnu.org/software/bash/)
-[![Version](https://img.shields.io/badge/Version-3.0-purple.svg)](#)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](#)
+<img src="https://img.shields.io/badge/Platform-Ubuntu%2020%2B-E95420?style=flat-square&logo=ubuntu&logoColor=white" alt="Platform"/>
+<img src="https://img.shields.io/badge/Shell-Bash%205%2B-4EAA25?style=flat-square&logo=gnubash&logoColor=white" alt="Shell"/>
+<img src="https://img.shields.io/badge/Version-3.0-7c3aed?style=flat-square" alt="Version"/>
+<img src="https://img.shields.io/badge/License-MIT-1a73e8?style=flat-square" alt="License"/>
 
 </div>
 
 ---
 
-## ✨ What is NexoShield?
+## What is NexoShield?
 
 NexoShield is a single-script toolkit that transforms a bare Ubuntu server into a hardened, DDoS-resistant machine in under 5 minutes.
 
@@ -23,7 +25,7 @@ You can use it purely for **server security** — or also enable the built-in **
 
 ---
 
-## 🚀 نصب آسان
+## نصب آسان
 
 **یک دستور — همه چیز آماده:**
 
@@ -31,7 +33,7 @@ You can use it purely for **server security** — or also enable the built-in **
 bash <(curl -fsSL https://raw.githubusercontent.com/MNSH-Nexo/NexoShield/master/install.sh)
 ```
 
-> ✅ نیازی به clone یا دانلود جداگانه نیست. فقط این دستور رو روی سرور Ubuntu اجرا کن.
+> نیازی به clone یا دانلود جداگانه نیست. فقط این دستور رو روی سرور Ubuntu اجرا کن.
 
 **بعد از نصب، با این دستور اجرا کن:**
 
@@ -39,7 +41,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/MNSH-Nexo/NexoShield/master/
 proxy
 ```
 
-### پیش‌نیاز
+**پیش‌نیاز**
 
 - Ubuntu 20.04 / 22.04 / 24.04
 - دسترسی root
@@ -47,7 +49,7 @@ proxy
 
 ---
 
-## 🛡️ لایه‌های حفاظتی
+## لایه‌های حفاظتی
 
 NexoShield از **۵ لایه موازی** برای محافظت استفاده می‌کنه:
 
@@ -61,25 +63,25 @@ NexoShield از **۵ لایه موازی** برای محافظت استفاده 
 └──────────────────────────────────────────────────────────────┘
 ```
 
-### جزئیات حفاظت
+**جزئیات حفاظت**
 
 | حمله | روش مقابله | وضعیت |
 |------|-----------|--------|
-| SYN Flood (direct) | SYNPROXY kernel-level | ✅ |
-| SYN Flood (spoofed IP) | Global rate cap | ✅ |
-| Slowloris / Conn-Hold | connlimit + keepalive=30s + fail2ban | ✅ |
-| HTTP Burst (pipeline) | hashlimit + fail2ban 200req/30s | ✅ |
-| Botnet distributed (/24) | Subnet aggregate tracking | ✅ |
-| UDP Flood | hashlimit per-IP | ✅ |
-| UDP Amplification | DNS/NTP/SSDP/memcached blocked | ✅ |
-| ICMP Flood | rate-limited per-IP | ✅ |
-| Port Scan | NULL/XMAS/FIN/bogus flags DROP | ✅ |
-| SSH Brute Force | fail2ban (3 tries → 24h ban) | ✅ |
-| IP Spoofing | rp_filter + SYNPROXY | ✅ |
+| SYN Flood (direct) | SYNPROXY kernel-level | Active |
+| SYN Flood (spoofed IP) | Global rate cap | Active |
+| Slowloris / Conn-Hold | connlimit + keepalive=30s + fail2ban | Active |
+| HTTP Burst (pipeline) | hashlimit + fail2ban 200req/30s | Active |
+| Botnet distributed (/24) | Subnet aggregate tracking | Active |
+| UDP Flood | hashlimit per-IP | Active |
+| UDP Amplification | DNS/NTP/SSDP/memcached blocked | Active |
+| ICMP Flood | rate-limited per-IP | Active |
+| Port Scan | NULL/XMAS/FIN/bogus flags DROP | Active |
+| SSH Brute Force | fail2ban (3 tries → 24h ban) | Active |
+| IP Spoofing | rp_filter + SYNPROXY | Active |
 
 ---
 
-## ☁️ Cloudflare Integration
+## Cloudflare Integration
 
 NexoShield دارای **753 رنج IP رسمی Cloudflare** است که در **تمام لایه‌ها** whitelist شده‌اند:
 
@@ -89,7 +91,7 @@ NexoShield دارای **753 رنج IP رسمی Cloudflare** است که در **�
 
 ---
 
-## 📋 منوی اصلی
+## منوی اصلی
 
 ```
 ════════════════════════════════════════
@@ -103,23 +105,21 @@ NexoShield دارای **753 رنج IP رسمی Cloudflare** است که در **�
 ════════════════════════════════════════
 ```
 
-### بخش‌های اصلی
-
-**🔧 SOCKS5 Proxy Manager** — نصب، مدیریت و مانیتور 3proxy  
+**SOCKS5 Proxy Manager** — نصب، مدیریت و مانیتور 3proxy  
 نصب خودکار با یوزرنیم/پسورد تصادفی، تغییر پسورد، restart، مشاهده لاگ، نمایش اطلاعات اتصال
 
-**⚡ Kernel Optimizer** — بهینه‌سازی سیستم  
+**Kernel Optimizer** — بهینه‌سازی سیستم  
 تنظیم TCP timeouts، conntrack، buffer sizes — با snapshot و rollback
 
-**🛡️ Anti-DDoS Protection** — نصب همه ۵ لایه  
+**Anti-DDoS Protection** — نصب همه ۵ لایه  
 Auto-detect سخت‌افزار و تنظیم threshold متناسب — ماندگار بعد از reboot
 
-**📊 Live Threat Monitor** — داشبورد real-time  
+**Live Threat Monitor** — داشبورد real-time  
 نمایش حملات فعال، ban‌های اخیر، top IP‌ها، آمار شبکه، CPU، RAM، conntrack
 
 ---
 
-## 🔒 Smart Auto-Ban Pipeline
+## Smart Auto-Ban Pipeline
 
 ```
 Connection Detected
@@ -143,7 +143,7 @@ Connection Detected
 
 ---
 
-## 📊 Thresholds (auto-scaled by RAM)
+## Thresholds — auto-scaled by RAM
 
 | پارامتر | RAM < 2GB | RAM 2–4GB | RAM > 4GB |
 |---------|-----------|-----------|-----------|
@@ -154,7 +154,7 @@ Connection Detected
 
 ---
 
-## 🗂️ فایل‌های نصب شده
+## فایل‌های نصب شده
 
 ```
 /usr/local/bin/proxy          ← دستور اصلی
@@ -166,20 +166,20 @@ Connection Detected
 
 ---
 
-## ⚠️ سازگاری
+## سازگاری
 
 | سیستم | وضعیت |
 |-------|--------|
-| Ubuntu 20.04 LTS | ✅ کامل |
-| Ubuntu 22.04 LTS | ✅ کامل |
-| Ubuntu 24.04 LTS | ✅ کامل |
-| KVM / VMware | ✅ کامل |
-| LXC Container | ✅ (بدون SYNPROXY) |
-| OpenVZ | ⚠️ محدود |
+| Ubuntu 20.04 LTS | Full support |
+| Ubuntu 22.04 LTS | Full support |
+| Ubuntu 24.04 LTS | Full support |
+| KVM / VMware | Full support |
+| LXC Container | Supported (no SYNPROXY) |
+| OpenVZ | Limited |
 
 ---
 
-## 📜 License
+## License
 
 MIT License — آزادانه استفاده، تغییر و توزیع کن.
 
@@ -187,6 +187,6 @@ MIT License — آزادانه استفاده، تغییر و توزیع کن.
 
 <div align="center">
 
-Made with ❤️ by [MNSH-Nexo](https://github.com/MNSH-Nexo)
+Made with care by [MNSH-Nexo](https://github.com/MNSH-Nexo)
 
 </div>
