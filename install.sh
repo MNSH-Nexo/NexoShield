@@ -1075,22 +1075,106 @@ setup_iptables_for_port() {
         firewall-cmd --reload >/dev/null 2>&1 || true
 }
 
+# ── Run a command with visible "working" feedback ──────────
+# Prints "<label> ......" and a growing dot animation so the user can see the
+# step is still alive. The command itself is NEVER time-limited. Output is
+# captured to a temp log so the dots stay clean; on failure the log tail is
+# shown so the real error is not hidden.
+run_spinner() {
+    local label="$1"; shift
+    local log _spin _rc
+    log=$(mktemp)
+    printf '  %s ' "$label"
+    ( while :; do printf '.'; sleep 1; done ) &
+    _spin=$!
+    "$@" >"$log" 2>&1
+    _rc=$?
+    kill "$_spin" 2>/dev/null; wait "$_spin" 2>/dev/null
+    if [ "$_rc" -eq 0 ]; then
+        printf ' done\n'
+    else
+        printf ' FAILED\n'
+        tail -n 15 "$log" >&2
+    fi
+    rm -f "$log"
+    return "$_rc"
+}
+
+# ── Pick the fastest reachable apt mirror ──────────────────
+# Tests a set of candidate mirrors with a SHORT per-mirror timeout (this is a
+# probe only) and echoes the URL of the fastest responsive one. The later
+# apt-get update/install runs WITHOUT any timeout. Returns empty if none work.
+pick_apt_mirror() {
+    local os="$1" code="$2"
+    local -a cands=()
+    if [ "$os" = ubuntu ]; then
+        cands=( "http://archive.ubuntu.com/ubuntu" "http://mirrors.aliyun.com/ubuntu" \
+                "https://mirrors.tuna.tsinghua.edu.cn/ubuntu" "http://mirrors.ustc.edu.cn/ubuntu" \
+                "http://mirrors.cloud.aliyuncs.com/ubuntu" "https://mirrors.huaweicloud.com/ubuntu" \
+                "http://mirrors.zju.edu.cn/ubuntu" )
+    else
+        cands=( "http://deb.debian.org/debian" "http://mirrors.aliyun.com/debian" \
+                "https://mirrors.tuna.tsinghua.edu.cn/debian" "http://mirrors.ustc.edu.cn/debian" \
+                "https://mirrors.huaweicloud.com/debian" "http://mirrors.cloud.aliyuncs.com/debian" )
+    fi
+    local best="" best_ms=99999 m t0 ms
+    for m in "${cands[@]}"; do
+        t0=$(date +%s%N 2>/dev/null || echo 0)
+        if curl -fsS --max-time 4 -o /dev/null "$m/dists/$code/InRelease" 2>/dev/null || \
+           curl -fsS --max-time 4 -o /dev/null "$m/dists/$code/Release" 2>/dev/null; then
+            ms=$(( ( $(date +%s%N 2>/dev/null || echo 0) - t0 ) / 1000000 ))
+            [ "$ms" -lt 0 ] && ms=0
+            if [ "$ms" -lt "$best_ms" ]; then best_ms=$ms; best=$m; fi
+        fi
+    done
+    printf '%s' "$best"
+}
+
+# ── Point apt at the chosen mirror (with backup) ───────────
+# Backs up existing apt sources, then writes a minimal sources.list using the
+# selected mirror. The original config is kept as *.bak so nothing is lost.
+configure_apt_mirror() {
+    local os="$1" code="$2" mirror="$3"
+    [ -f /etc/apt/sources.list ] && cp -a /etc/apt/sources.list /etc/apt/sources.list.bak 2>/dev/null || true
+    for _f in /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list; do
+        [ -e "$_f" ] && cp -a "$_f" "$_f.bak" 2>/dev/null || true
+    done
+    # On modern Ubuntu the default is deb822 (ubuntu.sources); use classic list.
+    rm -f /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || true
+    printf 'deb %s %s main restricted universe multiverse\n' "$mirror" "$code" > /etc/apt/sources.list
+    printf 'deb %s %s-updates main restricted universe multiverse\n' "$mirror" "$code" >> /etc/apt/sources.list
+    printf 'deb %s %s-security main restricted universe multiverse\n' "$mirror" "$code" >> /etc/apt/sources.list
+}
+
 install_proxy() {
     sep; echo -e "${YELLOW}Installing 3proxy SOCKS5...${NC}"; sep
 
     echo -e "${YELLOW}[1/7] Installing dependencies...${NC}"
-    if [ -f /etc/os-release ]; then . /etc/os-release; OS=${ID:-unknown}; fi
-    if [[ "${OS:-}" == "ubuntu" || "${OS:-}" == "debian" ]]; then
-        apt-get update -y -qq 2>/dev/null
-        apt-get install -y -qq wget curl iptables iproute2 logrotate \
-            build-essential iproute2 tcpdump 2>/dev/null || {
+    if [ -f /etc/os-release ]; then . /etc/os-release; OS=${ID:-unknown}; CODENAME=${VERSION_CODENAME:-}; fi
+    if [[ "$OS" == "ubuntu" || "$OS" == "debian" ]]; then
+        export DEBIAN_FRONTEND=noninteractive
+        # Prefer a fast reachable mirror so `apt-get update` doesn't stall on a
+        # slow one. Probe is quick (timeout on the test only); the install
+        # itself below is NEVER time-limited. If no mirror responds, keep the
+        # system's existing apt sources.
+        MIRROR=""
+        [ -n "$CODENAME" ] && MIRROR=$(pick_apt_mirror "$OS" "$CODENAME")
+        if [ -n "$MIRROR" ]; then
+            info "Using apt mirror: $MIRROR"
+            configure_apt_mirror "$OS" "$CODENAME" "$MIRROR"
+        else
+            info "No faster mirror reachable - using system apt sources"
+        fi
+        run_spinner "Updating package lists" apt-get update -y || true
+        run_spinner "Installing dependencies" apt-get install -y \
+            wget curl iptables iproute2 logrotate build-essential tcpdump || {
             echo -e "${YELLOW}Some packages failed, continuing...${NC}"
         }
-    elif [[ "${OS:-}" == "centos" || "${OS:-}" == "rhel" || \
-            "${OS:-}" == "rocky" || "${OS:-}" == "almalinux" || \
-            "${OS:-}" == "fedora" ]]; then
-        yum install -y -q wget curl iptables iproute logrotate gcc make \
-            iproute-tc tcpdump 2>/dev/null || {
+    elif [[ "$OS" == "centos" || "$OS" == "rhel" || \
+            "$OS" == "rocky" || "$OS" == "almalinux" || \
+            "$OS" == "fedora" ]]; then
+        run_spinner "Installing dependencies" yum install -y \
+            wget curl iptables iproute logrotate gcc make iproute-tc tcpdump || {
             echo -e "${YELLOW}Some packages failed, continuing...${NC}"
         }
     fi
@@ -1098,21 +1182,25 @@ install_proxy() {
     echo -e "${YELLOW}[2/7] Installing 3proxy...${NC}"
     TMPDIR_BUILD=$(mktemp -d)
     cd "$TMPDIR_BUILD"
-    if apt-get install -y -qq 3proxy 2>/dev/null; then
+    if run_spinner "Installing 3proxy via apt" apt-get install -y 3proxy; then
         PROXY_BIN_PATH=$(command -v 3proxy 2>/dev/null || echo "/usr/bin/3proxy")
         [ "$PROXY_BIN_PATH" != "$PROXY_BIN" ] && ln -sf "$PROXY_BIN_PATH" "$PROXY_BIN"
         echo -e "${GREEN}3proxy installed from apt.${NC}"
     else
         echo -e "${YELLOW}Compiling 3proxy from source...${NC}"
-        if wget -qO 3proxy.tar.gz \
-            https://github.com/3proxy/3proxy/archive/refs/tags/0.9.4.tar.gz 2>/dev/null; then
-            tar -xzf 3proxy.tar.gz 2>/dev/null
+        if run_spinner "Downloading 3proxy source" wget -O 3proxy.tar.gz \
+            https://github.com/3proxy/3proxy/archive/refs/tags/0.9.4.tar.gz; then
+            run_spinner "Extracting source" tar -xzf 3proxy.tar.gz
             cd 3proxy-0.9.4
-            make -f Makefile.Linux -j"$(nproc)" 2>/dev/null && \
+            if run_spinner "Compiling (this can take a while)" \
+                make -f Makefile.Linux -j"$(nproc)"; then
                 cp bin/3proxy "$PROXY_BIN" && chmod +x "$PROXY_BIN" && \
-                echo -e "${GREEN}3proxy compiled from source.${NC}" || {
+                    echo -e "${GREEN}3proxy compiled from source.${NC}" || {
+                    echo -e "${RED}Copy failed!${NC}"; cd /; rm -rf "$TMPDIR_BUILD"; return 1
+                }
+            else
                 echo -e "${RED}Compilation failed!${NC}"; cd /; rm -rf "$TMPDIR_BUILD"; return 1
-            }
+            fi
         else
             echo -e "${RED}Cannot download 3proxy! Check internet connection.${NC}"
             cd /; rm -rf "$TMPDIR_BUILD"; return 1
