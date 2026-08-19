@@ -59,6 +59,7 @@ mkdir -p "$INSTALL_DIR"
 
 # ── Cloudflare IP ranges (single source of truth) ────────
 CF_RANGES=(
+    "1.0.0.0/24"
     "1.1.1.0/24"
     "5.10.214.0/23"
     "5.226.183.0/24"
