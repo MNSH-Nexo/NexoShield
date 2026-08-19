@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="https://bty-reactus-resource-prod.s3.us-east-1.amazonaws.com/reactus/llm_server/5fb952001e1c4d37870f2a5824cbc4c5/image2/fa2b80c24aa04989896493af2e817c20.png" width="120" alt="NexoShield Logo" />
+<img src="logo.png" width="120" alt="NexoShield Logo" />
 
 # NexoShield
 
