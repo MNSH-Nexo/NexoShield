@@ -2897,20 +2897,29 @@ menu_antiddos() {
         AUTOBAN_ST=$(svc_status "auto-ban")
         echo -e "  Auto-ban: $AUTOBAN_ST"
 
-        # Show layer status quickly — use reliable checks
+        # Show layer status — gate everything on our install marker so that
+        # after "Remove all protection" (which deletes state.conf) every layer
+        # honestly shows as NOT installed. Never rely on generic system state
+        # (kernel defaults like tcp_syncookies=1 or the fail2ban service), which
+        # survive removal and would wrongly show checkmarks.
         echo ""; echo -e "  ${DIM}Protection layers:${NC}"
-        sysctl net.ipv4.tcp_syncookies 2>/dev/null | grep -q '= 1' && \
-            echo -e "  ${G}✓${NC} Kernel hardening" || echo -e "  ${DIM}○ Kernel hardening${NC}"
-        # iptables check: look for cf_whitelist (added by our install) or state file
-        { iptables -L INPUT -n 2>/dev/null | grep -q 'cf_whitelist\|hashlimit\|syn_flood\|SYNPROXY' || \
-          iptables-save 2>/dev/null | grep -q 'hashlimit\|cf_whitelist\|SYNPROXY'; } && \
-            echo -e "  ${G}✓${NC} iptables rules" || echo -e "  ${DIM}○ iptables rules${NC}"
-        systemctl is-active fail2ban >/dev/null 2>&1 && \
-            echo -e "  ${G}✓${NC} fail2ban" || echo -e "  ${DIM}○ fail2ban${NC}"
-        systemctl is-active auto-ban >/dev/null 2>&1 && \
-            echo -e "  ${G}✓${NC} Smart auto-ban" || echo -e "  ${DIM}○ Smart auto-ban${NC}"
-        tc class show dev "$(ip route show default 2>/dev/null | awk '/default/{print $5}' | head -1)" 2>/dev/null | grep -q 'htb' && \
-            echo -e "  ${G}✓${NC} Bandwidth shaping (tc)" || echo -e "  ${DIM}○ Bandwidth shaping (tc)${NC}"
+        if [ -f /etc/antiddos/state.conf ]; then
+            [ -f /etc/sysctl.d/98-antiddos-hardening.conf ] && \
+                echo -e "  ${G}✓${NC} Kernel hardening" || echo -e "  ${DIM}○ Kernel hardening${NC}"
+            iptables -L INPUT -n 2>/dev/null | grep -qE 'cf_whitelist|hashlimit|syn_flood|SYNPROXY' && \
+                echo -e "  ${G}✓${NC} iptables rules" || echo -e "  ${DIM}○ iptables rules${NC}"
+            [ -f /etc/fail2ban/jail.d/antiddos.conf ] && \
+                echo -e "  ${G}✓${NC} fail2ban" || echo -e "  ${DIM}○ fail2ban${NC}"
+            systemctl is-active auto-ban >/dev/null 2>&1 && \
+                echo -e "  ${G}✓${NC} Smart auto-ban" || echo -e "  ${DIM}○ Smart auto-ban${NC}"
+            tc class show dev "$(ip route show default 2>/dev/null | awk '/default/{print $5}' | head -1)" 2>/dev/null | grep -q 'htb' && \
+                echo -e "  ${G}✓${NC} Bandwidth shaping (tc)" || echo -e "  ${DIM}○ Bandwidth shaping (tc)${NC}"
+        else
+            for _layer in "Kernel hardening" "iptables rules" "fail2ban" \
+                          "Smart auto-ban" "Bandwidth shaping (tc)"; do
+                echo -e "  ${DIM}○ $_layer${NC}"
+            done
+        fi
 
         echo ""; sep2
         echo -e "  ${G}1.${NC}  Install / Re-install all layers"
