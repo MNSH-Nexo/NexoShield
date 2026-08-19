@@ -105,16 +105,16 @@ NexoShield دارای **753 رنج IP رسمی Cloudflare** است که در **�
 ════════════════════════════════════════
 ```
 
-با **SOCKS5 Proxy Manager** — نصب، مدیریت و مانیتور 3proxy  
+**SOCKS5 Proxy Manager** — نصب، مدیریت و مانیتور 3proxy  
 نصب خودکار با یوزرنیم/پسورد تصادفی، تغییر پسورد، restart، مشاهده لاگ، نمایش اطلاعات اتصال
 
-با **Kernel Optimizer** — بهینه‌سازی سیستم  
+**Kernel Optimizer** — بهینه‌سازی سیستم  
 تنظیم TCP timeouts، conntrack، buffer sizes — با snapshot و rollback
 
-با **Anti-DDoS Protection** — نصب همه ۵ لایه  
+**Anti-DDoS Protection** — نصب همه ۵ لایه  
 Auto-detect سخت‌افزار و تنظیم threshold متناسب — ماندگار بعد از reboot
 
-با **Live Threat Monitor** — داشبورد real-time  
+**Live Threat Monitor** — داشبورد real-time  
 نمایش حملات فعال، ban‌های اخیر، top IP‌ها، آمار شبکه، CPU، RAM، conntrack
 
 ---
@@ -182,6 +182,12 @@ Connection Detected
 ## License
 
 MIT License — آزادانه استفاده، تغییر و توزیع کن.
+
+---
+
+## Credits
+
+Built with the assistance of [HappySeeds AI](https://happyseeds.ai)
 
 ---
 
