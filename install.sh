@@ -2341,17 +2341,48 @@ _proxy_change_pass() {
 }
 
 _proxy_suspicious() {
-    clear; echo -e "  ${C}Suspicious IPs (top connectors)${NC}"; echo ""
-    [ ! -f /var/log/3proxy/access.log ] && warn "Log not found" && press_enter && return
-    echo -e "  ${DIM}Count    IP${NC}"; sep2
-    awk '{print $5}' /var/log/3proxy/access.log 2>/dev/null | \
-        grep -oP '^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}' | \
-        sort | uniq -c | sort -rn | head -20 | \
-        awk '{printf "  %-8s %s\n", $1, $2}'
+    clear; echo -e "  ${C}Threat IPs (real blocked/throttled attackers)${NC}"; echo ""
+    echo -e "  ${DIM}These are actual attackers auto-ban has blocked or throttled,"${NC}
+    echo -e "  ${DIM}not your normal heavy users.${NC}"; sep2
+
+    # Currently banned (iptables DROP rules tagged by auto-ban / subnet-ban)
+    local _banned=""
+    _banned=$(iptables -L INPUT -n 2>/dev/null | grep -E 'auto-ban|subnet-ban' | \
+        grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]+)?' | \
+        grep -v '^0\.0\.0\.0' | sort -u | head -20)
+
+    # Currently throttled (reputation-suspected, pre-ban)
+    local _throttled=""
+    _throttled=$(awk '{print $1}' /tmp/autoban_throttle 2>/dev/null | \
+        grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -10)
+
+    local _empty=1
+    if [ -n "$_banned" ]; then
+        echo -e "  ${R}── Currently BANNED ──${NC}"
+        echo "$_banned" | while IFS= read -r ip; do
+            [ -z "$ip" ] && continue
+            echo -e "  ${R}✗ $ip${NC}   (iptables DROP)"
+        done
+        _empty=0
+    fi
+    if [ -n "$_throttled" ]; then
+        echo ""
+        echo -e "  ${Y}── Currently THROTTLED ──${NC}"
+        echo "$_throttled" | while IFS= read -r ip; do
+            [ -z "$ip" ] && continue
+            echo -e "  ${Y}⚠ $ip${NC}   (auto-ban throttle)"
+        done
+        _empty=0
+    fi
+    [ "$_empty" -eq 1 ] && echo -e "  ${G}✓ No active threats${NC}"
     echo ""; sep2
-    echo -e "  ${DIM}Enter an IP from the list above to block it, or press Enter to skip.${NC}"
+
+    echo -e "  ${DIM}Enter an IP above to block it, or press Enter to skip.${NC}"
     printf '%s' "  Block IP (empty = skip): " >/dev/tty; read -r BIP </dev/tty || BIP=""
-    [ -n "$BIP" ] && iptables -I INPUT -s "$BIP" -j DROP 2>/dev/null && ok "$BIP blocked"
+    if [ -n "$BIP" ]; then
+        iptables -I INPUT -s "$BIP" -m comment --comment "auto-ban" -j DROP 2>/dev/null && \
+            ok "$BIP blocked" || warn "Could not block $BIP"
+    fi
     press_enter
 }
 
@@ -2512,11 +2543,18 @@ _monitor_dashboard() {
             SYNPROXY_HIT="${SYNPROXY_HIT//[^0-9]/}"; SYNPROXY_HIT="${SYNPROXY_HIT:-0}"
         fi
 
-        # ── Top attacking IPs right now ─────────────────────
-        local TOP_CONNS
-        TOP_CONNS=$(ss -tn 2>/dev/null | grep ESTAB | \
-            grep -oP '(\d{1,3}\.){3}\d{1,3}(?=:\d)' | grep -v '127\.0\.' | \
-            sort | uniq -c | sort -rn | head -6)
+        # ── Currently blocked attackers (REAL: from iptables DROP rules that
+        #    auto-ban/subnet-ban actually inserted; never the server's own IP) ──
+        local CUR_BANNED
+        CUR_BANNED=$(iptables -L INPUT -n 2>/dev/null | \
+            grep -E 'auto-ban|subnet-ban' | \
+            grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]+)?' | \
+            grep -v '^0\.0\.0\.0' | sort -u | head -6)
+
+        # ── Currently throttled (reputation-suspected, pre-ban) ──
+        local CUR_THROTTLED
+        CUR_THROTTLED=$(awk '{print $1}' /tmp/autoban_throttle 2>/dev/null | \
+            grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -4)
 
         # ── Recently banned IPs (last 8 from log) ───────────
         local RECENT_BANS=""
@@ -2574,29 +2612,30 @@ _monitor_dashboard() {
         echo -e "\033[2K  ${DIM}└──────────────────────────────────────────────────────────────┘${NC}"
         echo ""
 
-        # ── Row 3: Top IPs right now ─────────────────────────
-        echo -e "\033[2K  ${DIM}┌─ TOP CONNECTIONS RIGHT NOW (live) ──────────────────────────┐${NC}"
-        if [ -n "$TOP_CONNS" ]; then
-            echo -e "\033[2K  ${DIM}│  Conns    IP${NC}"
-            echo -e "\033[2K  ${DIM}│  ──────   ──────────────────${NC}"
-            local conn_count=0
-            while IFS= read -r line; do
-                local cnt ip
-                cnt=$(echo "$line" | awk '{print $1}')
-                ip=$(echo "$line" | awk '{print $2}')
-                [ -z "$ip" ] && continue
-                local cc=$G
-                [ "${cnt:-0}" -ge 50 ] 2>/dev/null && cc=$R || { [ "${cnt:-0}" -ge 20 ] 2>/dev/null && cc=$Y; }
-                echo -e "\033[2K  ${DIM}│${NC}  ${cc}${cnt}${NC}   ${ip}"
-                conn_count=$((conn_count+1))
-            done <<< "$TOP_CONNS"
-            while [ "$conn_count" -lt 6 ]; do
-                echo -e "\033[2K  ${DIM}│${NC}"
-                conn_count=$((conn_count+1))
-            done
-        else
-            for _ in 1 2 3 4 5 6; do echo -e "\033[2K  ${DIM}│  (no established connections)${NC}"; done
+        # ── Row 3: Active threats (REAL blocked/throttled attackers) ──
+        echo -e "\033[2K  ${DIM}┌─ ACTIVE THREATS (blocked / throttled attackers) ───────────┐${NC}"
+        local _tcount=0 _bip _tip
+        if [ -n "$CUR_BANNED" ]; then
+            while IFS= read -r _bip; do
+                [ -z "$_bip" ] && continue
+                echo -e "\033[2K  ${DIM}│${NC}  ${R}✗ BANNED${NC}   ${_bip}"
+                _tcount=$((_tcount+1))
+            done <<< "$CUR_BANNED"
         fi
+        if [ -n "$CUR_THROTTLED" ]; then
+            while IFS= read -r _tip; do
+                [ -z "$_tip" ] && continue
+                echo -e "\033[2K  ${DIM}│${NC}  ${Y}⚠ THROTTLED${NC} ${_tip}"
+                _tcount=$((_tcount+1))
+            done <<< "$CUR_THROTTLED"
+        fi
+        if [ "$_tcount" -eq 0 ]; then
+            echo -e "\033[2K  ${DIM}│  ${G}✓ No active threats${NC}"
+        fi
+        while [ "$_tcount" -lt 6 ]; do
+            echo -e "\033[2K  ${DIM}│${NC}"
+            _tcount=$((_tcount+1))
+        done
         echo -e "\033[2K  ${DIM}└──────────────────────────────────────────────────────────────┘${NC}"
         echo ""
 
