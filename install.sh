@@ -1100,6 +1100,11 @@ run_spinner() {
     return "$_rc"
 }
 
+# Standalone script helpers (not inherited from install.sh).
+info() { echo -e "  ${CYAN}->${NC}  $*"; }
+ok()   { echo -e "  ${GREEN}✓${NC}  $*"; }
+warn() { echo -e "  ${YELLOW}⚠${NC}  $*"; }
+
 # ── Pick the fastest reachable apt mirror ──────────────────
 # Tests a set of candidate mirrors with a SHORT per-mirror timeout (this is a
 # probe only) and echoes the URL of the fastest responsive one. The later
@@ -2273,7 +2278,13 @@ menu_proxy() {
         echo -e "  ${DIM}──────────────────────────────────────────────────${NC}"
         printf '%s' "  Enter number: " >/dev/tty; read -r CH </dev/tty || CH=""
         case "$CH" in
-            1) bash "$PROXY_SCRIPT" --install < /dev/tty; press_enter ;;
+            1) # Ensure the Cloudflare whitelist file exists before install so CF
+               # IPs are ALWAYS excluded from throttling (it can be deleted by an
+               # earlier uninstall/antiddos --remove in the same session).
+               mkdir -p /etc/antiddos
+               [ -s /etc/antiddos/cloudflare-ipv4.list ] || \
+                   printf "%s\n" "${CF_RANGES[@]}" > /etc/antiddos/cloudflare-ipv4.list
+               bash "$PROXY_SCRIPT" --install < /dev/tty; press_enter ;;
             2) echo ""
                printf '%s' "  Remove 3proxy completely? (y/N): " >/dev/tty; read -r _RC </dev/tty || _RC=""
                [[ "$_RC" == "y" || "$_RC" == "Y" ]] && bash "$PROXY_SCRIPT" --remove < /dev/tty || echo -e "  ${DIM}Cancelled.${NC}"
