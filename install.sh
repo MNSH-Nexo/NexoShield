@@ -848,7 +848,14 @@ SERVICE_FILE="/etc/systemd/system/3proxy.service"
 # ── Cloudflare IP ranges (loaded from shared data file) ──
 CF_RANGES=()
 if [ -f /etc/antiddos/cloudflare-ipv4.list ]; then
-    mapfile -t CF_RANGES < /etc/antiddos/cloudflare-ipv4.list
+    # Load CF ranges, skipping blank/whitespace-only lines. A stray blank line
+    # in the file would otherwise become an empty array entry, and feeding an
+    # empty source to iptables ("host/network '' not found") aborts the whole
+    # install — which previously left auto-ban uninstalled.
+    while IFS= read -r _cfl; do
+        _cfl="${_cfl//[[:space:]]/}"
+        [ -n "$_cfl" ] && CF_RANGES+=("$_cfl")
+    done < /etc/antiddos/cloudflare-ipv4.list
 else
     echo "WARN: /etc/antiddos/cloudflare-ipv4.list missing - CF whitelist empty" >&2
 fi
@@ -969,7 +976,14 @@ IF="${1:-eth0}"
 # ── Cloudflare IP ranges (loaded from shared data file) ──
 CF_RANGES=()
 if [ -f /etc/antiddos/cloudflare-ipv4.list ]; then
-    mapfile -t CF_RANGES < /etc/antiddos/cloudflare-ipv4.list
+    # Load CF ranges, skipping blank/whitespace-only lines. A stray blank line
+    # in the file would otherwise become an empty array entry, and feeding an
+    # empty source to iptables ("host/network '' not found") aborts the whole
+    # install — which previously left auto-ban uninstalled.
+    while IFS= read -r _cfl; do
+        _cfl="${_cfl//[[:space:]]/}"
+        [ -n "$_cfl" ] && CF_RANGES+=("$_cfl")
+    done < /etc/antiddos/cloudflare-ipv4.list
 else
     echo "WARN: /etc/antiddos/cloudflare-ipv4.list missing - CF whitelist empty" >&2
 fi
@@ -3152,7 +3166,14 @@ sep()     { echo -e "${CYAN}═════════════════�
 # ── Cloudflare IP ranges (loaded from shared data file) ──
 CF_RANGES=()
 if [ -f /etc/antiddos/cloudflare-ipv4.list ]; then
-    mapfile -t CF_RANGES < /etc/antiddos/cloudflare-ipv4.list
+    # Load CF ranges, skipping blank/whitespace-only lines. A stray blank line
+    # in the file would otherwise become an empty array entry, and feeding an
+    # empty source to iptables ("host/network '' not found") aborts the whole
+    # install — which previously left auto-ban uninstalled.
+    while IFS= read -r _cfl; do
+        _cfl="${_cfl//[[:space:]]/}"
+        [ -n "$_cfl" ] && CF_RANGES+=("$_cfl")
+    done < /etc/antiddos/cloudflare-ipv4.list
 else
     echo "WARN: /etc/antiddos/cloudflare-ipv4.list missing - CF whitelist empty" >&2
 fi
@@ -3876,7 +3897,14 @@ IF=${IF:-eth0}
 # ── Cloudflare IP ranges (loaded from shared data file) ──
 CF_RANGES=()
 if [ -f /etc/antiddos/cloudflare-ipv4.list ]; then
-    mapfile -t CF_RANGES < /etc/antiddos/cloudflare-ipv4.list
+    # Load CF ranges, skipping blank/whitespace-only lines. A stray blank line
+    # in the file would otherwise become an empty array entry, and feeding an
+    # empty source to iptables ("host/network '' not found") aborts the whole
+    # install — which previously left auto-ban uninstalled.
+    while IFS= read -r _cfl; do
+        _cfl="${_cfl//[[:space:]]/}"
+        [ -n "$_cfl" ] && CF_RANGES+=("$_cfl")
+    done < /etc/antiddos/cloudflare-ipv4.list
 else
     echo "WARN: /etc/antiddos/cloudflare-ipv4.list missing - CF whitelist empty" >&2
 fi
@@ -4490,7 +4518,14 @@ IF="${IF:-eth0}"
 # ── Cloudflare IP ranges (loaded from shared data file) ──
 CF_RANGES=()
 if [ -f /etc/antiddos/cloudflare-ipv4.list ]; then
-    mapfile -t CF_RANGES < /etc/antiddos/cloudflare-ipv4.list
+    # Load CF ranges, skipping blank/whitespace-only lines. A stray blank line
+    # in the file would otherwise become an empty array entry, and feeding an
+    # empty source to iptables ("host/network '' not found") aborts the whole
+    # install — which previously left auto-ban uninstalled.
+    while IFS= read -r _cfl; do
+        _cfl="${_cfl//[[:space:]]/}"
+        [ -n "$_cfl" ] && CF_RANGES+=("$_cfl")
+    done < /etc/antiddos/cloudflare-ipv4.list
 else
     echo "WARN: /etc/antiddos/cloudflare-ipv4.list missing - CF whitelist empty" >&2
 fi
