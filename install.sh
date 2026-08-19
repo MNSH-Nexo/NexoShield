@@ -904,6 +904,17 @@ setup_tc() {
         HANDLE=$((HANDLE + 1))
     done < <(get_server_ips)
 
+    # User whitelist → class 1:10 (unlimited, same as CF/self)
+    if [ -f "/etc/antiddos/whitelist.list" ]; then
+        while IFS= read -r WIP; do
+            WIP="${WIP%%#*}"; WIP="${WIP// /}"
+            [ -z "$WIP" ] && continue
+            tc filter add dev "$IF" parent 1: protocol ip prio $HANDLE \
+                u32 match ip src "$WIP" flowid 1:10 2>/dev/null || true
+            HANDLE=$((HANDLE + 1))
+        done < /etc/antiddos/whitelist.list
+    fi
+
     # ── WARP / WireGuard awareness ──────────────────────────
     # tc shapes the default-route interface. If a WireGuard/WARP tunnel is
     # present, its traffic egresses on a wg* device, so these filters would
@@ -1719,6 +1730,16 @@ for SIP in $(ip -4 addr show 2>/dev/null | grep 'inet ' | \
         u32 match ip src "$SIP/32" flowid 1:10 2>/dev/null || true
     HANDLE=$((HANDLE + 1))
 done
+# Add user whitelist (unlimited)
+if [ -f /etc/antiddos/whitelist.list ]; then
+    while IFS= read -r WIP; do
+        WIP="${WIP%%#*}"; WIP="${WIP// /}"
+        [ -z "$WIP" ] && continue
+        tc filter add dev "$IF" parent 1: protocol ip prio $HANDLE \
+            u32 match ip src "$WIP" flowid 1:10 2>/dev/null || true
+        HANDLE=$((HANDLE + 1))
+    done < /etc/antiddos/whitelist.list
+fi
 TCEOF
     chmod +x /opt/proxy-manager/tc-setup.sh
 
@@ -4662,6 +4683,17 @@ apply_iptables() {
         [ -z "$SIP" ] && continue
         ipt_ins INPUT -s "$SIP/32" -m comment --comment "self_whitelist" -j ACCEPT
     done < <(get_server_ips)
+
+    # ── Step 4b: User whitelist → ACCEPT (before ALL limits) ──
+    mkdir -p /etc/antiddos
+    touch "$WHITELIST_FILE"
+    if [ -f "$WHITELIST_FILE" ]; then
+        while IFS= read -r WIP; do
+            WIP="${WIP%%#*}"; WIP="${WIP// /}"
+            [ -z "$WIP" ] && continue
+            ipt_ins INPUT -s "$WIP" -m comment --comment "user_whitelist" -j ACCEPT
+        done < "$WHITELIST_FILE"
+    fi
     success "CF + self whitelist: added (${#CF_RANGES[@]} CF ranges + own IPs)"
 
     # ── Step 5: SYN Flood protection ─────────────────
@@ -4680,6 +4712,15 @@ apply_iptables() {
             iptables -t raw -C PREROUTING -s "$SIP/32" -j ACCEPT 2>/dev/null || \
             iptables -t raw -A PREROUTING -s "$SIP/32" -j ACCEPT
         done < <(get_server_ips)
+        # Also whitelist user whitelist in raw (SYNPROXY never touches them)
+        if [ -f "$WHITELIST_FILE" ]; then
+            while IFS= read -r WIP; do
+                WIP="${WIP%%#*}"; WIP="${WIP// /}"
+                [ -z "$WIP" ] && continue
+                iptables -t raw -C PREROUTING -s "$WIP" -j ACCEPT 2>/dev/null || \
+                iptables -t raw -A PREROUTING -s "$WIP" -j ACCEPT
+            done < "$WHITELIST_FILE"
+        fi
         iptables -t raw -C PREROUTING -p tcp --syn \
             -m conntrack --ctstate NEW -j CT --notrack 2>/dev/null || \
         iptables -t raw -A PREROUTING -p tcp --syn \
@@ -5099,6 +5140,11 @@ LOG="/var/log/auto-ban.log"
 BANNED_LIST="/etc/antiddos/banned.list"
 WATCH_LIST="/tmp/autoban_watch"
 THROTTLE_LIST="/tmp/autoban_throttle"
+# User whitelist — IPs/CIDRs exempt from ALL anti-DDoS limits.
+# Managed by the user via the menu (never auto-modified). One per line.
+# Lines starting with # are comments. Server's own IPs + CF IPs are always
+# exempt separately (see is_exempt), this file adds MORE whitelisted IPs.
+WHITELIST_FILE="/etc/antiddos/whitelist.list"
 
 # ── Reputation scoring state (persistent across cycles) ────
 # Each scored IP keeps: score, last connection count, last timestamp.
@@ -5964,11 +6010,28 @@ is_self_ip() {
     return 1
 }
 
-# Check if IP should be exempt (CF or self)
+# Check if IP is in the user whitelist (exact or within a listed CIDR)
+is_user_whitelisted() {
+    local ip="$1" entry
+    [ -f "$WHITELIST_FILE" ] || return 1
+    while IFS= read -r entry; do
+        entry="${entry%%#*}"            # strip comments
+        entry="${entry// /}"            # drop spaces
+        [ -z "$entry" ] && continue
+        case "$entry" in
+            */*) ip_in_cidr "$ip" "$entry" 2>/dev/null && return 0 ;;
+            *)   [ "$entry" = "$ip" ] && return 0 ;;
+        esac
+    done < "$WHITELIST_FILE"
+    return 1
+}
+
+# Check if IP should be exempt (CF or self or user-whitelisted)
 is_exempt() {
     local ip="$1"
     is_self_ip "$ip"  && return 0
     is_cf_ip   "$ip"  && return 0
+    is_user_whitelisted "$ip" && return 0
     return 1
 }
 
@@ -6436,6 +6499,17 @@ setup_tc() {
             u32 match ip src "$SIP/32" flowid 1:10 2>/dev/null || true
         HANDLE=$((HANDLE + 1))
     done < <(get_server_ips)
+
+    # User whitelist → class 1:10 (unlimited, same as CF/self)
+    if [ -f "$WHITELIST_FILE" ]; then
+        while IFS= read -r WIP; do
+            WIP="${WIP%%#*}"; WIP="${WIP// /}"
+            [ -z "$WIP" ] && continue
+            tc filter add dev "$MAIN_IF" parent 1: protocol ip prio $HANDLE \
+                u32 match ip src "$WIP" flowid 1:10 2>/dev/null || true
+            HANDLE=$((HANDLE + 1))
+        done < "$WHITELIST_FILE"
+    fi
 
     # ── WARP / WireGuard awareness ──────────────────────────
     if ip link show 2>/dev/null | grep -qE '^\s*[0-9]+:\s+(wg|utm|warp)[0-9]*[:@]'; then
@@ -7223,6 +7297,14 @@ for SIP in $(ip -4 addr show 2>/dev/null | grep 'inet ' | \
     tc filter add dev "$IF" parent 1: protocol ip prio $H \
         u32 match ip src "$SIP/32" flowid 1:10 2>/dev/null || true; H=$((H+1))
 done
+if [ -f /etc/antiddos/whitelist.list ]; then
+    while IFS= read -r WIP; do
+        WIP="${WIP%%#*}"; WIP="${WIP// /}"
+        [ -z "$WIP" ] && continue
+        tc filter add dev "$IF" parent 1: protocol ip prio $H \
+            u32 match ip src "$WIP" flowid 1:10 2>/dev/null || true; H=$((H+1))
+    done < /etc/antiddos/whitelist.list
+fi
 TCEOF
     chmod +x /opt/proxy-manager/tc-setup.sh
 
@@ -7392,7 +7474,7 @@ remove_rules() {
     success "Kernel hardening: removed"
 
     # iptables — delete by content match (line numbers shift after each delete, so loop)
-    MATCH_PAT="hashlimit\|SYNPROXY\|connlimit\|cf_whitelist\|auto-ban\|self_whitelist\|syn_flood\|udp_flood\|icmp_flood\|rst_flood\|bw_per_ip\|new_conn_rate\|http_req_rate"
+    MATCH_PAT="hashlimit\|SYNPROXY\|connlimit\|cf_whitelist\|auto-ban\|self_whitelist\|user_whitelist\|syn_flood\|udp_flood\|icmp_flood\|rst_flood\|bw_per_ip\|new_conn_rate\|http_req_rate"
     for TABLE in INPUT FORWARD; do
         while iptables -L "$TABLE" -n 2>/dev/null | grep -qE "$MATCH_PAT"; do
             RNUM=$(iptables -L "$TABLE" -n --line-numbers 2>/dev/null | \
@@ -7402,7 +7484,7 @@ remove_rules() {
         done
     done
     # raw table
-    while iptables -t raw -L PREROUTING -n 2>/dev/null | grep -qE "CT|notrack|cf_whitelist|self_whitelist"; do
+    while iptables -t raw -L PREROUTING -n 2>/dev/null | grep -qE "CT|notrack|cf_whitelist|self_whitelist|user_whitelist"; do
         RNUM=$(iptables -t raw -L PREROUTING -n --line-numbers 2>/dev/null | \
               grep -E "CT|notrack|ACCEPT" | awk '{print $1}' | head -1 || true)
         [ -z "$RNUM" ] && break
@@ -7530,6 +7612,85 @@ show_thresholds() {
     sep
 }
 
+# ── Whitelist manager ──────────────────────────────────────
+manage_whitelist() {
+    local WL="$WHITELIST_FILE"
+    mkdir -p /etc/antiddos
+    [ -f "$WL" ] || touch "$WL"
+
+    while true; do
+        clear; sep
+        echo -e "  ${CYAN}${BOLD}Whitelist Manager${NC}"
+        echo -e "  ${DIM}IPs/CIDRs here are exempt from ALL anti-DDoS limits:${NC}"
+        echo -e "  ${DIM}iptables rate-limit, connlimit, SYNPROXY, tc bandwidth, auto-ban.${NC}"
+        sep
+        if [ -s "$WL" ]; then
+            echo -e "  ${CYAN}Current whitelist:${NC}"
+            local N=0
+            while IFS= read -r E; do
+                [ -z "${E%%#*}" ] && continue
+                E="${E// /}"
+                [ -z "$E" ] && continue
+                N=$((N + 1))
+                printf "    ${GREEN}%s.${NC} %s\n" "$N" "$E"
+            done < "$WL"
+            echo ""
+        else
+            echo -e "  ${YELLOW}Whitelist is empty.${NC} (Server's own IPs + Cloudflare are always exempt automatically.)"
+            echo ""
+        fi
+        echo -e "  ${CYAN}a.${NC} Add IP/CIDR"
+        echo -e "  ${CYAN}d.${NC} Remove entry"
+        echo -e "  ${CYAN}0.${NC} Back"
+        sep
+        printf '%s' "  Enter choice: " >/dev/tty; read -r WCH </dev/tty || WCH=""
+        case "$WCH" in
+            a|A)
+                printf '%s' "  IP or CIDR to whitelist (e.g. 1.2.3.4 or 5.6.7.0/24): " >/dev/tty
+                read -r WIP </dev/tty || WIP=""
+                WIP="${WIP// /}"
+                if [ -z "$WIP" ]; then
+                    echo -e "  ${YELLOW}No input.${NC}"
+                elif grep -qF "$WIP" "$WL" 2>/dev/null; then
+                    echo -e "  ${YELLOW}Already in whitelist.${NC}"
+                else
+                    echo "$WIP" >> "$WL"
+                    echo -e "  ${GREEN}✓ Added: $WIP${NC}"
+                    # Apply to iptables + tc immediately (re-apply both)
+                    apply_iptables >/dev/null 2>&1 || true
+                    apply_tc_runtime "$MAIN_IF" >/dev/null 2>&1 || true
+                fi
+                printf '%s\n' "  Press Enter..." >/dev/tty; read -r _PE </dev/tty 2>/dev/null || true ;;
+            d|D)
+                printf '%s' "  Entry to remove (paste the exact IP/CIDR): " >/dev/tty
+                read -r RIP </dev/tty || RIP=""
+                RIP="${RIP// /}"
+                if [ -n "$RIP" ] && grep -qF "$RIP" "$WL" 2>/dev/null; then
+                    grep -vxF "$RIP" "$WL" > "$WL.tmp" && mv "$WL.tmp" "$WL"
+                    # Clean the empty case
+                    sed -i '/^[[:space:]]*$/d' "$WL" 2>/dev/null || true
+                    echo -e "  ${GREEN}✓ Removed: $RIP${NC}"
+                    apply_iptables >/dev/null 2>&1 || true
+                    apply_tc_runtime "$MAIN_IF" >/dev/null 2>&1 || true
+                else
+                    echo -e "  ${YELLOW}Not found.${NC}"
+                fi
+                printf '%s\n' "  Press Enter..." >/dev/tty; read -r _PE </dev/tty 2>/dev/null || true ;;
+            0) return 0 ;;
+            *) echo -e "  ${YELLOW}Invalid choice.${NC}"; sleep 1 ;;
+        esac
+    done
+}
+
+# Runtime tc re-apply for a single interface (used by whitelist manager)
+apply_tc_runtime() {
+    local IF="${1:-$(ip route show default 2>/dev/null | awk '/default/{print $5}' | head -1)}"
+    [ -z "$IF" ] && IF="eth0"
+    # Only re-run if tc is already configured
+    tc qdisc show dev "$IF" 2>/dev/null | grep -q htb || return 0
+    setup_tc "$IF" >/dev/null 2>&1 || true
+}
+
 # CLI args
 case "${1:-}" in
     --install|-i)    detect_env; do_install; exit 0 ;;
@@ -7541,6 +7702,7 @@ case "${1:-}" in
     --iptables)      detect_env; apply_iptables; exit 0 ;;
     --fail2ban)      detect_env; apply_fail2ban; exit 0 ;;
     --autoban)       detect_env; setup_autoban; exit 0 ;;
+    --whitelist|-w)  detect_env; manage_whitelist; exit 0 ;;
     --tc)            detect_env; setup_tc; exit 0 ;;
     --auto|-y)
         detect_env
@@ -7587,6 +7749,7 @@ while true; do
     echo -e "  ${CYAN}7.${NC}  Smart ban only"
     echo -e "  ${CYAN}8.${NC}  tc bandwidth only"
     echo -e "  ${CYAN}9.${NC}  Unban IP (all layers)"
+    echo -e "  ${CYAN}w.${NC}  Manage whitelist (IPs exempt from ALL limits)"
     echo -e "  ${CYAN}r.${NC}  Remove all rules"
     echo -e "  ${CYAN}0.${NC}  Back"
     sep
@@ -7617,6 +7780,7 @@ while true; do
                echo -e "  ${GREEN}✓ $UIP fully unblocked${NC}"
            }
            printf '%s\n' "  Press Enter to continue..." >/dev/tty; read -r _PE </dev/tty 2>/dev/null || true ;;
+        w|W) manage_whitelist ;;
         r) remove_rules; printf '%s\n' "  Press Enter to continue..." >/dev/tty; read -r _PE </dev/tty 2>/dev/null || true ;;
         0) exit 0 ;;
     esac
