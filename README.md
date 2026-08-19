@@ -187,6 +187,10 @@ MIT License — آزادانه استفاده، تغییر و توزیع کن.
 
 ## Credits
 
+<a href="https://happyseeds.ai">
+  <img src="happyseeds.png" width="64" alt="HappySeeds AI" />
+</a>
+
 Built with the assistance of [HappySeeds AI](https://happyseeds.ai)
 
 ---
