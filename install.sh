@@ -904,6 +904,17 @@ setup_tc() {
         HANDLE=$((HANDLE + 1))
     done < <(get_server_ips)
 
+    # ── WARP / WireGuard awareness ──────────────────────────
+    # tc shapes the default-route interface. If a WireGuard/WARP tunnel is
+    # present, its traffic egresses on a wg* device, so these filters would
+    # NOT shape tunneled traffic — warn the user (conditional, non-intrusive).
+    if ip link show 2>/dev/null | grep -qE '^\s*[0-9]+:\s+(wg|utm|warp)[0-9]*[:@]'; then
+        echo -e "${YELLOW}⚠ WARP/WireGuard tunnel detected on a different interface.${NC}"
+        echo -e "   tc is applied to '${IF}' (default route). Tunneled (WARP) traffic"
+        echo -e "   leaves via the tunnel device and is NOT shaped by these limits."
+        echo -e "   This is intentional & safe — inbound anti-DDoS (iptables) still applies."
+    fi
+
     echo -e "${GREEN}✓ tc bandwidth control configured (CF=unlimited, others=500Mbps)${NC}"
 }
 
@@ -2481,7 +2492,10 @@ net.netfilter.nf_conntrack_tcp_timeout_time_wait = 10
 net.netfilter.nf_conntrack_tcp_timeout_fin_wait = 10
 net.netfilter.nf_conntrack_tcp_timeout_close_wait = 10
 net.netfilter.nf_conntrack_udp_timeout = 15
-net.netfilter.nf_conntrack_udp_timeout_stream = 30
+# stream=120: WARP/WireGuard keepalive (25s) must never expire the tunnel.
+# 120 = ~5x keepalive — absorbs packet-loss/jitter, still < kernel default (180).
+# UDP-flood protection comes from hashlimit, not this timeout, so it's safe.
+net.netfilter.nf_conntrack_udp_timeout_stream = 120
 net.netfilter.nf_conntrack_icmp_timeout = 5
 net.netfilter.nf_conntrack_generic_timeout = 60
 EOF
@@ -4581,7 +4595,10 @@ net.netfilter.nf_conntrack_tcp_timeout_time_wait = 10
 net.netfilter.nf_conntrack_tcp_timeout_fin_wait = 10
 net.netfilter.nf_conntrack_tcp_timeout_close_wait = 10
 net.netfilter.nf_conntrack_udp_timeout = 15
-net.netfilter.nf_conntrack_udp_timeout_stream = 30
+# stream=120: WARP/WireGuard keepalive (25s) must never expire the tunnel.
+# 120 = ~5x keepalive — absorbs packet-loss/jitter, still < kernel default (180).
+# UDP-flood protection comes from hashlimit, not this timeout, so it's safe.
+net.netfilter.nf_conntrack_udp_timeout_stream = 120
 net.netfilter.nf_conntrack_icmp_timeout = 5
 net.netfilter.nf_conntrack_generic_timeout = 60
 
@@ -6419,6 +6436,12 @@ setup_tc() {
             u32 match ip src "$SIP/32" flowid 1:10 2>/dev/null || true
         HANDLE=$((HANDLE + 1))
     done < <(get_server_ips)
+
+    # ── WARP / WireGuard awareness ──────────────────────────
+    if ip link show 2>/dev/null | grep -qE '^\s*[0-9]+:\s+(wg|utm|warp)[0-9]*[:@]'; then
+        warn "WARP/WireGuard tunnel detected — tc shapes '${MAIN_IF}' (default route)."
+        warn "Tunneled (WARP) traffic egresses via the tunnel device and is NOT shaped; inbound anti-DDoS (iptables) still applies."
+    fi
 
     success "tc: CF=unlimited, others=500Mbps, throttled=100Mbps"
 
