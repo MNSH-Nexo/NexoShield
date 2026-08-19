@@ -2596,8 +2596,14 @@ menu_security() {
                    iptables -D INPUT -s "$UIP" -j DROP 2>/dev/null && ok "iptables: unblocked" || true
                    # Remove from auto-ban if running
                    [ -f /opt/proxy-manager/auto-ban.sh ] && {
-                       tc filter del dev "$(ip route show default | awk '/default/{print $5}' | head -1)" \
-                           parent 1: 2>/dev/null || true
+                       # Remove ONLY this IP's throttle filter (never 'parent 1:'
+                       # bare — that deletes every filter incl. the CF whitelist).
+                       local _IFP _PRIO
+                       _IFP=$(ip route show default | awk '/default/{print $5}' | head -1)
+                       _PRIO=$(grep -F "$UIP " /tmp/autoban_throttle 2>/dev/null | \
+                               awk '{print $2}' | head -1 || true)
+                       [ -n "$_PRIO" ] && tc filter del dev "$_IFP" parent 1: prio "$_PRIO" 2>/dev/null || true
+                       sed -i "/^$UIP /d" /tmp/autoban_throttle 2>/dev/null || true
                    }
                    fail2ban-client status 2>/dev/null | grep "Jail list" | \
                        sed 's/.*://;s/,/\n/g' | tr -d ' ' | while read -r j; do
@@ -2983,6 +2989,7 @@ SYSCTL_FILE="/etc/sysctl.d/98-antiddos-hardening.conf"
 IPTABLES_SAVE_FILE="/etc/antiddos/iptables-antiddos.rules"
 AUTOBAN_SCRIPT="/opt/proxy-manager/auto-ban.sh"
 AUTOBAN_SERVICE="/etc/systemd/system/auto-ban.service"
+WHITELIST_FILE="/etc/antiddos/whitelist.list"
 
 [ "$EUID" -ne 0 ] && echo -e "${RED}Root required${NC}" && exit 1
 
@@ -3802,16 +3809,23 @@ is_exempt() {
     return 1
 }
 
+# Reserved tc filter priority bands (must never overlap):
+#   whitelist (CF + server-own + user)  : 10 .. <10000  (allocated in tc-setup.sh)
+#   throttle (100Mbps class 1:30)       : 10000 ..
+#   hard-throttle (50Mbps class 1:40)   : 20000 ..
+# This guarantees a throttle filter can NEVER collide with a Cloudflare/server
+# whitelist filter, so CF and the server itself stay exempt even at ban time
+# (ban_ip deletes only the recorded throttle-band prio).
 throttle_ip() {
     local ip="$1"
     is_exempt "$ip" && return 0
-    grep -qF "$ip" "$THROTTLE_LIST" 2>/dev/null && return 0
-    echo "$ip $(date +%s)" >> "$THROTTLE_LIST"
+    grep -qF "$ip " "$THROTTLE_LIST" 2>/dev/null && return 0
     # Add to tc class 1:30 (100Mbps)
     local HANDLE
     local _WC; _WC=$(wc -l < "$THROTTLE_LIST" 2>/dev/null || echo 1)
     _WC="${_WC//[^0-9]/}"; _WC="${_WC:-1}"
-    HANDLE=$(( _WC + 200 ))
+    HANDLE=$(( 10000 + _WC ))
+    echo "$ip $HANDLE $(date +%s)" >> "$THROTTLE_LIST"
     tc filter add dev "$IF" parent 1: protocol ip prio $HANDLE \
         u32 match ip src "$ip/32" flowid 1:30 2>/dev/null || true
     log " THROTTLE: $ip -> 100Mbps (will ban in ${OBSERVE_SECONDS}s if continues)"
@@ -3826,8 +3840,15 @@ throttle_ip() {
 hard_throttle_ip() {
     local ip="$1"
     is_exempt "$ip" && return 0
+    # Drop any earlier throttle entry for this IP so the tc filter list stays
+    # consistent and no stale prio is left behind (its filter would still match).
+    local _OLD
+    _OLD=$(grep -F "$ip " "$THROTTLE_LIST" 2>/dev/null | awk '{print $2}' | head -1 || true)
+    [ -n "$_OLD" ] && tc filter del dev "$IF" parent 1: prio "$_OLD" 2>/dev/null || true
+    sed -i "/^$ip /d" "$THROTTLE_LIST" 2>/dev/null || true
     local HANDLE
-    HANDLE=$(( 300 + ( RANDOM % 4000 ) ))
+    HANDLE=$(( 20000 + ( RANDOM % 4000 ) ))
+    echo "$ip $HANDLE $(date +%s) hard" >> "$THROTTLE_LIST"
     tc filter add dev "$IF" parent 1: protocol ip prio $HANDLE \
         u32 match ip src "$ip/32" flowid 1:40 2>/dev/null || \
     tc filter add dev "$IF" parent 1: protocol ip prio $HANDLE \
@@ -3838,14 +3859,20 @@ hard_throttle_ip() {
 ban_ip() {
     local ip="$1"
     is_exempt "$ip" && return 0
-    grep -qF "$ip" "$BANNED_LIST" 2>/dev/null && return 0
+    grep -qF "$ip " "$BANNED_LIST" 2>/dev/null && return 0
     local UNBAN_TIME
     UNBAN_TIME=$(date -d "+${BAN_HOURS} hours" '+%H:%M:%S' 2>/dev/null || \
                  date -v "+${BAN_HOURS}H" '+%H:%M:%S' 2>/dev/null || echo "N/A")
     iptables -I INPUT -s "$ip" -m comment --comment "auto-ban" -j DROP 2>/dev/null || true
     echo "$ip $(date +%s) $((BAN_HOURS * 3600))" >> "$BANNED_LIST"
-    # Remove throttle filter
-    tc filter del dev "$IF" parent 1: 2>/dev/null || true
+    # Remove ONLY this IP's throttle/hard-throttle tc filter.
+    # NOTE: never run 'tc filter del dev "$IF" parent 1:' here — that deletes
+    # EVERY filter including the Cloudflare + server-own whitelist, which would
+    # throttle CF traffic. We remove the one filter recorded for this IP.
+    local _PRIO
+    _PRIO=$(grep -F "$ip " "$THROTTLE_LIST" 2>/dev/null | awk '{print $2}' | head -1 || true)
+    [ -n "$_PRIO" ] && tc filter del dev "$IF" parent 1: prio "$_PRIO" 2>/dev/null || true
+    sed -i "/^$ip /d" "$THROTTLE_LIST" 2>/dev/null || true
     log " BANNED: $ip | unban: $UNBAN_TIME"
 }
 
@@ -3978,6 +4005,23 @@ ban_subnet() {
     local own_subnet
     own_subnet=$(ip -4 addr show 2>/dev/null | grep -oP '(?<=inet )\d+\.\d+\.\d+' | head -1)
     [ "${own_subnet:-x}" = "$subnet" ] && return 0
+    # Don't ban if any user-whitelisted IP/CIDR falls inside this /24 subnet —
+    # whitelisted users must never be dropped even under distributed attacks.
+    local _ENTRY _EIP
+    if [ -f "$WHITELIST_FILE" ]; then
+        while IFS= read -r _ENTRY; do
+            _ENTRY="${_ENTRY%%#*}"; _ENTRY="${_ENTRY// /}"
+            [ -z "$_ENTRY" ] && continue
+            case "$_ENTRY" in
+                */*) _EIP="${_ENTRY%%/*}" ;;
+                *)   _EIP="$_ENTRY" ;;
+            esac
+            if [ "$(echo "$_EIP" | grep -oP '^\d+\.\d+\.\d+' 2>/dev/null)" = "$subnet" ]; then
+                log " SUBNET SKIP: $cidr overlaps whitelisted $_ENTRY"
+                return 0
+            fi
+        done < "$WHITELIST_FILE"
+    fi
     # Already banned?
     iptables -C INPUT -s "$cidr" -m comment --comment "subnet-ban" -j DROP 2>/dev/null && return 0
     iptables -I INPUT -s "$cidr" -m comment --comment "subnet-ban" -j DROP 2>/dev/null || true
@@ -4131,18 +4175,18 @@ while true; do
         # Still hot → keep throttled, let scoring manage it.
         [ "${CONN_COUNT[$ip]:-0}" -ge "$CONN_THRESHOLD" ] && continue
         # Not banned, no longer hot → release to normal class (1:20).
-        # We remove the throttle entry and let the next cycle re-throttle only
-        # if it misbehaves again. The tc filter for 1:30 stays until the qdisc is
-        # rebuilt, but a fresh normal filter on the next misbehavior wins because
-        # HTB matches highest prio first; simplest robust approach is to restore
-        # it to class 1:20 explicitly.
-        _RELEASE_HANDLE=$(( 500 + ( RANDOM % 3000 ) ))
-        tc filter add dev "$IF" parent 1: protocol ip prio $_RELEASE_HANDLE \
-            u32 match ip src "$ip/32" flowid 1:20 2>/dev/null || true
-        sed -i "/$ip/d" "$THROTTLE_LIST" 2>/dev/null || true
+        # Remove THIS IP's throttle filter by its recorded prio (never a bare
+        # 'parent 1:' delete, and never a competing add — an added release
+        # filter would out-prio the throttle band and permanently defeat
+        # re-throttling of this IP, plus it would accumulate on the iface).
+        _RELEASE_PRIO=$(grep -F "$ip " "$THROTTLE_LIST" 2>/dev/null | \
+                        awk '{print $2}' | head -1 || true)
+        [ -n "$_RELEASE_PRIO" ] && \
+            tc filter del dev "$IF" parent 1: prio "$_RELEASE_PRIO" 2>/dev/null || true
+        sed -i "/^$ip /d" "$THROTTLE_LIST" 2>/dev/null || true
         sed -i "/$ip/d" "$WATCH_LIST" 2>/dev/null || true
         clear_reputation "$ip"
-        log " AUTO-RELEASE: $ip (calmed down) → normal class"
+        log " AUTO-RELEASE: $ip (calmed down) → normal class (1:20)"
     done < "$THROTTLE_LIST" 2>/dev/null || true
 
     # ── Subnet /24 botnet detection ──────────────────────────
