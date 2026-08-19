@@ -204,23 +204,26 @@ MIT License — آزادانه استفاده، تغییر و توزیع کن.
 
 ## Credits & Contributors
 
-**همکاران این پروژه** — از مشارکت این دو نفر در توسعه و بهبود NexoShield سپاسگزاریم:
+با صمیمانه‌ترین تقدیر و سپاس از **Xarheon** و **AssA7778** که با زمان، حوصله و دانش خود در توسعه و بهبود NexoShield سهیم بودند. همراهی ارزشمند شما برای این پروژه مایه‌ی دلگرمی است — بی‌نهایت سپاسگزاریم.
 
-<p align="center">
-  <a href="https://github.com/Xarheon">
-    <img src="https://github.com/Xarheon.png?size=100" width="100" height="100" alt="Xarheon" />
-    <br />
-    <sub><b>Xarheon</b></sub>
-  </a>
-  &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
-  <a href="https://github.com/AssA7778">
-    <img src="https://github.com/AssA7778.png?size=100" width="100" height="100" alt="AssA7778" />
-    <br />
-    <sub><b>AssA7778</b></sub>
-  </a>
-</p>
-
-<br />
+<table>
+  <tr>
+    <td align="center">
+      <a href="https://github.com/Xarheon">
+        <img src="https://github.com/Xarheon.png?size=120" width="120" height="120" alt="Xarheon" />
+        <br />
+        <sub><b>Xarheon</b></sub>
+      </a>
+    </td>
+    <td align="center">
+      <a href="https://github.com/AssA7778">
+        <img src="https://github.com/AssA7778.png?size=120" width="120" height="120" alt="AssA7778" />
+        <br />
+        <sub><b>AssA7778</b></sub>
+      </a>
+    </td>
+  </tr>
+</table>
 
 <a href="https://happyseeds.ai">
   <img src="happyseeds.png" width="64" alt="HappySeeds AI" />
