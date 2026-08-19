@@ -25,6 +25,19 @@ You can use it purely for **server security** — or also enable the built-in **
 
 ---
 
+## امکانات
+
+- 🛡 **۵ لایه حفاظت DDoS** — kernel hardening، iptables، fail2ban، smart auto-ban و tc
+- 🧠 **Smart Auto-Ban با امتیازدهی Reputation** — تمایز کاربرِ سنگینِ واقعی از بات
+- ☁️ **753 رنج رسمی Cloudflare** — کاربران CF همیشه نامحدود و بدون ban
+- ⚡ **نصب در کمتر از ۵ دقیقه** — فقط با یک دستور
+- 📊 **داشبورد real-time** برای مانیتور حمله، banها و top IPها
+- 🛠 **SOCKS5 Proxy Manager** اختیاری (3proxy) با پسورد تصادفی و لاگ زنده
+- 🔄 **SnapShot و Rollback** برای تنظیمات kernel
+- 🚫 **تشخیص Subnet botnet** برای حمله‌های توزیع‌شده از یک /24
+
+---
+
 ## نصب آسان
 
 **یک دستور — همه چیز آماده:**
@@ -125,20 +138,24 @@ Auto-detect سخت‌افزار و تنظیم threshold متناسب — مان�
 Connection Detected
         │
         ▼
-  conns ≥ 80/IP ──────────────────► WATCHING (30s)
-        │                                  │
-        │                     still high after 30s?
-        │                                  │
-  conns ≥ 200/IP ──► INSTANT BAN 4h        ▼
-                                    THROTTLE 50Mbps
-                                           │
-                                    still high after 30s?
-                                           │
-                                           ▼
-                                       BAN 4 hours
+  active conns ≥ 120/IP ────────────► WATCHING (observe 45s)
+        │                                       │
+        │                        still high after 45s?
+        │                                       │
+  active conns ≥ 300/IP ─► INSTANT BAN          ▼
+                        (4h)            THROTTLE 100 Mbps
+                                                │
+                                       still high after 45s?
+                                                │
+                                                ▼
+                                            BAN 4 hours
 
-  /24 subnet ≥ 300 total ──► WATCHING subnet
-  /24 subnet ≥ 800 total ──► BAN entire /24 CIDR (botnet defense)
+  /24 subnet ≥ 400 total ──► WATCHING subnet
+  /24 subnet ≥ 1000 total ──► BAN entire /24 CIDR (botnet defense)
+
+  Reputation scoring:  80+ normal → 60+ watch → 40+ 100M throttle
+                       → 20+ 50M → <20 instant ban (4h)
+  auto-release:        IPs that calm down are automatically released
 ```
 
 ---
@@ -185,7 +202,25 @@ MIT License — آزادانه استفاده، تغییر و توزیع کن.
 
 ---
 
-## Credits
+## Credits & Contributors
+
+**همکاران این پروژه** — از مشارکت این دو نفر در توسعه و بهبود NexoShield سپاسگزاریم:
+
+<p align="center">
+  <a href="https://github.com/Xarheon">
+    <img src="https://github.com/Xarheon.png?size=100" width="100" height="100" alt="Xarheon" />
+    <br />
+    <sub><b>Xarheon</b></sub>
+  </a>
+  &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+  <a href="https://github.com/AssA7778">
+    <img src="https://github.com/AssA7778.png?size=100" width="100" height="100" alt="AssA7778" />
+    <br />
+    <sub><b>AssA7778</b></sub>
+  </a>
+</p>
+
+<br />
 
 <a href="https://happyseeds.ai">
   <img src="happyseeds.png" width="64" alt="HappySeeds AI" />
