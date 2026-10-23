@@ -30,6 +30,25 @@ those waves land.
   list is empty). Tests: exempt_check 10/10, daemon whitelist
   validation 5/5 (garbage masks can no longer widen a match, BUG-029
   daemon half). `make check` + `make test` green.
+- Wave 2 — DONE. BUG-001: every tc filter (both setups, both generated
+  persistence scripts, daemon throttle/hard-throttle) now classifies by
+  `ip dst` — on an egress qdisc the client is the destination, so the
+  throttle pipeline can fire for the first time. BUG-021: daemon prios
+  come from a persistent monotonic counter (`tc-prio.seq`, ≥20001),
+  never reused; line-count and RANDOM allocation deleted. BUG-024:
+  throttle state is written only after the tc filter lands, and a
+  missing class (autoban-only mode) is a logged skip, not a fake
+  throttle. BUG-022: generated tc-setup.sh scripts re-apply recorded
+  daemon throttles after any qdisc rebuild, and the daemon re-applies
+  them at startup; THROTTLE_LIST entries gained a band field (soft/hard).
+  BUG-032 (tc legs): 3proxy's generated script receives the detected
+  link speed (placeholder-substituted) instead of hardcoding 1gbit, and
+  both setups record the pre-existing qdisc before replacing it.
+  BUG-036 (tc leg): apply_tc_runtime verifies class 1:30 exists after a
+  rebuild and warns otherwise. Tests: stub-tc suite 12/12 (dst matching,
+  unique persistent prios, no state on tc failure, no state without
+  classes, hard-throttle band transitions). `make check` + `make test`
+  green (57 tests total).
 
 **Inputs:** `docs/BUGS.md` — 68 audited findings (BUG-001…068) plus the
 maintainer's field reports FR-1 (whitelist must exempt from *everything*),

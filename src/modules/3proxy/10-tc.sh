@@ -11,7 +11,9 @@ setup_tc() {
         [ -n "$SPEED" ] && BW="${SPEED}mbit"
     }
 
-    # Remove old tc config
+    # Remove old tc config (record what was there first - BUG-032)
+    mkdir -p /etc/antiddos
+    tc qdisc show dev "$IF" 2>/dev/null | head -1 > /etc/antiddos/tc-qdisc-before.txt || true
     tc qdisc del dev "$IF" root 2>/dev/null || true
 
     # HTB root
@@ -28,7 +30,7 @@ setup_tc() {
         # skip IPv6 if kernel doesn't support tc ip6
         [[ "$CF" == *":"* ]] && continue
         tc filter add dev "$IF" parent 1: protocol ip prio $HANDLE \
-            u32 match ip src "$CF" flowid 1:10 2>/dev/null || true
+            u32 match ip dst "$CF" flowid 1:10 2>/dev/null || true
         HANDLE=$((HANDLE + 1))
     done
 
@@ -36,7 +38,7 @@ setup_tc() {
     while IFS= read -r SIP; do
         [ -z "$SIP" ] && continue
         tc filter add dev "$IF" parent 1: protocol ip prio $HANDLE \
-            u32 match ip src "$SIP/32" flowid 1:10 2>/dev/null || true
+            u32 match ip dst "$SIP/32" flowid 1:10 2>/dev/null || true
         HANDLE=$((HANDLE + 1))
     done < <(get_server_ips)
 
@@ -46,7 +48,7 @@ setup_tc() {
             WIP="${WIP%%#*}"; WIP="${WIP// /}"
             [ -z "$WIP" ] && continue
             tc filter add dev "$IF" parent 1: protocol ip prio $HANDLE \
-                u32 match ip src "$WIP" flowid 1:10 2>/dev/null || true
+                u32 match ip dst "$WIP" flowid 1:10 2>/dev/null || true
             HANDLE=$((HANDLE + 1))
         done < /etc/antiddos/whitelist.list
     fi
@@ -86,6 +88,15 @@ RemainAfterExit=yes
 WantedBy=multi-user.target
 EOF
 
+    # Detected link speed must reach the generated script (BUG-032: it
+    # hardcoded 1gbit even on 10G links). Written via a placeholder that
+    # is substituted after the quoted heredoc lands.
+    local BW="1gbit"
+    command -v ethtool >/dev/null 2>&1 && {
+        local SPEED; SPEED=$(ethtool "$IF" 2>/dev/null | grep Speed | awk '{print $2}' | grep -oP '\d+' | head -1)
+        [ -n "$SPEED" ] && BW="${SPEED}mbit"
+    }
+
     # Write tc-setup.sh
     cat > /opt/proxy-manager/tc-setup.sh << 'TCEOF'
 #!/bin/bash
@@ -94,22 +105,22 @@ IF="${1:-eth0}"
 # @include lib/cloudflare-loader.sh
 tc qdisc del dev "$IF" root 2>/dev/null || true
 tc qdisc add dev "$IF" root handle 1: htb default 20
-tc class add dev "$IF" parent 1: classid 1:1  htb rate 1gbit ceil 1gbit
-tc class add dev "$IF" parent 1:1 classid 1:10 htb rate 1gbit  ceil 1gbit  burst 25Mb
+tc class add dev "$IF" parent 1: classid 1:1  htb rate __BW__ ceil __BW__
+tc class add dev "$IF" parent 1:1 classid 1:10 htb rate __BW__  ceil __BW__  burst 25Mb
 tc class add dev "$IF" parent 1:1 classid 1:20 htb rate 500mbit ceil 500mbit burst 6400Kb
 tc class add dev "$IF" parent 1:1 classid 1:30 htb rate 100mbit ceil 100mbit burst 1280Kb
 tc class add dev "$IF" parent 1:1 classid 1:40 htb rate 50mbit  ceil 50mbit  burst 640Kb
 HANDLE=10
 for CF in "${CF_RANGES[@]}"; do
     tc filter add dev "$IF" parent 1: protocol ip prio $HANDLE \
-        u32 match ip src "$CF" flowid 1:10 2>/dev/null || true
+        u32 match ip dst "$CF" flowid 1:10 2>/dev/null || true
     HANDLE=$((HANDLE + 1))
 done
 # Add server own IPs
 for SIP in $(ip -4 addr show 2>/dev/null | grep 'inet ' | \
     grep -v '127\.\|10\.\|192\.168\.' | awk '{print $2}' | cut -d/ -f1); do
     tc filter add dev "$IF" parent 1: protocol ip prio $HANDLE \
-        u32 match ip src "$SIP/32" flowid 1:10 2>/dev/null || true
+        u32 match ip dst "$SIP/32" flowid 1:10 2>/dev/null || true
     HANDLE=$((HANDLE + 1))
 done
 # Add user whitelist (unlimited)
@@ -118,11 +129,22 @@ if [ -f /etc/antiddos/whitelist.list ]; then
         WIP="${WIP%%#*}"; WIP="${WIP// /}"
         [ -z "$WIP" ] && continue
         tc filter add dev "$IF" parent 1: protocol ip prio $HANDLE \
-            u32 match ip src "$WIP" flowid 1:10 2>/dev/null || true
+            u32 match ip dst "$WIP" flowid 1:10 2>/dev/null || true
         HANDLE=$((HANDLE + 1))
     done < /etc/antiddos/whitelist.list
 fi
+# Re-apply live daemon throttles (BUG-022): a qdisc rebuild must not
+# silently drop enforcement state recorded by the auto-ban daemon.
+if [ -f /etc/antiddos/throttled.list ]; then
+    while read -r TIP TPRIO TTS TBAND; do
+        [ -z "$TIP" ] && continue
+        TFLOW=1:30; [ "$TBAND" = "hard" ] && TFLOW=1:40
+        tc filter add dev "$IF" parent 1: protocol ip prio $TPRIO \
+            u32 match ip dst "$TIP/32" flowid $TFLOW 2>/dev/null || true
+    done < /etc/antiddos/throttled.list
+fi
 TCEOF
+    sed -i "s/__BW__/$BW/g" /opt/proxy-manager/tc-setup.sh
     chmod +x /opt/proxy-manager/tc-setup.sh
 
     # Also add to if-up.d for NetworkManager

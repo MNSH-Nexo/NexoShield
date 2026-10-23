@@ -54,6 +54,10 @@ log " Smart throttle+ban started (conn_threshold:${CONN_THRESHOLD} ban_threshold
 
 score_init
 
+# Restore throttle filters recorded before a restart/reboot (the qdisc
+# may have been rebuilt without them - see reapply_throttles, BUG-022).
+reapply_throttles
+
 CYCLE=0
 while true; do
     CYCLE=$((CYCLE + 1))

@@ -198,6 +198,10 @@ apply_tc_runtime() {
     # Only re-run if tc is already configured
     tc qdisc show dev "$IF" 2>/dev/null | grep -q htb || return 0
     setup_tc "$IF" >/dev/null 2>&1 || true
+    # BUG-036: verify the rebuild actually produced the throttle classes
+    # instead of reporting success on faith.
+    tc class show dev "$IF" 2>/dev/null | grep -q 'class htb 1:30' || \
+        warn "tc re-apply: class 1:30 missing on $IF after rebuild - throttling unavailable"
 }
 
 # CLI args
