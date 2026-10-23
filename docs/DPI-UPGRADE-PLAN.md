@@ -124,7 +124,23 @@ and bytes/conn <= 2000 -> min(10, (cur_est - 30) / 10) points/min
 ("slow" log component). Rate features are structurally blind to
 Slowloris-class attacks; age x bytes is the cheap behavioural pair.
 
-## Phase 3 — XDP escape hatch (dormant insurance)
+## Phase 3 — XDP escape hatch (dormant insurance) — DONE in v3.10.0
+
+As built: `src/native/nx_xdp.c` (LPM-trie ban/exempt maps, per-CPU
+counters, pure-SYN drops only, exempt checked first) +
+`src/native/nx-xdp-loader.c` (load native→generic fallback, pinned
+maps, sync from daemon state files, `check` parse-validation).
+The daemon (26-xdp.sh) attaches ONLY on kernel distress
+(SyncookiesSent >500/min, ListenOverflows >1000/min, or SYN arrivals
+>3000/s sustained 15 cycles), re-syncs when ban state changes, and
+detaches after `xdp_calm_seconds` (600) of calm. Installer builds
+only with clang+libbpf (one best-effort package attempt); absent
+toolchain = feature dormant, zero behaviour change. In-sandbox
+verification: loader compiled against a stub libbpf API (parser +
+fail-soft paths, 8/8), daemon state machine stub-tested (17/17);
+eBPF object compile + live attach are field-owed (no clang in the
+build sandbox; netns blocked), joining the live-fire battery.
+Deferred per plan: HeavyKeeper, offline weight distillation.
 
 `src/native/nx_xdp.c`: XDP program with an LPM-trie ban map (v4+v6,
 values carry expiry) and per-CPU counters (SYNs seen, drops). Loader
