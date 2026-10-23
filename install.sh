@@ -3,7 +3,7 @@ exec bash <(tr -d '\r' < "$0" | tail -n +3) "$@"
 #!/bin/bash
 # ── GENERATED FILE ─ built by tools/build.py from src/ ─ do not edit directly; edit the sources and rebuild ──
 # ============================================================
-#  Proxy Manager - Auto Installer  v3.6.0
+#  Proxy Manager - Auto Installer  v3.7.0
 #  One file, one command, everything ready
 #
 #  Install:
@@ -28,7 +28,7 @@ exec bash <(tr -d '\r' < "$0" | tail -n +3) "$@"
 # ============================================================
 set -euo pipefail
 
-VERSION="3.6.0"
+VERSION="3.7.0"
 INSTALL_DIR="/opt/proxy-manager"
 BIN_LINK="/usr/local/bin/proxy"
 LOG="/var/log/proxy-manager-install.log"
@@ -1874,7 +1874,7 @@ TARGET_FILE="/etc/sysctl.d/99-vpn-optimized.conf"
 SNAPSHOT_DIR="/var/lib/vpn-sysctl-snapshots"
 LOG_FILE="/var/log/vpn-sysctl-optimizer.log"
 LOCK_FILE="/var/run/vpn-sysctl.lock"
-SCRIPT_VERSION="3.6.0"
+SCRIPT_VERSION="3.7.0"
 
 [ "$EUID" -ne 0 ] && echo -e "${RED}Root required${NC}" && exit 1
 
@@ -2465,7 +2465,7 @@ cat > "$INSTALL_DIR/.proxy-menu.sh.nxnew" << 'MENU_SCRIPT'
 # SC2094 - atomic state writes via tmp-file + rename, which the
 # checker flags as same-file pipelines. Both classes were audited
 # site-by-site during the fix waves (docs/FIX-PLAN.md).
-VERSION="3.6.0"
+VERSION="3.7.0"
 INSTALL_DIR="/opt/proxy-manager"
 _BSRC="${BASH_SOURCE[0]:-}"
 if [ -n "$_BSRC" ] && [ "$_BSRC" != "/dev/stdin" ] && [[ "$_BSRC" != /dev/fd/* ]]; then
@@ -2534,10 +2534,7 @@ get_ip() {
 
 draw_header() {
     clear 2>/dev/null || true
-    echo -e "${C}${BOLD}"
-    echo "  ╔══════════════════════════════════════════════╗"
-    echo "  ║       Proxy Manager  v${VERSION}  Anti-DDoS      ║"
-    echo "  ╚══════════════════════════════════════════════╝${NC}"
+    echo -e "  ${C}${BOLD}NexoShield${NC} ${DIM}v${VERSION} — Server Security Toolkit${NC}"
     local PROXY_ST PROXY_PORT SERVER_IP LOAD MEM_PCT DISK_PCT DDOS_ST
     PROXY_ST=$(svc_status "3proxy")
     PROXY_PORT=$(get_proxy_port)
@@ -2555,9 +2552,116 @@ draw_header() {
 }
 
 # ── SOCKS5 Menu ───────────────────────────────────────────
+#
+# Before v3.7 every screen hand-rolled its own loop: 21 separate
+# printf/read pairs against /dev/tty, four different confirmation
+# idioms, headers drawn ad hoc, and no fallback when /dev/tty was
+# unavailable (ssh without -t meant an infinite empty-read redraw).
+# All screens now share this small framework:
+#   ui_input VAR "prompt"  - one read idiom (tty, stdin fallback)
+#   ui_confirm "question"  - the single (y/N) idiom
+#   ui_title "A › B"       - header + breadcrumb title
+#   ui_options "n|label|status" ... - aligned menu rows
+#   ui_home_panel          - the dashboard summary on the main menu
+# State locations are overridable for tests (NX_STATE_DIR,
+# NX_SCORE_FILE); production defaults are the real paths.
+NX_STATE_DIR="${NX_STATE_DIR:-/etc/antiddos}"
+NX_SCORE_FILE="${NX_SCORE_FILE:-/var/lib/antiddos/scores/reputation.dat}"
+
+ui_input() {
+    local _var="$1" _prompt="$2" _val=""
+    if [ -n "${NX_UI_STDIN:-}" ]; then
+        printf '%s' "$_prompt"; read -r _val || _val=""
+    elif (exec </dev/tty) 2>/dev/null; then
+        printf '%s' "$_prompt" >/dev/tty; read -r _val </dev/tty || _val=""
+    else
+        printf '%s' "$_prompt"; read -r _val || _val=""
+    fi
+    printf -v "$_var" '%s' "$_val"
+}
+
+ui_confirm() {
+    local _a
+    ui_input _a "  $1 (y/N): "
+    [ "$_a" = "y" ] || [ "$_a" = "Y" ]
+}
+
+ui_title() {
+    draw_header
+    echo -e "  ${C}${BOLD}$1${NC}"; echo ""
+}
+
+ui_options() {
+    local _spec _n _label _status
+    for _spec in "$@"; do
+        _n="${_spec%%|*}"; _label="${_spec#*|}"; _status=""
+        case "$_label" in *\|*) _status="${_label#*|}"; _label="${_label%%|*}" ;; esac
+        if [ -n "$_status" ]; then
+            echo -e "  ${C}${_n}.${NC}  $_label  $_status"
+        else
+            echo -e "  ${C}${_n}.${NC}  $_label"
+        fi
+    done
+    echo ""
+    echo -e "  ${DIM}──────────────────────────────────────────────────${NC}"
+}
+
+# press_enter predates the framework (00-header); redefine it on top
+# of ui_input so every "go back" pause shares the same input path.
+press_enter() {
+    echo ""
+    local _pe
+    ui_input _pe "  Press Enter to go back..."
+}
+
+# ── Dashboard summary for the main menu ────────────────────
+ui_home_panel() {
+    local _nb _nt _nw
+    _nb=$(cnt . "$NX_STATE_DIR/banned.list")
+    _nt=$(cnt . "$NX_STATE_DIR/throttled.list")
+    _nw=$(cnt . "$NX_STATE_DIR/whitelist.list")
+    echo -e "  ${BOLD}Overview${NC}"
+    echo -e "  ${DIM}Banned now:${NC} ${W}${_nb}${NC}    ${DIM}Throttled:${NC} ${W}${_nt}${NC}    ${DIM}Whitelist entries:${NC} ${W}${_nw}${NC}"
+    if [ -s "$NX_SCORE_FILE" ]; then
+        echo -e "  ${DIM}Lowest reputation:${NC}"
+        sort -k2 -n "$NX_SCORE_FILE" 2>/dev/null | head -3 | while read -r _ip _sc _rest; do
+            [ -z "${_ip:-}" ] && continue
+            local _col="$DIM"
+            [ "${_sc:-100}" -lt 40 ] 2>/dev/null && _col="$R"
+            [ "${_sc:-100}" -ge 40 ] && [ "${_sc:-100}" -lt 60 ] 2>/dev/null && _col="$Y"
+            echo -e "    ${_col}${_ip} — score ${_sc}${NC}"
+        done
+    fi
+    if [ -s /var/log/auto-ban.log ]; then
+        echo -e "  ${DIM}Recent auto-ban events:${NC}"
+        tail -3 /var/log/auto-ban.log 2>/dev/null | sed 's/^/    /'
+    fi
+    echo ""
+}
+
+# ── Plain-text CLI views (scriptable; no colours) ─────────
+nx_status_plain() {
+    echo "NexoShield v$VERSION"
+    echo "3proxy:    $(systemctl is-active 3proxy 2>/dev/null || echo unknown) (port: $(get_proxy_port || echo -))"
+    echo "auto-ban:  $(systemctl is-active auto-ban 2>/dev/null || echo unknown)"
+    echo "fail2ban:  $(systemctl is-active fail2ban 2>/dev/null || echo unknown)"
+    [ -f "$NX_STATE_DIR/state.conf" ] && echo "antiddos:  installed" || echo "antiddos:  not installed"
+    echo "banned:    $(cnt . "$NX_STATE_DIR/banned.list")"
+    echo "throttled: $(cnt . "$NX_STATE_DIR/throttled.list")"
+}
+
+nx_bans_plain() {
+    [ -s "$NX_STATE_DIR/banned.list" ] || { echo "(no active bans)"; return 0; }
+    local _ip _ts _dur
+    while read -r _ip _ts _dur; do
+        [ -z "$_ip" ] && continue
+        _ts="${_ts//[^0-9]/}"; _dur="${_dur//[^0-9]/}"
+        echo "$_ip  since $(date -d "@${_ts:-0}" '+%F %T' 2>/dev/null || echo '?')  expires $(date -d "@$(( ${_ts:-0} + ${_dur:-0} ))" '+%F %T' 2>/dev/null || echo '?')"
+    done < "$NX_STATE_DIR/banned.list"
+}
 menu_proxy() {
     while true; do
-        draw_header; echo -e "  ${C}${BOLD}SOCKS5 Proxy (3proxy)${NC}"; echo ""
+        ui_title "SOCKS5 Proxy (3proxy)"
         local ST PORT
         ST=$(svc_status "3proxy")
         PORT=$(get_proxy_port)
@@ -2571,13 +2675,11 @@ menu_proxy() {
             echo -e "  User   : ${G}${_INFO_USER:-?}${NC}   Pass: ${G}${_INFO_PASS:-?}${NC}"
             echo -e "  Link   : ${G}socks5://${_INFO_USER:-?}:${_INFO_PASS:-?}@$(get_ip):${PORT:-?}${NC}"
         }
-        echo ""; sep2
-        echo -e "  ${C}1.${NC} Install/Update  ${C}2.${NC} Remove      ${C}3.${NC} Start"
-        echo -e "  ${C}4.${NC} Stop            ${C}5.${NC} Restart     ${C}6.${NC} Live log"
-        echo -e "  ${C}7.${NC} Traffic stats   ${C}8.${NC} Change pass ${C}9.${NC} Suspicious IPs"
-        echo -e "  ${C}0.${NC} Back"; echo ""
-        echo -e "  ${DIM}──────────────────────────────────────────────────${NC}"
-        printf '%s' "  Enter number: " >/dev/tty; read -r CH </dev/tty || CH=""
+        echo ""
+        ui_options "1|Install/Update" "2|Remove" "3|Start" "4|Stop" \
+            "5|Restart" "6|Live log" "7|Traffic stats" "8|Change password" \
+            "9|Suspicious IPs" "0|Back"
+        ui_input CH "  Enter number: "
         case "$CH" in
             1) # Ensure the Cloudflare whitelist file exists before install so CF
                # IPs are ALWAYS excluded from throttling (it can be deleted by an
@@ -2603,8 +2705,11 @@ menu_proxy() {
                fi
                press_enter ;;
             2) echo ""
-               printf '%s' "  Remove 3proxy completely? (y/N): " >/dev/tty; read -r _RC </dev/tty || _RC=""
-               [[ "$_RC" == "y" || "$_RC" == "Y" ]] && bash "$PROXY_SCRIPT" --remove < /dev/tty || echo -e "  ${DIM}Cancelled.${NC}"
+               if ui_confirm "Remove 3proxy completely?"; then
+                   bash "$PROXY_SCRIPT" --remove < /dev/tty
+               else
+                   echo -e "  ${DIM}Cancelled.${NC}"
+               fi
                press_enter ;;
             3) bash "$PROXY_SCRIPT" --start; press_enter ;;
             4) bash "$PROXY_SCRIPT" --stop;  press_enter ;;
@@ -2625,23 +2730,21 @@ _proxy_suspicious() {
     echo -e "  ${DIM}These are actual attackers auto-ban has blocked or throttled,"${NC}
     echo -e "  ${DIM}not your normal heavy users.${NC}"; sep2
 
-    # Currently banned (iptables DROP rules tagged by auto-ban / subnet-ban)
+    # U-1 (UI redesign): state files are the source of truth. The old
+    # code scraped iptables -L for bans and read throttles from
+    # /tmp/autoban_throttle - a path nothing in the product writes,
+    # so the throttled section was permanently empty.
     local _banned=""
-    _banned=$(iptables -L INPUT -n 2>/dev/null | grep -E 'auto-ban|subnet-ban' | \
-        grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]+)?' | \
-        grep -v '^0\.0\.0\.0' | sort -u | head -20)
-
-    # Currently throttled (reputation-suspected, pre-ban)
+    _banned=$(awk '{print $1}' "$NX_STATE_DIR/banned.list" 2>/dev/null | head -20)
     local _throttled=""
-    _throttled=$(awk '{print $1}' /tmp/autoban_throttle 2>/dev/null | \
-        grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -10)
+    _throttled=$(awk '{print $1}' "$NX_STATE_DIR/throttled.list" 2>/dev/null | head -10)
 
     local _empty=1
     if [ -n "$_banned" ]; then
         echo -e "  ${R}── Currently BANNED ──${NC}"
         echo "$_banned" | while IFS= read -r ip; do
             [ -z "$ip" ] && continue
-            echo -e "  ${R}✗ $ip${NC}   (iptables DROP)"
+            echo -e "  ${R}✗ $ip${NC}   (auto-ban state)"
         done
         _empty=0
     fi
@@ -2658,7 +2761,7 @@ _proxy_suspicious() {
     echo ""; sep2
 
     echo -e "  ${DIM}Enter an IP above to block it, or press Enter to skip.${NC}"
-    printf '%s' "  Block IP (empty = skip): " >/dev/tty; read -r BIP </dev/tty || BIP=""
+    ui_input BIP "  Block IP (empty = skip): "
     if [ -n "$BIP" ]; then
         bash "$ANTIDDOS_SCRIPT" --exempt-check "$BIP" >/dev/null 2>&1; _EC=$?
         if [ "$_EC" -eq 0 ]; then
@@ -2677,7 +2780,7 @@ _proxy_suspicious() {
 # ── sysctl Menu ───────────────────────────────────────────
 menu_sysctl() {
     while true; do
-        draw_header; echo -e "  ${C}${BOLD}Network Optimization${NC}"; echo ""
+        ui_title "Network Optimization"
         if [ -f /etc/sysctl.d/99-vpn-optimized.conf ]; then
             echo -e "  Status  : ${G}✓ Optimized${NC}"
         else
@@ -2692,7 +2795,7 @@ menu_sysctl() {
         echo -e "  ${C}3.${NC} Current values"
         echo -e "  ${C}0.${NC} Back"; echo ""
         echo -e "  ${DIM}──────────────────────────────────────────────────${NC}"
-        printf '%s' "  Enter number: " >/dev/tty; read -r CH </dev/tty || CH=""
+        ui_input CH "  Enter number: "
         case "$CH" in
             1) bash "$SYSCTL_SCRIPT" --install < /dev/tty; press_enter ;;
             2) bash "$SYSCTL_SCRIPT" --rollback < /dev/tty; press_enter ;;
@@ -2705,13 +2808,13 @@ menu_sysctl() {
 # ── Monitoring Menu ───────────────────────────────────────
 menu_monitor() {
     while true; do
-        draw_header; echo -e "  ${C}${BOLD}Monitoring${NC}"; echo ""
+        ui_title "Monitoring"
         echo -e "  ${C}1.${NC} Live Threat Monitor  ${C}2.${NC} Connections"
         echo -e "  ${C}3.${NC} CPU & RAM            ${C}4.${NC} Disk"
         echo -e "  ${C}5.${NC} Logs                 ${C}6.${NC} Auto-ban log"
         echo -e "  ${C}7.${NC} Traffic top IPs      ${C}0.${NC} Back"; echo ""
         echo -e "  ${DIM}──────────────────────────────────────────────────${NC}"
-        printf '%s' "  Enter number: " >/dev/tty; read -r CH </dev/tty || CH=""
+        ui_input CH "  Enter number: "
         case "$CH" in
             1) _monitor_dashboard ;;
             2) ss -tnp 2>/dev/null | head -30; echo ""; ss -s 2>/dev/null; press_enter ;;
@@ -2963,7 +3066,7 @@ _monitor_logs() {
         echo -e "  ${C}4.${NC} system    ${C}5.${NC} auto-ban  ${C}6.${NC} antiddos"
         echo -e "  ${C}0.${NC} Back"; echo ""
         echo -e "  ${DIM}──────────────────────────────────────────────────${NC}"
-        printf '%s' "  Enter number: " >/dev/tty; read -r CH </dev/tty || CH=""
+        ui_input CH "  Enter number: "
         case "$CH" in
             1) less +G /var/log/3proxy/access.log 2>/dev/null || \
                journalctl -u 3proxy --no-pager -n 50 ;;
@@ -2980,13 +3083,13 @@ _monitor_logs() {
 # ── Security Menu ─────────────────────────────────────────
 menu_security() {
     while true; do
-        draw_header; echo -e "  ${C}${BOLD}Security${NC}"; echo ""
+        ui_title "Security"
         echo -e "  ${C}1.${NC} Blocked IPs (all)       ${C}2.${NC} Block IP"
         echo -e "  ${C}3.${NC} Unblock IP              ${C}4.${NC} iptables rules"
         echo -e "  ${C}5.${NC} SSH brute force          ${C}6.${NC} Auto-ban status"
         echo -e "  ${C}0.${NC} Back"; echo ""
         echo -e "  ${DIM}──────────────────────────────────────────────────${NC}"
-        printf '%s' "  Enter number: " >/dev/tty; read -r CH </dev/tty || CH=""
+        ui_input CH "  Enter number: "
         case "$CH" in
              1) clear 2>/dev/null || true
                echo -e "  ${C}fail2ban bans:${NC}"
@@ -3004,7 +3107,7 @@ menu_security() {
                    while read -r ip; do echo -e "  ${R}$ip${NC}"; done | head -30
                press_enter ;;
             2) echo -e "  ${C}Block IP${NC}"; echo ""
-               printf '%s' "  Enter IP or CIDR to block (e.g. 1.2.3.4 or 1.2.3.0/24): " >/dev/tty; read -r BIP </dev/tty || BIP=""
+               ui_input BIP "  Enter IP or CIDR to block (e.g. 1.2.3.4 or 1.2.3.0/24): "
                if [ -n "$BIP" ]; then
                    bash "$ANTIDDOS_SCRIPT" --exempt-check "$BIP" >/dev/null 2>&1; _EC=$?
                    if [ "$_EC" -eq 0 ]; then
@@ -3021,7 +3124,7 @@ menu_security() {
                fi
                press_enter ;;
             3) echo -e "  ${C}Unblock IP${NC}"; echo ""
-               printf '%s' "  Enter IP to unblock: " >/dev/tty; read -r UIP </dev/tty || UIP=""
+               ui_input UIP "  Enter IP to unblock: "
                [ -n "$UIP" ] && {
                    iptables -D INPUT -s "$UIP" -j DROP 2>/dev/null && ok "iptables: unblocked" || true
                    # Remove from auto-ban if running
@@ -3078,7 +3181,7 @@ menu_services() {
         for S in 3proxy auto-ban; do
             printf '%s\n' "${SERVICES[@]}" | grep -qx "$S" || SERVICES+=("$S")
         done
-        draw_header; echo -e "  ${C}${BOLD}Services${NC}"; echo ""
+        ui_title "Services"
         for i in "${!SERVICES[@]}"; do
             printf "  ${C}%d.${NC}  %-20s %s  %s\n" "$((i+1))" \
                 "${SERVICES[$i]}" \
@@ -3088,13 +3191,13 @@ menu_services() {
         echo ""; sep2
         echo -e "  ${C}a.${NC} Start all   ${C}z.${NC} Restart all   ${C}0.${NC} Back"; echo ""
         echo -e "  ${DIM}──────────────────────────────────────────────────${NC}"
-        printf '%s' "  Enter number: " >/dev/tty; read -r CH </dev/tty || CH=""
+        ui_input CH "  Enter number: "
         if [[ "$CH" =~ ^[0-9]+$ ]] && [ "$CH" -ge 1 ] && [ "$CH" -le "${#SERVICES[@]}" ]; then
             SVC="${SERVICES[$((CH-1))]}"
             clear; echo -e "  ${C}${BOLD}$SVC${NC}  $(svc_status "$SVC")"; echo ""
             echo -e "  ${C}1.${NC} Start   ${C}2.${NC} Stop   ${C}3.${NC} Restart   ${C}4.${NC} Status   ${C}0.${NC} Back"
             echo ""; sep2
-            printf '%s' "  Choice: " >/dev/tty; read -r A </dev/tty || A=""
+            ui_input A "  Choice: "
             case "$A" in
                 1) systemctl start "$SVC" 2>/dev/null && ok "Started" || err "Failed" ;;
                 2) systemctl stop "$SVC" 2>/dev/null && ok "Stopped" || err "Failed" ;;
@@ -3120,12 +3223,12 @@ menu_services() {
 # ── System Menu ───────────────────────────────────────────
 menu_system() {
     while true; do
-        draw_header; echo -e "  ${C}${BOLD}System${NC}"; echo ""
+        ui_title "System"
         echo -e "  ${C}1.${NC} Server info    ${C}2.${NC} Update"
         echo -e "  ${C}3.${NC} Clean logs     ${C}4.${NC} Reboot"
         echo -e "  ${C}5.${NC} Backup config  ${C}0.${NC} Back"; echo ""
         echo -e "  ${DIM}──────────────────────────────────────────────────${NC}"
-        printf '%s' "  Enter number: " >/dev/tty; read -r CH </dev/tty || CH=""
+        ui_input CH "  Enter number: "
         case "$CH" in
              1) clear 2>/dev/null || true
                printf "  ${DIM}%-20s${NC} %s\n" "Hostname:" "$(hostname)"
@@ -3138,7 +3241,7 @@ menu_system() {
                printf "  ${DIM}%-20s${NC} %s\n" "All IPs:" "$(ip -4 addr show 2>/dev/null | grep 'inet ' | grep -v '127\.' | awk '{print $2}' | tr '\n' ' ')"
                press_enter ;;
             2) echo ""
-               printf '%s' "  Update system packages? (y/N): " >/dev/tty; read -r _UC </dev/tty || _UC=""
+               ui_input _UC "  Update system packages? (y/N): "
                if [[ "$_UC" == "y" || "$_UC" == "Y" ]]; then
                    # BUG-044: the old && / || chain ran yum on Debian
                    # boxes when apt failed and printed "Update complete"
@@ -3168,7 +3271,7 @@ menu_system() {
                ok "Freed: $(awk -v b="${BEFORE:-0}" -v a="${AFTER:-0}" 'BEGIN{printf "%.1f", (b-a)/1024}') MB"
                press_enter ;;
             4) echo ""
-               printf '%s' "  Reboot server now? (y/N): " >/dev/tty; read -r _RBC </dev/tty || _RBC=""
+               ui_input _RBC "  Reboot server now? (y/N): "
                if [[ "$_RBC" == "y" || "$_RBC" == "Y" ]]; then
                    ok "Rebooting in 5 seconds..."
                    sleep 5 && reboot
@@ -3201,8 +3304,7 @@ menu_system() {
 # ── Anti-DDoS Menu ────────────────────────────────────────
 menu_antiddos() {
     while true; do
-        draw_header
-        echo -e "  ${C}${BOLD}Anti-DDoS Protection${NC}"; echo ""
+        ui_title "Anti-DDoS Protection"
 
         # Status at a glance
         if [ -f /etc/antiddos/state.conf ]; then
@@ -3238,20 +3340,16 @@ menu_antiddos() {
             done
         fi
 
-        echo ""; sep2
-        echo -e "  ${G}1.${NC}  Install / Re-install all layers"
-        echo -e "  ${C}2.${NC}  Status & active bans"
-        echo -e "  ${C}3.${NC}  Unban an IP"
-        echo -e "  ${C}4.${NC}  Auto-ban control (start/stop/log)"
-        echo -e "  ${Y}5.${NC}  Remove all protection"
-        echo -e "  ${C}0.${NC}  Back"; echo ""
-        echo -e "  ${DIM}──────────────────────────────────────────────────${NC}"
-        printf '%s' "  Enter number: " >/dev/tty; read -r CH </dev/tty || CH=""
+        echo ""
+        ui_options "1|Install / Re-install all layers" "2|Status & active bans" \
+            "3|Unban an IP" "4|Auto-ban control (start/stop/log)" \
+            "5|Remove all protection" "0|Back"
+        ui_input CH "  Enter number: "
         case "$CH" in
             1) _antiddos_install ;;
             2) bash "$ANTIDDOS_SCRIPT" --status < /dev/tty; press_enter ;;
             3) echo -e "  ${C}Unban IP${NC}"; echo ""
-               printf '%s' "  Enter IP to unban (removes from iptables + fail2ban): " >/dev/tty; read -r UIP </dev/tty || UIP=""
+               ui_input UIP "  Enter IP to unban (removes from iptables + fail2ban): "
                [ -n "$UIP" ] && {
                    # Exact deletes (BUG-038): match the tagged specs the
                    # daemon creates; state edit by exact field 1 (the
@@ -3280,8 +3378,7 @@ menu_antiddos() {
                echo -e "  ${DIM}This will remove: iptables rules, sysctl hardening, fail2ban jails,"
                echo -e "  auto-ban service, tc bandwidth shaping, and boot persistence.${NC}"
                echo ""
-               printf '%s' "  Are you sure? (y/N): " >/dev/tty; read -r _RMCONF </dev/tty || _RMCONF=""
-               if [[ "$_RMCONF" == "y" || "$_RMCONF" == "Y" ]]; then
+               if ui_confirm "Are you sure?"; then
                    bash "$ANTIDDOS_SCRIPT" --remove-force
                else
                    echo -e "  ${DIM}Cancelled.${NC}"
@@ -3311,8 +3408,7 @@ _antiddos_install() {
         echo ""
     fi
     sep2
-    printf '%s' "  Start installation? (y/N): " >/dev/tty; read -r CF_I </dev/tty || CF_I=""
-    [[ "$CF_I" != "y" && "$CF_I" != "Y" ]] && echo -e "  ${DIM}Cancelled.${NC}" && return
+    ui_confirm "Start installation?" || { echo -e "  ${DIM}Cancelled.${NC}"; return; }
 
     echo ""
     # Use --auto flag: skips the second confirm prompt inside antiddos.sh
@@ -3337,18 +3433,12 @@ _antiddos_install() {
 
 _autoban_control() {
     while true; do
-        clear; sep
-        echo -e "  ${C}Auto-ban Control${NC}"; sep
+        ui_title "Anti-DDoS › Auto-ban Control"
         echo -e "  Status: $(svc_status 'auto-ban')"
         echo ""
-        echo -e "  ${C}1.${NC} Start auto-ban"
-        echo -e "  ${C}2.${NC} Stop auto-ban"
-        echo -e "  ${C}3.${NC} View log (last 30)"
-        echo -e "  ${C}4.${NC} Current banned IPs"
-        echo -e "  ${C}5.${NC} Flush all auto-bans"
-        echo -e "  ${C}0.${NC} Back"; echo ""
-        echo -e "  ${DIM}──────────────────────────────────────────────────${NC}"
-        printf '%s' "  Enter number: " >/dev/tty; read -r CH </dev/tty || CH=""
+        ui_options "1|Start auto-ban" "2|Stop auto-ban" "3|View log (last 30)" \
+            "4|Current banned IPs" "5|Flush all auto-bans" "0|Back"
+        ui_input CH "  Enter number: "
         case "$CH" in
             1) systemctl start auto-ban 2>/dev/null && ok "auto-ban started" || err "Failed (not installed?)"
                press_enter ;;
@@ -3382,11 +3472,19 @@ _autoban_control() {
     done
 }
 
-# ── Main Menu ─────────────────────────────────────────────
-log "START: proxy manager v$VERSION"
+# ── CLI (v3.7): scriptable views, no menu ─────────────────
+case "${1:-}" in
+    --status)  nx_status_plain; exit 0 ;;
+    --bans)    nx_bans_plain; exit 0 ;;
+    --version) echo "NexoShield v$VERSION"; exit 0 ;;
+    --help)    echo "Usage: proxy-menu.sh [--status|--bans|--version]  (no flag = interactive menu)"; exit 0 ;;
+esac
+
+# ── Main Menu (dashboard home, v3.7) ──────────────────────
+log "START: NexoShield menu v$VERSION"
 while true; do
     draw_header
-    echo -e "  ${C}${BOLD}Main Menu${NC}"; echo ""
+    ui_home_panel
 
     # Show inline status for key items
     _PROXY_ST="$(systemctl is-active 3proxy 2>/dev/null)"
@@ -3408,16 +3506,10 @@ while true; do
     else _D="${Y}○ Not installed${NC}"; fi
     [ "$_NET_ST"   = "active" ] && _N="${G}● Optimized${NC}" || _N="${Y}○ Default${NC}"
 
-    echo -e "  ${C}1.${NC}  SOCKS5 Proxy         $_P"
-    echo -e "  ${C}2.${NC}  Network Optimization $_N"
-    echo -e "  ${C}3.${NC}  Anti-DDoS            $_D"
-    echo -e "  ${C}4.${NC}  Monitoring"
-    echo -e "  ${C}5.${NC}  Security"
-    echo -e "  ${C}6.${NC}  Services"
-    echo -e "  ${C}7.${NC}  System"
-    echo -e "  ${C}0.${NC}  Exit"; echo ""
-    echo -e "  ${DIM}──────────────────────────────────────────────────${NC}"
-        printf '%s' "  Enter number: " >/dev/tty; read -r CH </dev/tty || CH=""
+    ui_options "1|SOCKS5 Proxy|$_P" "2|Network Optimization|$_N" \
+        "3|Anti-DDoS|$_D" "4|Monitoring" "5|Security" "6|Services" \
+        "7|System" "0|Exit"
+    ui_input CH "  Enter number: "
     case "$CH" in
         1) menu_proxy ;;
         2) menu_sysctl ;;
@@ -3444,7 +3536,7 @@ cat > "$INSTALL_DIR/.antiddos.sh.nxnew" << 'ANTIDDOS_SCRIPT'
 # checker flags as same-file pipelines. Both classes were audited
 # site-by-site during the fix waves (docs/FIX-PLAN.md).
 # ============================================================
-#  Anti-DDoS Protection Manager v3.6.0
+#  Anti-DDoS Protection Manager v3.7.0
 #
 #  Layers:
 #    1. Kernel (sysctl hardening + tight conntrack timeouts)
@@ -3468,7 +3560,7 @@ set -euo pipefail
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 CYAN='\033[0;36m'; WHITE='\033[1;37m'; DIM='\033[2m'; BOLD='\033[1m'; NC='\033[0m'
 
-SCRIPT_VERSION="3.6.0"
+SCRIPT_VERSION="3.7.0"
 LOG_FILE="/var/log/antiddos.log"
 STATE_FILE="/etc/antiddos/state.conf"
 BANNED_LIST="/etc/antiddos/banned.list"

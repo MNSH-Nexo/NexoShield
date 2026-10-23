@@ -228,7 +228,7 @@ _monitor_logs() {
         echo -e "  ${C}4.${NC} system    ${C}5.${NC} auto-ban  ${C}6.${NC} antiddos"
         echo -e "  ${C}0.${NC} Back"; echo ""
         echo -e "  ${DIM}──────────────────────────────────────────────────${NC}"
-        printf '%s' "  Enter number: " >/dev/tty; read -r CH </dev/tty || CH=""
+        ui_input CH "  Enter number: "
         case "$CH" in
             1) less +G /var/log/3proxy/access.log 2>/dev/null || \
                journalctl -u 3proxy --no-pager -n 50 ;;

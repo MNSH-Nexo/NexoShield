@@ -2,7 +2,7 @@
 # Assembled into proxy-menu.sh by tools/build.py - not a standalone script.
 menu_proxy() {
     while true; do
-        draw_header; echo -e "  ${C}${BOLD}SOCKS5 Proxy (3proxy)${NC}"; echo ""
+        ui_title "SOCKS5 Proxy (3proxy)"
         local ST PORT
         ST=$(svc_status "3proxy")
         PORT=$(get_proxy_port)
@@ -16,13 +16,11 @@ menu_proxy() {
             echo -e "  User   : ${G}${_INFO_USER:-?}${NC}   Pass: ${G}${_INFO_PASS:-?}${NC}"
             echo -e "  Link   : ${G}socks5://${_INFO_USER:-?}:${_INFO_PASS:-?}@$(get_ip):${PORT:-?}${NC}"
         }
-        echo ""; sep2
-        echo -e "  ${C}1.${NC} Install/Update  ${C}2.${NC} Remove      ${C}3.${NC} Start"
-        echo -e "  ${C}4.${NC} Stop            ${C}5.${NC} Restart     ${C}6.${NC} Live log"
-        echo -e "  ${C}7.${NC} Traffic stats   ${C}8.${NC} Change pass ${C}9.${NC} Suspicious IPs"
-        echo -e "  ${C}0.${NC} Back"; echo ""
-        echo -e "  ${DIM}──────────────────────────────────────────────────${NC}"
-        printf '%s' "  Enter number: " >/dev/tty; read -r CH </dev/tty || CH=""
+        echo ""
+        ui_options "1|Install/Update" "2|Remove" "3|Start" "4|Stop" \
+            "5|Restart" "6|Live log" "7|Traffic stats" "8|Change password" \
+            "9|Suspicious IPs" "0|Back"
+        ui_input CH "  Enter number: "
         case "$CH" in
             1) # Ensure the Cloudflare whitelist file exists before install so CF
                # IPs are ALWAYS excluded from throttling (it can be deleted by an
@@ -48,8 +46,11 @@ menu_proxy() {
                fi
                press_enter ;;
             2) echo ""
-               printf '%s' "  Remove 3proxy completely? (y/N): " >/dev/tty; read -r _RC </dev/tty || _RC=""
-               [[ "$_RC" == "y" || "$_RC" == "Y" ]] && bash "$PROXY_SCRIPT" --remove < /dev/tty || echo -e "  ${DIM}Cancelled.${NC}"
+               if ui_confirm "Remove 3proxy completely?"; then
+                   bash "$PROXY_SCRIPT" --remove < /dev/tty
+               else
+                   echo -e "  ${DIM}Cancelled.${NC}"
+               fi
                press_enter ;;
             3) bash "$PROXY_SCRIPT" --start; press_enter ;;
             4) bash "$PROXY_SCRIPT" --stop;  press_enter ;;
@@ -70,23 +71,21 @@ _proxy_suspicious() {
     echo -e "  ${DIM}These are actual attackers auto-ban has blocked or throttled,"${NC}
     echo -e "  ${DIM}not your normal heavy users.${NC}"; sep2
 
-    # Currently banned (iptables DROP rules tagged by auto-ban / subnet-ban)
+    # U-1 (UI redesign): state files are the source of truth. The old
+    # code scraped iptables -L for bans and read throttles from
+    # /tmp/autoban_throttle - a path nothing in the product writes,
+    # so the throttled section was permanently empty.
     local _banned=""
-    _banned=$(iptables -L INPUT -n 2>/dev/null | grep -E 'auto-ban|subnet-ban' | \
-        grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]+)?' | \
-        grep -v '^0\.0\.0\.0' | sort -u | head -20)
-
-    # Currently throttled (reputation-suspected, pre-ban)
+    _banned=$(awk '{print $1}' "$NX_STATE_DIR/banned.list" 2>/dev/null | head -20)
     local _throttled=""
-    _throttled=$(awk '{print $1}' /tmp/autoban_throttle 2>/dev/null | \
-        grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -10)
+    _throttled=$(awk '{print $1}' "$NX_STATE_DIR/throttled.list" 2>/dev/null | head -10)
 
     local _empty=1
     if [ -n "$_banned" ]; then
         echo -e "  ${R}── Currently BANNED ──${NC}"
         echo "$_banned" | while IFS= read -r ip; do
             [ -z "$ip" ] && continue
-            echo -e "  ${R}✗ $ip${NC}   (iptables DROP)"
+            echo -e "  ${R}✗ $ip${NC}   (auto-ban state)"
         done
         _empty=0
     fi
@@ -103,7 +102,7 @@ _proxy_suspicious() {
     echo ""; sep2
 
     echo -e "  ${DIM}Enter an IP above to block it, or press Enter to skip.${NC}"
-    printf '%s' "  Block IP (empty = skip): " >/dev/tty; read -r BIP </dev/tty || BIP=""
+    ui_input BIP "  Block IP (empty = skip): "
     if [ -n "$BIP" ]; then
         bash "$ANTIDDOS_SCRIPT" --exempt-check "$BIP" >/dev/null 2>&1; _EC=$?
         if [ "$_EC" -eq 0 ]; then

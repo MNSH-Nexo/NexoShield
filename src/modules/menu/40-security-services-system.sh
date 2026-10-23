@@ -2,13 +2,13 @@
 # Assembled into proxy-menu.sh by tools/build.py - not a standalone script.
 menu_security() {
     while true; do
-        draw_header; echo -e "  ${C}${BOLD}Security${NC}"; echo ""
+        ui_title "Security"
         echo -e "  ${C}1.${NC} Blocked IPs (all)       ${C}2.${NC} Block IP"
         echo -e "  ${C}3.${NC} Unblock IP              ${C}4.${NC} iptables rules"
         echo -e "  ${C}5.${NC} SSH brute force          ${C}6.${NC} Auto-ban status"
         echo -e "  ${C}0.${NC} Back"; echo ""
         echo -e "  ${DIM}──────────────────────────────────────────────────${NC}"
-        printf '%s' "  Enter number: " >/dev/tty; read -r CH </dev/tty || CH=""
+        ui_input CH "  Enter number: "
         case "$CH" in
              1) clear 2>/dev/null || true
                echo -e "  ${C}fail2ban bans:${NC}"
@@ -26,7 +26,7 @@ menu_security() {
                    while read -r ip; do echo -e "  ${R}$ip${NC}"; done | head -30
                press_enter ;;
             2) echo -e "  ${C}Block IP${NC}"; echo ""
-               printf '%s' "  Enter IP or CIDR to block (e.g. 1.2.3.4 or 1.2.3.0/24): " >/dev/tty; read -r BIP </dev/tty || BIP=""
+               ui_input BIP "  Enter IP or CIDR to block (e.g. 1.2.3.4 or 1.2.3.0/24): "
                if [ -n "$BIP" ]; then
                    bash "$ANTIDDOS_SCRIPT" --exempt-check "$BIP" >/dev/null 2>&1; _EC=$?
                    if [ "$_EC" -eq 0 ]; then
@@ -43,7 +43,7 @@ menu_security() {
                fi
                press_enter ;;
             3) echo -e "  ${C}Unblock IP${NC}"; echo ""
-               printf '%s' "  Enter IP to unblock: " >/dev/tty; read -r UIP </dev/tty || UIP=""
+               ui_input UIP "  Enter IP to unblock: "
                [ -n "$UIP" ] && {
                    iptables -D INPUT -s "$UIP" -j DROP 2>/dev/null && ok "iptables: unblocked" || true
                    # Remove from auto-ban if running
@@ -100,7 +100,7 @@ menu_services() {
         for S in 3proxy auto-ban; do
             printf '%s\n' "${SERVICES[@]}" | grep -qx "$S" || SERVICES+=("$S")
         done
-        draw_header; echo -e "  ${C}${BOLD}Services${NC}"; echo ""
+        ui_title "Services"
         for i in "${!SERVICES[@]}"; do
             printf "  ${C}%d.${NC}  %-20s %s  %s\n" "$((i+1))" \
                 "${SERVICES[$i]}" \
@@ -110,13 +110,13 @@ menu_services() {
         echo ""; sep2
         echo -e "  ${C}a.${NC} Start all   ${C}z.${NC} Restart all   ${C}0.${NC} Back"; echo ""
         echo -e "  ${DIM}──────────────────────────────────────────────────${NC}"
-        printf '%s' "  Enter number: " >/dev/tty; read -r CH </dev/tty || CH=""
+        ui_input CH "  Enter number: "
         if [[ "$CH" =~ ^[0-9]+$ ]] && [ "$CH" -ge 1 ] && [ "$CH" -le "${#SERVICES[@]}" ]; then
             SVC="${SERVICES[$((CH-1))]}"
             clear; echo -e "  ${C}${BOLD}$SVC${NC}  $(svc_status "$SVC")"; echo ""
             echo -e "  ${C}1.${NC} Start   ${C}2.${NC} Stop   ${C}3.${NC} Restart   ${C}4.${NC} Status   ${C}0.${NC} Back"
             echo ""; sep2
-            printf '%s' "  Choice: " >/dev/tty; read -r A </dev/tty || A=""
+            ui_input A "  Choice: "
             case "$A" in
                 1) systemctl start "$SVC" 2>/dev/null && ok "Started" || err "Failed" ;;
                 2) systemctl stop "$SVC" 2>/dev/null && ok "Stopped" || err "Failed" ;;
@@ -142,12 +142,12 @@ menu_services() {
 # ── System Menu ───────────────────────────────────────────
 menu_system() {
     while true; do
-        draw_header; echo -e "  ${C}${BOLD}System${NC}"; echo ""
+        ui_title "System"
         echo -e "  ${C}1.${NC} Server info    ${C}2.${NC} Update"
         echo -e "  ${C}3.${NC} Clean logs     ${C}4.${NC} Reboot"
         echo -e "  ${C}5.${NC} Backup config  ${C}0.${NC} Back"; echo ""
         echo -e "  ${DIM}──────────────────────────────────────────────────${NC}"
-        printf '%s' "  Enter number: " >/dev/tty; read -r CH </dev/tty || CH=""
+        ui_input CH "  Enter number: "
         case "$CH" in
              1) clear 2>/dev/null || true
                printf "  ${DIM}%-20s${NC} %s\n" "Hostname:" "$(hostname)"
@@ -160,7 +160,7 @@ menu_system() {
                printf "  ${DIM}%-20s${NC} %s\n" "All IPs:" "$(ip -4 addr show 2>/dev/null | grep 'inet ' | grep -v '127\.' | awk '{print $2}' | tr '\n' ' ')"
                press_enter ;;
             2) echo ""
-               printf '%s' "  Update system packages? (y/N): " >/dev/tty; read -r _UC </dev/tty || _UC=""
+               ui_input _UC "  Update system packages? (y/N): "
                if [[ "$_UC" == "y" || "$_UC" == "Y" ]]; then
                    # BUG-044: the old && / || chain ran yum on Debian
                    # boxes when apt failed and printed "Update complete"
@@ -190,7 +190,7 @@ menu_system() {
                ok "Freed: $(awk -v b="${BEFORE:-0}" -v a="${AFTER:-0}" 'BEGIN{printf "%.1f", (b-a)/1024}') MB"
                press_enter ;;
             4) echo ""
-               printf '%s' "  Reboot server now? (y/N): " >/dev/tty; read -r _RBC </dev/tty || _RBC=""
+               ui_input _RBC "  Reboot server now? (y/N): "
                if [[ "$_RBC" == "y" || "$_RBC" == "Y" ]]; then
                    ok "Rebooting in 5 seconds..."
                    sleep 5 && reboot

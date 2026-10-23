@@ -2,7 +2,7 @@
 # Assembled into proxy-menu.sh by tools/build.py - not a standalone script.
 menu_sysctl() {
     while true; do
-        draw_header; echo -e "  ${C}${BOLD}Network Optimization${NC}"; echo ""
+        ui_title "Network Optimization"
         if [ -f /etc/sysctl.d/99-vpn-optimized.conf ]; then
             echo -e "  Status  : ${G}✓ Optimized${NC}"
         else
@@ -17,7 +17,7 @@ menu_sysctl() {
         echo -e "  ${C}3.${NC} Current values"
         echo -e "  ${C}0.${NC} Back"; echo ""
         echo -e "  ${DIM}──────────────────────────────────────────────────${NC}"
-        printf '%s' "  Enter number: " >/dev/tty; read -r CH </dev/tty || CH=""
+        ui_input CH "  Enter number: "
         case "$CH" in
             1) bash "$SYSCTL_SCRIPT" --install < /dev/tty; press_enter ;;
             2) bash "$SYSCTL_SCRIPT" --rollback < /dev/tty; press_enter ;;
@@ -30,13 +30,13 @@ menu_sysctl() {
 # ── Monitoring Menu ───────────────────────────────────────
 menu_monitor() {
     while true; do
-        draw_header; echo -e "  ${C}${BOLD}Monitoring${NC}"; echo ""
+        ui_title "Monitoring"
         echo -e "  ${C}1.${NC} Live Threat Monitor  ${C}2.${NC} Connections"
         echo -e "  ${C}3.${NC} CPU & RAM            ${C}4.${NC} Disk"
         echo -e "  ${C}5.${NC} Logs                 ${C}6.${NC} Auto-ban log"
         echo -e "  ${C}7.${NC} Traffic top IPs      ${C}0.${NC} Back"; echo ""
         echo -e "  ${DIM}──────────────────────────────────────────────────${NC}"
-        printf '%s' "  Enter number: " >/dev/tty; read -r CH </dev/tty || CH=""
+        ui_input CH "  Enter number: "
         case "$CH" in
             1) _monitor_dashboard ;;
             2) ss -tnp 2>/dev/null | head -30; echo ""; ss -s 2>/dev/null; press_enter ;;

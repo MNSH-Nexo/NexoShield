@@ -2,8 +2,7 @@
 # Assembled into proxy-menu.sh by tools/build.py - not a standalone script.
 menu_antiddos() {
     while true; do
-        draw_header
-        echo -e "  ${C}${BOLD}Anti-DDoS Protection${NC}"; echo ""
+        ui_title "Anti-DDoS Protection"
 
         # Status at a glance
         if [ -f /etc/antiddos/state.conf ]; then
@@ -39,20 +38,16 @@ menu_antiddos() {
             done
         fi
 
-        echo ""; sep2
-        echo -e "  ${G}1.${NC}  Install / Re-install all layers"
-        echo -e "  ${C}2.${NC}  Status & active bans"
-        echo -e "  ${C}3.${NC}  Unban an IP"
-        echo -e "  ${C}4.${NC}  Auto-ban control (start/stop/log)"
-        echo -e "  ${Y}5.${NC}  Remove all protection"
-        echo -e "  ${C}0.${NC}  Back"; echo ""
-        echo -e "  ${DIM}──────────────────────────────────────────────────${NC}"
-        printf '%s' "  Enter number: " >/dev/tty; read -r CH </dev/tty || CH=""
+        echo ""
+        ui_options "1|Install / Re-install all layers" "2|Status & active bans" \
+            "3|Unban an IP" "4|Auto-ban control (start/stop/log)" \
+            "5|Remove all protection" "0|Back"
+        ui_input CH "  Enter number: "
         case "$CH" in
             1) _antiddos_install ;;
             2) bash "$ANTIDDOS_SCRIPT" --status < /dev/tty; press_enter ;;
             3) echo -e "  ${C}Unban IP${NC}"; echo ""
-               printf '%s' "  Enter IP to unban (removes from iptables + fail2ban): " >/dev/tty; read -r UIP </dev/tty || UIP=""
+               ui_input UIP "  Enter IP to unban (removes from iptables + fail2ban): "
                [ -n "$UIP" ] && {
                    # Exact deletes (BUG-038): match the tagged specs the
                    # daemon creates; state edit by exact field 1 (the
@@ -81,8 +76,7 @@ menu_antiddos() {
                echo -e "  ${DIM}This will remove: iptables rules, sysctl hardening, fail2ban jails,"
                echo -e "  auto-ban service, tc bandwidth shaping, and boot persistence.${NC}"
                echo ""
-               printf '%s' "  Are you sure? (y/N): " >/dev/tty; read -r _RMCONF </dev/tty || _RMCONF=""
-               if [[ "$_RMCONF" == "y" || "$_RMCONF" == "Y" ]]; then
+               if ui_confirm "Are you sure?"; then
                    bash "$ANTIDDOS_SCRIPT" --remove-force
                else
                    echo -e "  ${DIM}Cancelled.${NC}"
@@ -112,8 +106,7 @@ _antiddos_install() {
         echo ""
     fi
     sep2
-    printf '%s' "  Start installation? (y/N): " >/dev/tty; read -r CF_I </dev/tty || CF_I=""
-    [[ "$CF_I" != "y" && "$CF_I" != "Y" ]] && echo -e "  ${DIM}Cancelled.${NC}" && return
+    ui_confirm "Start installation?" || { echo -e "  ${DIM}Cancelled.${NC}"; return; }
 
     echo ""
     # Use --auto flag: skips the second confirm prompt inside antiddos.sh

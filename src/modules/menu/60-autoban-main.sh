@@ -2,18 +2,12 @@
 # Assembled into proxy-menu.sh by tools/build.py - not a standalone script.
 _autoban_control() {
     while true; do
-        clear; sep
-        echo -e "  ${C}Auto-ban Control${NC}"; sep
+        ui_title "Anti-DDoS › Auto-ban Control"
         echo -e "  Status: $(svc_status 'auto-ban')"
         echo ""
-        echo -e "  ${C}1.${NC} Start auto-ban"
-        echo -e "  ${C}2.${NC} Stop auto-ban"
-        echo -e "  ${C}3.${NC} View log (last 30)"
-        echo -e "  ${C}4.${NC} Current banned IPs"
-        echo -e "  ${C}5.${NC} Flush all auto-bans"
-        echo -e "  ${C}0.${NC} Back"; echo ""
-        echo -e "  ${DIM}──────────────────────────────────────────────────${NC}"
-        printf '%s' "  Enter number: " >/dev/tty; read -r CH </dev/tty || CH=""
+        ui_options "1|Start auto-ban" "2|Stop auto-ban" "3|View log (last 30)" \
+            "4|Current banned IPs" "5|Flush all auto-bans" "0|Back"
+        ui_input CH "  Enter number: "
         case "$CH" in
             1) systemctl start auto-ban 2>/dev/null && ok "auto-ban started" || err "Failed (not installed?)"
                press_enter ;;
@@ -47,11 +41,19 @@ _autoban_control() {
     done
 }
 
-# ── Main Menu ─────────────────────────────────────────────
-log "START: proxy manager v$VERSION"
+# ── CLI (v3.7): scriptable views, no menu ─────────────────
+case "${1:-}" in
+    --status)  nx_status_plain; exit 0 ;;
+    --bans)    nx_bans_plain; exit 0 ;;
+    --version) echo "NexoShield v$VERSION"; exit 0 ;;
+    --help)    echo "Usage: proxy-menu.sh [--status|--bans|--version]  (no flag = interactive menu)"; exit 0 ;;
+esac
+
+# ── Main Menu (dashboard home, v3.7) ──────────────────────
+log "START: NexoShield menu v$VERSION"
 while true; do
     draw_header
-    echo -e "  ${C}${BOLD}Main Menu${NC}"; echo ""
+    ui_home_panel
 
     # Show inline status for key items
     _PROXY_ST="$(systemctl is-active 3proxy 2>/dev/null)"
@@ -73,16 +75,10 @@ while true; do
     else _D="${Y}○ Not installed${NC}"; fi
     [ "$_NET_ST"   = "active" ] && _N="${G}● Optimized${NC}" || _N="${Y}○ Default${NC}"
 
-    echo -e "  ${C}1.${NC}  SOCKS5 Proxy         $_P"
-    echo -e "  ${C}2.${NC}  Network Optimization $_N"
-    echo -e "  ${C}3.${NC}  Anti-DDoS            $_D"
-    echo -e "  ${C}4.${NC}  Monitoring"
-    echo -e "  ${C}5.${NC}  Security"
-    echo -e "  ${C}6.${NC}  Services"
-    echo -e "  ${C}7.${NC}  System"
-    echo -e "  ${C}0.${NC}  Exit"; echo ""
-    echo -e "  ${DIM}──────────────────────────────────────────────────${NC}"
-        printf '%s' "  Enter number: " >/dev/tty; read -r CH </dev/tty || CH=""
+    ui_options "1|SOCKS5 Proxy|$_P" "2|Network Optimization|$_N" \
+        "3|Anti-DDoS|$_D" "4|Monitoring" "5|Security" "6|Services" \
+        "7|System" "0|Exit"
+    ui_input CH "  Enter number: "
     case "$CH" in
         1) menu_proxy ;;
         2) menu_sysctl ;;
