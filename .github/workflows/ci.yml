@@ -1,0 +1,30 @@
+# Runs the project's own quality gate (make check), a guard that the
+# shipped install.sh is always in sync with src/, and the unit tests.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+
+      - name: Quality gate (bash -n, shellcheck, build verification)
+        run: make check
+
+      - name: install.sh must match a fresh build from src/
+        run: |
+          ./build.sh
+          git diff --exit-code -- install.sh || {
+            echo "::error::install.sh is out of sync with src/ - run ./build.sh and commit the result"
+            exit 1
+          }
+
+      - name: Unit tests
+        run: make test

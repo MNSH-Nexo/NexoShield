@@ -1,8 +1,18 @@
 # Fix Plan — NexoShield
 
-**Status:** DRAFT for maintainer approval (2026-10-23). No fix in this plan
-has been applied yet (except the separately staged quick-win patch, which
-is Wave 0 and still awaits approval).
+**Status:** APPROVED by the maintainer 2026-10-23 ("شروع کن" — start).
+Execution follows the waves below. Open questions Q1/Q2 proceed with the
+recommended defaults (Q1: full IPv6 parity in Wave 9; Q2: probation
+score 50 / 30-minute window) unless the maintainer overrides them before
+those waves land.
+
+**Progress log:**
+- Wave 0 — DONE. Quick-win patch applied (BUG-029 validator into the
+  whitelist manager, BUG-049 password fallback removed ×3, BUG-006
+  sha256 pin scaffold — value still to be filled per Q4), CI workflow
+  added (`.github/workflows/ci.yml`, runs `make check` + `make test` +
+  install.sh sync guard), test skeleton added (`tests/unit/`, first
+  suite: `valid_ip_or_cidr`, 30/30). `make check` + `make test` green.
 
 **Inputs:** `docs/BUGS.md` — 68 audited findings (BUG-001…068) plus the
 maintainer's field reports FR-1 (whitelist must exempt from *everything*),

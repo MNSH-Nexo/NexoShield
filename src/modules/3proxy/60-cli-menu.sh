@@ -95,7 +95,11 @@ case "${1:-}" in
                   tc class show dev "${MAIN_IF:-eth0}" 2>/dev/null || echo "tc not configured"
                   printf '%s\n' "  Press Enter to continue..." >/dev/tty; read -r _PE </dev/tty 2>/dev/null || true; exit 0 ;;
     --change-pass)
-                  NEW_PASS=$(tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c 16 || echo "proxy$(date +%s)")
+                  NEW_PASS=$(tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c 16)
+                  if [ -z "$NEW_PASS" ]; then
+                      echo -e "${RED}Failed to generate a secure password (/dev/urandom unavailable). Aborting.${NC}" >&2
+                      exit 1
+                  fi
                   CU=$(grep -oP '(?<=allow )\S+' "$PROXY_CONF" 2>/dev/null | head -1 || echo "")
                   if [ -n "$CU" ]; then
                       echo "users ${CU}:CL:${NEW_PASS}" > "$PROXY_USERS"

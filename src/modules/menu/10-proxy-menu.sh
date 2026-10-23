@@ -88,7 +88,14 @@ _proxy_change_pass() {
     [ ! -f /etc/3proxy/3proxy.cfg ] && warn "3proxy not installed" && press_enter && return
     echo -e "  ${DIM}Leave empty to generate a random password.${NC}"; echo ""
     printf '%s' "  New password (empty = random): " >/dev/tty; read -r NP </dev/tty || NP=""
-    [ -z "$NP" ] && NP=$(tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c 16 || echo "proxy$(date +%s)")
+    if [ -z "$NP" ]; then
+        NP=$(tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c 16)
+        if [ -z "$NP" ]; then
+            warn "Failed to generate a secure password (/dev/urandom unavailable)"
+            press_enter
+            return 1
+        fi
+    fi
     CU=$(grep -oP '(?<=allow )\S+' /etc/3proxy/3proxy.cfg 2>/dev/null | head -1 || echo "")
     [ -z "$CU" ] && warn "Cannot find username" && press_enter && return
     echo "users ${CU}:CL:${NP}" > /etc/3proxy/users.cfg

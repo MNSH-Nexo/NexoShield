@@ -42,8 +42,18 @@ install_proxy() {
         echo -e "${GREEN}3proxy installed from apt.${NC}"
     else
         echo -e "${YELLOW}Compiling 3proxy from source...${NC}"
+        # Pinned sha256 of the 3proxy 0.9.4 source tarball. Empty = skip the
+        # check (not recommended). Fill from a trusted download with:
+        #   sha256sum 3proxy.tar.gz
+        T3PROXY_SHA256=""
         if run_spinner "Downloading 3proxy source" wget -O 3proxy.tar.gz \
             https://github.com/3proxy/3proxy/archive/refs/tags/0.9.4.tar.gz; then
+            if [ -n "$T3PROXY_SHA256" ]; then
+                echo "$T3PROXY_SHA256  3proxy.tar.gz" | sha256sum -c - >/dev/null || {
+                    echo -e "${RED}Checksum mismatch for 3proxy source - aborting.${NC}"
+                    cd /; rm -rf "$TMPDIR_BUILD"; return 1
+                }
+            fi
             run_spinner "Extracting source" tar -xzf 3proxy.tar.gz
             cd 3proxy-0.9.4 || { cd /; rm -rf "$TMPDIR_BUILD"; return 1; }
             if run_spinner "Compiling (this can take a while)" \
@@ -91,7 +101,11 @@ install_proxy() {
     [[ "$CONN_TIMEOUT" =~ ^[0-9]+$ ]] || CONN_TIMEOUT=60
 
     PROXY_USER=$(tr -dc 'a-z' </dev/urandom 2>/dev/null | head -c 8 || echo "proxyuser")
-    PROXY_PASS=$(tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c 16 || echo "proxy$(date +%s)")
+    PROXY_PASS=$(tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c 16)
+    if [ -z "$PROXY_PASS" ]; then
+        echo -e "${RED}Failed to generate a secure proxy password (/dev/urandom unavailable). Aborting install.${NC}" >&2
+        return 1
+    fi
 
     mkdir -p /etc/3proxy "$PROXY_LOG_DIR"
     chmod 750 "$PROXY_LOG_DIR"

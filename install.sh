@@ -1208,8 +1208,18 @@ install_proxy() {
         echo -e "${GREEN}3proxy installed from apt.${NC}"
     else
         echo -e "${YELLOW}Compiling 3proxy from source...${NC}"
+        # Pinned sha256 of the 3proxy 0.9.4 source tarball. Empty = skip the
+        # check (not recommended). Fill from a trusted download with:
+        #   sha256sum 3proxy.tar.gz
+        T3PROXY_SHA256=""
         if run_spinner "Downloading 3proxy source" wget -O 3proxy.tar.gz \
             https://github.com/3proxy/3proxy/archive/refs/tags/0.9.4.tar.gz; then
+            if [ -n "$T3PROXY_SHA256" ]; then
+                echo "$T3PROXY_SHA256  3proxy.tar.gz" | sha256sum -c - >/dev/null || {
+                    echo -e "${RED}Checksum mismatch for 3proxy source - aborting.${NC}"
+                    cd /; rm -rf "$TMPDIR_BUILD"; return 1
+                }
+            fi
             run_spinner "Extracting source" tar -xzf 3proxy.tar.gz
             cd 3proxy-0.9.4 || { cd /; rm -rf "$TMPDIR_BUILD"; return 1; }
             if run_spinner "Compiling (this can take a while)" \
@@ -1257,7 +1267,11 @@ install_proxy() {
     [[ "$CONN_TIMEOUT" =~ ^[0-9]+$ ]] || CONN_TIMEOUT=60
 
     PROXY_USER=$(tr -dc 'a-z' </dev/urandom 2>/dev/null | head -c 8 || echo "proxyuser")
-    PROXY_PASS=$(tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c 16 || echo "proxy$(date +%s)")
+    PROXY_PASS=$(tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c 16)
+    if [ -z "$PROXY_PASS" ]; then
+        echo -e "${RED}Failed to generate a secure proxy password (/dev/urandom unavailable). Aborting install.${NC}" >&2
+        return 1
+    fi
 
     mkdir -p /etc/3proxy "$PROXY_LOG_DIR"
     chmod 750 "$PROXY_LOG_DIR"
@@ -1612,7 +1626,11 @@ case "${1:-}" in
                   tc class show dev "${MAIN_IF:-eth0}" 2>/dev/null || echo "tc not configured"
                   printf '%s\n' "  Press Enter to continue..." >/dev/tty; read -r _PE </dev/tty 2>/dev/null || true; exit 0 ;;
     --change-pass)
-                  NEW_PASS=$(tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c 16 || echo "proxy$(date +%s)")
+                  NEW_PASS=$(tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c 16)
+                  if [ -z "$NEW_PASS" ]; then
+                      echo -e "${RED}Failed to generate a secure password (/dev/urandom unavailable). Aborting.${NC}" >&2
+                      exit 1
+                  fi
                   CU=$(grep -oP '(?<=allow )\S+' "$PROXY_CONF" 2>/dev/null | head -1 || echo "")
                   if [ -n "$CU" ]; then
                       echo "users ${CU}:CL:${NEW_PASS}" > "$PROXY_USERS"
@@ -2254,7 +2272,7 @@ draw_header() {
     clear 2>/dev/null || true
     echo -e "${C}${BOLD}"
     echo "  ╔══════════════════════════════════════════════╗"
-    echo "  ║       Proxy Manager  v${VERSION}  Anti-DDoS       ║"
+    echo "  ║       Proxy Manager  v${VERSION}  Anti-DDoS      ║"
     echo "  ╚══════════════════════════════════════════════╝${NC}"
     local PROXY_ST PROXY_PORT SERVER_IP LOAD MEM_PCT DISK_PCT DDOS_ST
     PROXY_ST=$(svc_status "3proxy")
@@ -2361,7 +2379,14 @@ _proxy_change_pass() {
     [ ! -f /etc/3proxy/3proxy.cfg ] && warn "3proxy not installed" && press_enter && return
     echo -e "  ${DIM}Leave empty to generate a random password.${NC}"; echo ""
     printf '%s' "  New password (empty = random): " >/dev/tty; read -r NP </dev/tty || NP=""
-    [ -z "$NP" ] && NP=$(tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c 16 || echo "proxy$(date +%s)")
+    if [ -z "$NP" ]; then
+        NP=$(tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c 16)
+        if [ -z "$NP" ]; then
+            warn "Failed to generate a secure password (/dev/urandom unavailable)"
+            press_enter
+            return 1
+        fi
+    fi
     CU=$(grep -oP '(?<=allow )\S+' /etc/3proxy/3proxy.cfg 2>/dev/null | head -1 || echo "")
     [ -z "$CU" ] && warn "Cannot find username" && press_enter && return
     echo "users ${CU}:CL:${NP}" > /etc/3proxy/users.cfg
@@ -4881,6 +4906,38 @@ show_thresholds() {
     sep
 }
 
+# Validate an IPv4 address or CIDR (e.g. 1.2.3.4 or 5.6.7.0/24).
+# Returns 0 when valid, 1 otherwise. Guards the whitelist manager so a
+# typo can't silently add a non-address that iptables then ignores.
+valid_ip_or_cidr() {
+    local input="${1:-}" addr mask o slashed=0
+    case "$input" in
+        */*) addr="${input%%/*}"; mask="${input#*/}"; slashed=1 ;;
+        *)   addr="$input"; mask="" ;;
+    esac
+    case "$addr" in
+        ""|.*|*.|*..*|*[!0-9.]*) return 1 ;;
+    esac
+    local o1 o2 o3 o4 extra
+    IFS='.' read -r o1 o2 o3 o4 extra <<< "$addr"
+    [ -z "${extra:-}" ] || return 1
+    for o in "$o1" "$o2" "$o3" "$o4"; do
+        case "$o" in
+            ""|*[!0-9]*) return 1 ;;
+        esac
+        [ "${#o}" -le 3 ] || return 1
+        (( 10#$o <= 255 )) || return 1
+    done
+    if [ "$slashed" = 1 ]; then
+        case "$mask" in
+            ""|*[!0-9]*) return 1 ;;
+        esac
+        [ "${#mask}" -le 2 ] || return 1
+        (( 10#$mask <= 32 )) || return 1
+    fi
+    return 0
+}
+
 # ── Whitelist manager ──────────────────────────────────────
 manage_whitelist() {
     local WL="$WHITELIST_FILE"
@@ -4920,6 +4977,8 @@ manage_whitelist() {
                 WIP="${WIP// /}"
                 if [ -z "$WIP" ]; then
                     echo -e "  ${YELLOW}No input.${NC}"
+                elif ! valid_ip_or_cidr "$WIP"; then
+                    echo -e "  ${RED}Invalid IP/CIDR: $WIP${NC}"
                 elif grep -qF "$WIP" "$WL" 2>/dev/null; then
                     echo -e "  ${YELLOW}Already in whitelist.${NC}"
                 else

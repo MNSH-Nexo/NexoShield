@@ -27,6 +27,38 @@ show_thresholds() {
     sep
 }
 
+# Validate an IPv4 address or CIDR (e.g. 1.2.3.4 or 5.6.7.0/24).
+# Returns 0 when valid, 1 otherwise. Guards the whitelist manager so a
+# typo can't silently add a non-address that iptables then ignores.
+valid_ip_or_cidr() {
+    local input="${1:-}" addr mask o slashed=0
+    case "$input" in
+        */*) addr="${input%%/*}"; mask="${input#*/}"; slashed=1 ;;
+        *)   addr="$input"; mask="" ;;
+    esac
+    case "$addr" in
+        ""|.*|*.|*..*|*[!0-9.]*) return 1 ;;
+    esac
+    local o1 o2 o3 o4 extra
+    IFS='.' read -r o1 o2 o3 o4 extra <<< "$addr"
+    [ -z "${extra:-}" ] || return 1
+    for o in "$o1" "$o2" "$o3" "$o4"; do
+        case "$o" in
+            ""|*[!0-9]*) return 1 ;;
+        esac
+        [ "${#o}" -le 3 ] || return 1
+        (( 10#$o <= 255 )) || return 1
+    done
+    if [ "$slashed" = 1 ]; then
+        case "$mask" in
+            ""|*[!0-9]*) return 1 ;;
+        esac
+        [ "${#mask}" -le 2 ] || return 1
+        (( 10#$mask <= 32 )) || return 1
+    fi
+    return 0
+}
+
 # ── Whitelist manager ──────────────────────────────────────
 manage_whitelist() {
     local WL="$WHITELIST_FILE"
@@ -66,6 +98,8 @@ manage_whitelist() {
                 WIP="${WIP// /}"
                 if [ -z "$WIP" ]; then
                     echo -e "  ${YELLOW}No input.${NC}"
+                elif ! valid_ip_or_cidr "$WIP"; then
+                    echo -e "  ${RED}Invalid IP/CIDR: $WIP${NC}"
                 elif grep -qF "$WIP" "$WL" 2>/dev/null; then
                     echo -e "  ${YELLOW}Already in whitelist.${NC}"
                 else

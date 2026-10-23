@@ -55,7 +55,7 @@ draw_header() {
     clear 2>/dev/null || true
     echo -e "${C}${BOLD}"
     echo "  ╔══════════════════════════════════════════════╗"
-    echo "  ║       Proxy Manager  v${VERSION}  Anti-DDoS       ║"
+    echo "  ║       Proxy Manager  v${VERSION}  Anti-DDoS      ║"
     echo "  ╚══════════════════════════════════════════════╝${NC}"
     local PROXY_ST PROXY_PORT SERVER_IP LOAD MEM_PCT DISK_PCT DDOS_ST
     PROXY_ST=$(svc_status "3proxy")
