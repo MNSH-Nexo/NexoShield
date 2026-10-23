@@ -5,10 +5,17 @@ ban_subnet() {
     local cidr="${subnet}.0/24"
     # Don't ban if any CF range overlaps (rough check: skip 103.x, 104.x, 108.x, 141.x, 162.x, 172.x, 173.x, 188.x, 190.x, 197.x, 198.x)
     is_cf_ip "${subnet}.1" 2>/dev/null && return 0
-    # Don't ban own server subnet
-    local own_subnet
-    own_subnet=$(ip -4 addr show 2>/dev/null | grep -oP '(?<=inet )\d+\.\d+\.\d+' | head -1)
-    [ "${own_subnet:-x}" = "$subnet" ] && return 0
+    # Don't ban own server subnet - check EVERY local address (BUG-065:
+    # the old code compared only the first `ip addr` line via head -1)
+    local _sip
+    for _sip in "${SELF_IPS[@]}"; do
+        [ "${_sip%.*}" = "$subnet" ] && { log " SUBNET SKIP: $cidr contains own IP $_sip"; return 0; }
+    done
+    if [ -f /etc/antiddos/self-ips.list ]; then
+        while IFS= read -r _sip; do
+            [ "${_sip%.*}" = "$subnet" ] && { log " SUBNET SKIP: $cidr contains own IP $_sip (snapshot)"; return 0; }
+        done < /etc/antiddos/self-ips.list
+    fi
     # Don't ban if any user-whitelisted IP/CIDR falls inside this /24 subnet —
     # whitelisted users must never be dropped even under distributed attacks.
     local _ENTRY _EIP

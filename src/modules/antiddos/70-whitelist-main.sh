@@ -59,6 +59,64 @@ valid_ip_or_cidr() {
     return 0
 }
 
+# ── Exempt-set membership (D1) ─────────────────────────────
+nx_ip_to_int() {
+    local IFS=. a b c d
+    read -r a b c d <<< "$1"
+    echo $(( (10#$a << 24) + (10#$b << 16) + (10#$c << 8) + 10#$d ))
+}
+
+nx_ip_in_cidr() {
+    local ip="$1" cidr="$2" net mask ni ii sh
+    net="${cidr%%/*}"; mask="${cidr#*/}"
+    case "$mask" in ''|*[!0-9]*) return 1 ;; esac
+    (( 10#$mask <= 32 )) || return 1
+    ni=$(nx_ip_to_int "$net"); ii=$(nx_ip_to_int "$ip")
+    [ "$mask" -eq 0 ] && return 0
+    sh=$(( 32 - 10#$mask ))
+    [ $(( ii >> sh )) -eq $(( ni >> sh )) ]
+}
+
+# exempt_check <ip> — per-layer exemption status for one IP.
+# Exit: 0 = member of the exempt set (CF / self / whitelist), 1 = not
+# exempt, 2 = invalid input. Manual block flows MUST refuse on 0 (FR-1/2).
+exempt_check() {
+    local ip="${1:-}" rc=1 _e
+    [ -n "$ip" ] || { echo "usage: --exempt-check <ip>"; return 2; }
+    valid_ip_or_cidr "$ip" || { echo "invalid IP/CIDR: $ip"; return 2; }
+    ip="${ip%%/*}"
+    echo "Exemption check for $ip:"
+    local cf=no self=no wl=no
+    for _e in "${CF_RANGES[@]}"; do nx_ip_in_cidr "$ip" "$_e" && { cf=yes; break; }; done
+    list_self_ips 2>/dev/null | grep -qxF "$ip" && self=yes
+    if [ -f "$WHITELIST_FILE" ]; then
+        while IFS= read -r _e; do
+            _e="${_e%%#*}"; _e="${_e// /}"
+            [ -z "$_e" ] && continue
+            case "$_e" in
+                */*) nx_ip_in_cidr "$ip" "$_e" && { wl=yes; break; } ;;
+                *)   [ "$_e" = "$ip" ] && { wl=yes; break; } ;;
+            esac
+        done < "$WHITELIST_FILE"
+    fi
+    echo "  cloudflare ranges : $cf"
+    echo "  server own IP     : $self"
+    echo "  admin whitelist   : $wl"
+    { [ "$cf" = yes ] || [ "$self" = yes ] || [ "$wl" = yes ]; } && rc=0
+    if [ -f "$F2B_JAIL_DIR/antiddos.conf" ]; then
+        if grep -qw "$ip" "$F2B_JAIL_DIR/antiddos.conf" 2>/dev/null; then
+            echo "  fail2ban ignoreip : listed"
+        else
+            echo "  fail2ban ignoreip : NOT listed by exact IP (CIDR entries may still cover it)"
+        fi
+    fi
+    if iptables -S INPUT 2>/dev/null | grep -F -- "-s $ip" | grep -q -- '-j ACCEPT'; then
+        echo "  iptables INPUT    : ACCEPT rule present for this exact IP"
+    fi
+    [ "$rc" -eq 0 ] && echo "  VERDICT: EXEMPT" || echo "  VERDICT: not exempt"
+    return $rc
+}
+
 # ── Whitelist manager ──────────────────────────────────────
 manage_whitelist() {
     local WL="$WHITELIST_FILE"
@@ -108,6 +166,7 @@ manage_whitelist() {
                     # Apply to iptables + tc immediately (re-apply both)
                     apply_iptables >/dev/null 2>&1 || true
                     apply_tc_runtime "$MAIN_IF" >/dev/null 2>&1 || true
+                    update_f2b_ignoreip || true
                 fi
                 printf '%s\n' "  Press Enter..." >/dev/tty; read -r _PE </dev/tty 2>/dev/null || true ;;
             d|D)
@@ -121,6 +180,7 @@ manage_whitelist() {
                     echo -e "  ${GREEN}✓ Removed: $RIP${NC}"
                     apply_iptables >/dev/null 2>&1 || true
                     apply_tc_runtime "$MAIN_IF" >/dev/null 2>&1 || true
+                    update_f2b_ignoreip || true
                 else
                     echo -e "  ${YELLOW}Not found.${NC}"
                 fi
@@ -146,6 +206,7 @@ case "${1:-}" in
     --remove|-r)     detect_env; remove_rules; exit 0 ;;
     --remove-force)  detect_env; CONF_R="y"; remove_rules; exit 0 ;;
     --status|-s)     detect_env; show_status; exit 0 ;;
+    --exempt-check)  exempt_check "${2:-}"; exit $? ;;
     --thresholds|-t) detect_env; show_thresholds; exit 0 ;;
     --sysctl)        detect_env; apply_sysctl_hardening; exit 0 ;;
     --iptables)      detect_env; apply_iptables; exit 0 ;;

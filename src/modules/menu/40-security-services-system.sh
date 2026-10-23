@@ -27,8 +27,20 @@ menu_security() {
                press_enter ;;
             2) echo -e "  ${C}Block IP${NC}"; echo ""
                printf '%s' "  Enter IP or CIDR to block (e.g. 1.2.3.4 or 1.2.3.0/24): " >/dev/tty; read -r BIP </dev/tty || BIP=""
-               [ -n "$BIP" ] && iptables -I INPUT -s "$BIP" -j DROP 2>/dev/null && \
-                   ok "$BIP blocked" || warn "No IP entered"
+               if [ -n "$BIP" ]; then
+                   bash "$ANTIDDOS_SCRIPT" --exempt-check "$BIP" >/dev/null 2>&1; _EC=$?
+                   if [ "$_EC" -eq 0 ]; then
+                       warn "$BIP is EXEMPT (Cloudflare / own IP / whitelist) - refusing to block"
+                   elif [ "$_EC" -eq 2 ]; then
+                       warn "Invalid IP/CIDR: $BIP"
+                   elif iptables -I INPUT -s "$BIP" -j DROP 2>/dev/null; then
+                       ok "$BIP blocked"
+                   else
+                       warn "Could not block $BIP"
+                   fi
+               else
+                   warn "No IP entered"
+               fi
                press_enter ;;
             3) echo -e "  ${C}Unblock IP${NC}"; echo ""
                printf '%s' "  Enter IP to unblock: " >/dev/tty; read -r UIP </dev/tty || UIP=""

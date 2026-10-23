@@ -22,6 +22,34 @@ unban_expired() {
     printf "%b" "$NEWLIST" > "$BANNED_LIST" 2>/dev/null || true
 }
 
+# FR-2 watchdog (D2): if a DROP rule or throttle entry ever targets one
+# of the server's own IPs (our bug, a foreign tool, a manual mistake),
+# remove it and log loudly. "Never block our own IPs" is a monitored
+# invariant, not a hope.
+self_guard() {
+    local _sip _esc _rule
+    for _sip in "${SELF_IPS[@]}"; do
+        [ -z "$_sip" ] && continue
+        _esc=$(printf '%s' "$_sip" | sed 's/\./\\./g')
+        while IFS= read -r _rule; do
+            [ -z "$_rule" ] && continue
+            # _rule is an "INPUT ..." spec derived from iptables -S output.
+            # shellcheck disable=SC2086  # word splitting IS the mechanism
+            iptables -D $_rule 2>/dev/null && \
+                log " SELF-GUARD: removed DROP rule hitting own IP $_sip"
+        done < <(iptables -S INPUT 2>/dev/null | grep -E -- "-s ${_esc}(/32)?[[:space:]]" | grep -- '-j DROP' | sed 's/^-A /INPUT /')
+    done
+    if [ -f "$THROTTLE_LIST" ]; then
+        for _sip in "${SELF_IPS[@]}"; do
+            if grep -q "^${_sip} " "$THROTTLE_LIST" 2>/dev/null; then
+                unthrottle_ip "$_sip" hard 2>/dev/null || true
+                unthrottle_ip "$_sip" soft 2>/dev/null || true
+                log " SELF-GUARD: removed throttle state for own IP $_sip"
+            fi
+        done
+    fi
+}
+
 log " Smart throttle+ban started (conn_threshold:${CONN_THRESHOLD} ban_threshold:${BAN_CONN_THRESHOLD} subnet_threshold:${SUBNET_THRESHOLD} observe:${OBSERVE_SECONDS}s throttle:${THROTTLE_MBPS}Mbps ban:${BAN_HOURS}h)"
 
 score_init
@@ -32,6 +60,9 @@ while true; do
 
     # Every ~5 min: unban expired IPs and subnets
     [ $((CYCLE % 75)) -eq 0 ] && unban_expired && unban_subnet_expired
+
+    # Every cycle: enforce self-IP immunity (cheap; iptables -S scan)
+    self_guard
 
     # Measure active connections per IP (accurate, zero CPU overhead)
     # Normal user: 5-20 connections. Attacker: 100s-1000s.

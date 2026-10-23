@@ -816,6 +816,10 @@ CF_RANGES=(
 )
 mkdir -p /etc/antiddos
 printf "%s\n" "${CF_RANGES[@]}" > /etc/antiddos/cloudflare-ipv4.list
+# Pristine copy: the menu restores the runtime list from here if it is
+# ever deleted/emptied, instead of fabricating one (see BUG-005).
+mkdir -p "$INSTALL_DIR/data"
+printf "%s\n" "${CF_RANGES[@]}" > "$INSTALL_DIR/data/cloudflare-ipv4.list"
 
 touch "$LOG" && chmod 600 "$LOG"
 
@@ -1052,6 +1056,15 @@ setup_iptables_for_port() {
         --hitcount $((MAX_CONN * 2)) -j DROP 2>/dev/null || true
     iptables -D INPUT -p tcp --dport "$PORT" -m state --state NEW \
         -m recent --name "3proxy_$PORT" --set 2>/dev/null || true
+    # Remove old user-whitelist rules (spec mirrors the create below)
+    if [ -f /etc/antiddos/whitelist.list ]; then
+        while IFS= read -r WIP; do
+            WIP="${WIP%%#*}"; WIP="${WIP// /}"
+            [ -z "$WIP" ] && continue
+            iptables -D INPUT -p tcp --dport "$PORT" -s "$WIP" \
+                -m comment --comment "3proxy_wl_allow" -j ACCEPT 2>/dev/null || true
+        done < /etc/antiddos/whitelist.list
+    fi
 
     # ── Step 1: CF IPs → ACCEPT immediately (no limits!) ─
     for CF in "${CF_RANGES[@]}"; do
@@ -1066,6 +1079,17 @@ setup_iptables_for_port() {
         iptables -A INPUT -p tcp --dport "$PORT" -s "$SIP/32" \
             -m comment --comment "3proxy_self_allow" -j ACCEPT 2>/dev/null || true
     done < <(get_server_ips)
+
+    # ── Step 2b: User whitelist → ACCEPT (FR-1: exempt means exempt
+    # in EVERY layer, including this port's rate limits) ──────
+    if [ -f /etc/antiddos/whitelist.list ]; then
+        while IFS= read -r WIP; do
+            WIP="${WIP%%#*}"; WIP="${WIP// /}"
+            [ -z "$WIP" ] && continue
+            iptables -A INPUT -p tcp --dport "$PORT" -s "$WIP" \
+                -m comment --comment "3proxy_wl_allow" -j ACCEPT 2>/dev/null || true
+        done < /etc/antiddos/whitelist.list
+    fi
 
     # ── Step 3: Non-CF rate-limit (new conns per IP) ──────
     # Only apply to IPs NOT from CF (CF already accepted above)
@@ -2319,9 +2343,25 @@ menu_proxy() {
                # IPs are ALWAYS excluded from throttling (it can be deleted by an
                # earlier uninstall/antiddos --remove in the same session).
                mkdir -p /etc/antiddos
-               [ -s /etc/antiddos/cloudflare-ipv4.list ] || \
-                   printf "%s\n" "${CF_RANGES[@]}" > /etc/antiddos/cloudflare-ipv4.list
-               bash "$PROXY_SCRIPT" --install < /dev/tty; press_enter ;;
+               # BUG-005 fix: this script has no CF_RANGES - never fabricate
+               # the list here (the old code wrote a 1-byte blank file that
+               # then counted as "present" forever). Restore the installer's
+               # pristine copy; if there is none, refuse to install.
+               _CF_OK=1
+               if ! grep -q '[0-9]' /etc/antiddos/cloudflare-ipv4.list 2>/dev/null; then
+                   if [ -s /opt/proxy-manager/data/cloudflare-ipv4.list ]; then
+                       cp /opt/proxy-manager/data/cloudflare-ipv4.list \
+                           /etc/antiddos/cloudflare-ipv4.list
+                   else
+                       _CF_OK=0
+                   fi
+               fi
+               if [ "$_CF_OK" = 1 ]; then
+                   bash "$PROXY_SCRIPT" --install < /dev/tty
+               else
+                   warn "Cloudflare whitelist missing and no pristine copy found - re-run the NexoShield installer to repair it. Install aborted."
+               fi
+               press_enter ;;
             2) echo ""
                printf '%s' "  Remove 3proxy completely? (y/N): " >/dev/tty; read -r _RC </dev/tty || _RC=""
                [[ "$_RC" == "y" || "$_RC" == "Y" ]] && bash "$PROXY_SCRIPT" --remove < /dev/tty || echo -e "  ${DIM}Cancelled.${NC}"
@@ -2437,8 +2477,16 @@ _proxy_suspicious() {
     echo -e "  ${DIM}Enter an IP above to block it, or press Enter to skip.${NC}"
     printf '%s' "  Block IP (empty = skip): " >/dev/tty; read -r BIP </dev/tty || BIP=""
     if [ -n "$BIP" ]; then
-        iptables -I INPUT -s "$BIP" -m comment --comment "auto-ban" -j DROP 2>/dev/null && \
-            ok "$BIP blocked" || warn "Could not block $BIP"
+        bash "$ANTIDDOS_SCRIPT" --exempt-check "$BIP" >/dev/null 2>&1; _EC=$?
+        if [ "$_EC" -eq 0 ]; then
+            warn "$BIP is EXEMPT (Cloudflare / own IP / whitelist) - refusing to block"
+        elif [ "$_EC" -eq 2 ]; then
+            warn "Invalid IP/CIDR: $BIP"
+        elif iptables -I INPUT -s "$BIP" -m comment --comment "auto-ban" -j DROP 2>/dev/null; then
+            ok "$BIP blocked"
+        else
+            warn "Could not block $BIP"
+        fi
     fi
     press_enter
 }
@@ -2771,8 +2819,20 @@ menu_security() {
                press_enter ;;
             2) echo -e "  ${C}Block IP${NC}"; echo ""
                printf '%s' "  Enter IP or CIDR to block (e.g. 1.2.3.4 or 1.2.3.0/24): " >/dev/tty; read -r BIP </dev/tty || BIP=""
-               [ -n "$BIP" ] && iptables -I INPUT -s "$BIP" -j DROP 2>/dev/null && \
-                   ok "$BIP blocked" || warn "No IP entered"
+               if [ -n "$BIP" ]; then
+                   bash "$ANTIDDOS_SCRIPT" --exempt-check "$BIP" >/dev/null 2>&1; _EC=$?
+                   if [ "$_EC" -eq 0 ]; then
+                       warn "$BIP is EXEMPT (Cloudflare / own IP / whitelist) - refusing to block"
+                   elif [ "$_EC" -eq 2 ]; then
+                       warn "Invalid IP/CIDR: $BIP"
+                   elif iptables -I INPUT -s "$BIP" -j DROP 2>/dev/null; then
+                       ok "$BIP blocked"
+                   else
+                       warn "Could not block $BIP"
+                   fi
+               else
+                   warn "No IP entered"
+               fi
                press_enter ;;
             3) echo -e "  ${C}Unblock IP${NC}"; echo ""
                printf '%s' "  Enter IP to unblock: " >/dev/tty; read -r UIP </dev/tty || UIP=""
@@ -3183,6 +3243,8 @@ IPTABLES_SAVE_FILE="/etc/antiddos/iptables-antiddos.rules"
 AUTOBAN_SCRIPT="/opt/proxy-manager/auto-ban.sh"
 AUTOBAN_SERVICE="/etc/systemd/system/auto-ban.service"
 WHITELIST_FILE="/etc/antiddos/whitelist.list"
+SELF_IPS_FILE="/etc/antiddos/self-ips.list"
+EXEMPT_FILE="/etc/antiddos/exempt.list"
 
 [ "$EUID" -ne 0 ] && echo -e "${RED}Root required${NC}" && exit 1
 
@@ -3219,6 +3281,11 @@ get_server_ips() {
     ip -4 addr show 2>/dev/null | grep 'inet ' | \
         grep -v '127\.\|10\.\|192\.168\.\|172\.\(1[6-9]\|2[0-9]\|3[01]\)\.' | \
         awk '{print $2}' | cut -d/ -f1
+}
+list_self_ips() {
+    { ip -4 addr show 2>/dev/null | grep -oP '(?<=inet )\d+\.\d+\.\d+\.\d+'
+      hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'
+    } | sort -u | grep -v '^$'
 }
 
 # Detect environment
@@ -3376,6 +3443,13 @@ EOF
 apply_iptables() {
     info "Applying iptables rules..."
 
+    # BUG-027 (fail closed): with no Cloudflare ranges loaded, every rule
+    # below would treat CF IPs as ordinary traffic. Refuse to arm.
+    if [ "${#CF_RANGES[@]}" -eq 0 ]; then
+        err "Cloudflare range list is empty/missing - refusing to apply iptables rules (CF would lose its exemption)"
+        return 1
+    fi
+
     # Helper: add if not already present
     ipt_add() { iptables -C "$@" 2>/dev/null || iptables -A "$@"; }
     ipt_ins() { iptables -C "$@" 2>/dev/null || iptables -I "$@"; }
@@ -3418,6 +3492,20 @@ apply_iptables() {
         done < "$WHITELIST_FILE"
     fi
     success "CF + self whitelist: added (${#CF_RANGES[@]} CF ranges + own IPs)"
+
+    # ── Step 4c: Canonical exempt-set snapshot (D1) ──
+    # One file every layer can consult: CF ranges + ALL self IPs + the
+    # admin whitelist. Also snapshot the self IPs on their own (FR-2).
+    list_self_ips > "$SELF_IPS_FILE" 2>/dev/null || true
+    { printf '%s\n' "${CF_RANGES[@]}"
+      list_self_ips
+      if [ -f "$WHITELIST_FILE" ]; then
+          while IFS= read -r _EX; do
+              _EX="${_EX%%#*}"; _EX="${_EX// /}"
+              [ -n "$_EX" ] && printf '%s\n' "$_EX"
+          done < "$WHITELIST_FILE"
+      fi
+    } | grep -v '^$' | sort -u > "$EXEMPT_FILE" || true
 
     # ── Step 5: SYN Flood protection ─────────────────
     # NOTE: CF IPs already accepted above — these rules only apply to non-CF
@@ -3755,6 +3843,17 @@ EOF
     # line, so fail2ban NEVER bans a Cloudflare IP. Previously only 16 legacy
     # ranges were listed here, so CF IPs from newer ranges could get false bans.
     _F2B_IGNORE="127.0.0.1/8 ::1"
+    # FR-1/FR-2 (BUG-028): fail2ban must ignore the WHOLE exempt set, not
+    # just Cloudflare - the server's own IPs and the admin whitelist too.
+    while IFS= read -r _F2B_SELF; do
+        [ -n "$_F2B_SELF" ] && _F2B_IGNORE="$_F2B_IGNORE $_F2B_SELF/32"
+    done < <(list_self_ips)
+    if [ -f "$WHITELIST_FILE" ]; then
+        while IFS= read -r _F2B_WL; do
+            _F2B_WL="${_F2B_WL%%#*}"; _F2B_WL="${_F2B_WL// /}"
+            [ -n "$_F2B_WL" ] && _F2B_IGNORE="$_F2B_IGNORE $_F2B_WL"
+        done < "$WHITELIST_FILE"
+    fi
     _F2B_CF_N=0
     for _F2B_CF in "${CF_RANGES[@]}"; do
         _F2B_CF_N=$((_F2B_CF_N + 1))
@@ -3843,6 +3942,16 @@ EOF
     ACTIVE_JAILS=$(fail2ban-client status 2>/dev/null | grep "Jail list" | \
         sed 's/.*://;s/,/ /g' | wc -w || echo 0)
     success "fail2ban: $ACTIVE_JAILS jails active"
+}
+
+# Regenerate the jail file (its ignoreip is built from the live exempt
+# set) and reload fail2ban. Called by the whitelist manager after every
+# add/remove so a whitelisted IP is exempt in fail2ban immediately (FR-1).
+update_f2b_ignoreip() {
+    [ -f "$F2B_JAIL_DIR/antiddos.conf" ] || return 0
+    apply_fail2ban >/dev/null 2>&1 || true
+    fail2ban-client reload >/dev/null 2>&1 || \
+        systemctl reload fail2ban >/dev/null 2>&1 || true
 }
 
 # ════════════════════════════════════════════════
@@ -3952,6 +4061,11 @@ if [ -f /etc/antiddos/cloudflare-ipv4.list ]; then
 else
     echo "WARN: /etc/antiddos/cloudflare-ipv4.list missing - CF whitelist empty" >&2
 fi
+list_self_ips() {
+    { ip -4 addr show 2>/dev/null | grep -oP '(?<=inet )\d+\.\d+\.\d+\.\d+'
+      hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'
+    } | sort -u | grep -v '^$'
+}
 
 mkdir -p /etc/antiddos
 touch "$LOG" && chmod 600 "$LOG"
@@ -3961,10 +4075,7 @@ touch "$BANNED_LIST" "$WATCH_LIST" "$THROTTLE_LIST" 2>/dev/null || true
 SELF_IPS=()
 while IFS= read -r sip; do
     [ -n "$sip" ] && SELF_IPS+=("$sip")
-done < <(ip -4 addr show 2>/dev/null | grep -oP '(?<=inet )\d+\.\d+\.\d+\.\d+')
-while IFS= read -r sip; do
-    [ -n "$sip" ] && SELF_IPS+=("$sip")
-done < <(hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]')
+done < <(list_self_ips)
 
 log() { echo "[$(date '+%H:%M:%S')] $*" | tee -a "$LOG"; }
 
@@ -4004,6 +4115,9 @@ is_self_ip() {
     done
     ip -4 addr show 2>/dev/null | grep -oP '(?<=inet )\d+\.\d+\.\d+\.\d+' | grep -qxF "$ip" && return 0
     hostname -I 2>/dev/null | tr ' ' '\n' | grep -qxF "$ip" && return 0
+    # Freshness fallback: the installer's self-IP snapshot (FR-2)
+    [ -f /etc/antiddos/self-ips.list ] && \
+        grep -qxF "$ip" /etc/antiddos/self-ips.list 2>/dev/null && return 0
     return 1
 }
 
@@ -4016,7 +4130,15 @@ is_user_whitelisted() {
         entry="${entry// /}"            # drop spaces
         [ -z "$entry" ] && continue
         case "$entry" in
-            */*) ip_in_cidr "$ip" "$entry" 2>/dev/null && return 0 ;;
+            */*)
+                # BUG-029 (daemon half): a malformed mask must NEVER widen
+                # the match (arithmetic on garbage treated it as a number).
+                # Invalid entries are skipped, never "close enough".
+                _m="${entry#*/}"
+                case "$_m" in ''|*[!0-9]*) continue ;; esac
+                [ "${#_m}" -le 2 ] || continue
+                (( 10#$_m <= 32 )) || continue
+                ip_in_cidr "$ip" "$entry" 2>/dev/null && return 0 ;;
             *)   [ "$entry" = "$ip" ] && return 0 ;;
         esac
     done < "$WHITELIST_FILE"
@@ -4081,6 +4203,13 @@ hard_throttle_ip() {
 
 ban_ip() {
     local ip="$1"
+    # FR-2 choke-point guard: ban_ip is the funnel for EVERY ban path
+    # (classic, reputation, instant). A self IP must never pass, even if
+    # some other check regresses.
+    if is_self_ip "$ip"; then
+        log " SELF-GUARD: refused to ban the server's own IP $ip"
+        return 1
+    fi
     is_exempt "$ip" && return 0
     grep -qF "$ip " "$BANNED_LIST" 2>/dev/null && return 0
     local UNBAN_TIME
@@ -4224,10 +4353,17 @@ ban_subnet() {
     local cidr="${subnet}.0/24"
     # Don't ban if any CF range overlaps (rough check: skip 103.x, 104.x, 108.x, 141.x, 162.x, 172.x, 173.x, 188.x, 190.x, 197.x, 198.x)
     is_cf_ip "${subnet}.1" 2>/dev/null && return 0
-    # Don't ban own server subnet
-    local own_subnet
-    own_subnet=$(ip -4 addr show 2>/dev/null | grep -oP '(?<=inet )\d+\.\d+\.\d+' | head -1)
-    [ "${own_subnet:-x}" = "$subnet" ] && return 0
+    # Don't ban own server subnet - check EVERY local address (BUG-065:
+    # the old code compared only the first `ip addr` line via head -1)
+    local _sip
+    for _sip in "${SELF_IPS[@]}"; do
+        [ "${_sip%.*}" = "$subnet" ] && { log " SUBNET SKIP: $cidr contains own IP $_sip"; return 0; }
+    done
+    if [ -f /etc/antiddos/self-ips.list ]; then
+        while IFS= read -r _sip; do
+            [ "${_sip%.*}" = "$subnet" ] && { log " SUBNET SKIP: $cidr contains own IP $_sip (snapshot)"; return 0; }
+        done < /etc/antiddos/self-ips.list
+    fi
     # Don't ban if any user-whitelisted IP/CIDR falls inside this /24 subnet —
     # whitelisted users must never be dropped even under distributed attacks.
     local _ENTRY _EIP
@@ -4295,6 +4431,34 @@ unban_expired() {
     printf "%b" "$NEWLIST" > "$BANNED_LIST" 2>/dev/null || true
 }
 
+# FR-2 watchdog (D2): if a DROP rule or throttle entry ever targets one
+# of the server's own IPs (our bug, a foreign tool, a manual mistake),
+# remove it and log loudly. "Never block our own IPs" is a monitored
+# invariant, not a hope.
+self_guard() {
+    local _sip _esc _rule
+    for _sip in "${SELF_IPS[@]}"; do
+        [ -z "$_sip" ] && continue
+        _esc=$(printf '%s' "$_sip" | sed 's/\./\\./g')
+        while IFS= read -r _rule; do
+            [ -z "$_rule" ] && continue
+            # _rule is an "INPUT ..." spec derived from iptables -S output.
+            # shellcheck disable=SC2086  # word splitting IS the mechanism
+            iptables -D $_rule 2>/dev/null && \
+                log " SELF-GUARD: removed DROP rule hitting own IP $_sip"
+        done < <(iptables -S INPUT 2>/dev/null | grep -E -- "-s ${_esc}(/32)?[[:space:]]" | grep -- '-j DROP' | sed 's/^-A /INPUT /')
+    done
+    if [ -f "$THROTTLE_LIST" ]; then
+        for _sip in "${SELF_IPS[@]}"; do
+            if grep -q "^${_sip} " "$THROTTLE_LIST" 2>/dev/null; then
+                unthrottle_ip "$_sip" hard 2>/dev/null || true
+                unthrottle_ip "$_sip" soft 2>/dev/null || true
+                log " SELF-GUARD: removed throttle state for own IP $_sip"
+            fi
+        done
+    fi
+}
+
 log " Smart throttle+ban started (conn_threshold:${CONN_THRESHOLD} ban_threshold:${BAN_CONN_THRESHOLD} subnet_threshold:${SUBNET_THRESHOLD} observe:${OBSERVE_SECONDS}s throttle:${THROTTLE_MBPS}Mbps ban:${BAN_HOURS}h)"
 
 score_init
@@ -4305,6 +4469,9 @@ while true; do
 
     # Every ~5 min: unban expired IPs and subnets
     [ $((CYCLE % 75)) -eq 0 ] && unban_expired && unban_subnet_expired
+
+    # Every cycle: enforce self-IP immunity (cheap; iptables -S scan)
+    self_guard
 
     # Measure active connections per IP (accurate, zero CPU overhead)
     # Normal user: 5-20 connections. Attacker: 100s-1000s.
@@ -4938,6 +5105,64 @@ valid_ip_or_cidr() {
     return 0
 }
 
+# ── Exempt-set membership (D1) ─────────────────────────────
+nx_ip_to_int() {
+    local IFS=. a b c d
+    read -r a b c d <<< "$1"
+    echo $(( (10#$a << 24) + (10#$b << 16) + (10#$c << 8) + 10#$d ))
+}
+
+nx_ip_in_cidr() {
+    local ip="$1" cidr="$2" net mask ni ii sh
+    net="${cidr%%/*}"; mask="${cidr#*/}"
+    case "$mask" in ''|*[!0-9]*) return 1 ;; esac
+    (( 10#$mask <= 32 )) || return 1
+    ni=$(nx_ip_to_int "$net"); ii=$(nx_ip_to_int "$ip")
+    [ "$mask" -eq 0 ] && return 0
+    sh=$(( 32 - 10#$mask ))
+    [ $(( ii >> sh )) -eq $(( ni >> sh )) ]
+}
+
+# exempt_check <ip> — per-layer exemption status for one IP.
+# Exit: 0 = member of the exempt set (CF / self / whitelist), 1 = not
+# exempt, 2 = invalid input. Manual block flows MUST refuse on 0 (FR-1/2).
+exempt_check() {
+    local ip="${1:-}" rc=1 _e
+    [ -n "$ip" ] || { echo "usage: --exempt-check <ip>"; return 2; }
+    valid_ip_or_cidr "$ip" || { echo "invalid IP/CIDR: $ip"; return 2; }
+    ip="${ip%%/*}"
+    echo "Exemption check for $ip:"
+    local cf=no self=no wl=no
+    for _e in "${CF_RANGES[@]}"; do nx_ip_in_cidr "$ip" "$_e" && { cf=yes; break; }; done
+    list_self_ips 2>/dev/null | grep -qxF "$ip" && self=yes
+    if [ -f "$WHITELIST_FILE" ]; then
+        while IFS= read -r _e; do
+            _e="${_e%%#*}"; _e="${_e// /}"
+            [ -z "$_e" ] && continue
+            case "$_e" in
+                */*) nx_ip_in_cidr "$ip" "$_e" && { wl=yes; break; } ;;
+                *)   [ "$_e" = "$ip" ] && { wl=yes; break; } ;;
+            esac
+        done < "$WHITELIST_FILE"
+    fi
+    echo "  cloudflare ranges : $cf"
+    echo "  server own IP     : $self"
+    echo "  admin whitelist   : $wl"
+    { [ "$cf" = yes ] || [ "$self" = yes ] || [ "$wl" = yes ]; } && rc=0
+    if [ -f "$F2B_JAIL_DIR/antiddos.conf" ]; then
+        if grep -qw "$ip" "$F2B_JAIL_DIR/antiddos.conf" 2>/dev/null; then
+            echo "  fail2ban ignoreip : listed"
+        else
+            echo "  fail2ban ignoreip : NOT listed by exact IP (CIDR entries may still cover it)"
+        fi
+    fi
+    if iptables -S INPUT 2>/dev/null | grep -F -- "-s $ip" | grep -q -- '-j ACCEPT'; then
+        echo "  iptables INPUT    : ACCEPT rule present for this exact IP"
+    fi
+    [ "$rc" -eq 0 ] && echo "  VERDICT: EXEMPT" || echo "  VERDICT: not exempt"
+    return $rc
+}
+
 # ── Whitelist manager ──────────────────────────────────────
 manage_whitelist() {
     local WL="$WHITELIST_FILE"
@@ -4987,6 +5212,7 @@ manage_whitelist() {
                     # Apply to iptables + tc immediately (re-apply both)
                     apply_iptables >/dev/null 2>&1 || true
                     apply_tc_runtime "$MAIN_IF" >/dev/null 2>&1 || true
+                    update_f2b_ignoreip || true
                 fi
                 printf '%s\n' "  Press Enter..." >/dev/tty; read -r _PE </dev/tty 2>/dev/null || true ;;
             d|D)
@@ -5000,6 +5226,7 @@ manage_whitelist() {
                     echo -e "  ${GREEN}✓ Removed: $RIP${NC}"
                     apply_iptables >/dev/null 2>&1 || true
                     apply_tc_runtime "$MAIN_IF" >/dev/null 2>&1 || true
+                    update_f2b_ignoreip || true
                 else
                     echo -e "  ${YELLOW}Not found.${NC}"
                 fi
@@ -5025,6 +5252,7 @@ case "${1:-}" in
     --remove|-r)     detect_env; remove_rules; exit 0 ;;
     --remove-force)  detect_env; CONF_R="y"; remove_rules; exit 0 ;;
     --status|-s)     detect_env; show_status; exit 0 ;;
+    --exempt-check)  exempt_check "${2:-}"; exit $? ;;
     --thresholds|-t) detect_env; show_thresholds; exit 0 ;;
     --sysctl)        detect_env; apply_sysctl_hardening; exit 0 ;;
     --iptables)      detect_env; apply_iptables; exit 0 ;;

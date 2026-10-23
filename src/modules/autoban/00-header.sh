@@ -78,6 +78,7 @@ IF=${IF:-eth0}
 
 # Cloudflare ranges (NEVER touched)
 # @include lib/cloudflare-loader.sh
+# @include lib/self-ips.sh
 
 mkdir -p /etc/antiddos
 touch "$LOG" && chmod 600 "$LOG"
@@ -87,8 +88,5 @@ touch "$BANNED_LIST" "$WATCH_LIST" "$THROTTLE_LIST" 2>/dev/null || true
 SELF_IPS=()
 while IFS= read -r sip; do
     [ -n "$sip" ] && SELF_IPS+=("$sip")
-done < <(ip -4 addr show 2>/dev/null | grep -oP '(?<=inet )\d+\.\d+\.\d+\.\d+')
-while IFS= read -r sip; do
-    [ -n "$sip" ] && SELF_IPS+=("$sip")
-done < <(hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]')
+done < <(list_self_ips)
 

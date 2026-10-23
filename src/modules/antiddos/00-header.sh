@@ -37,6 +37,8 @@ IPTABLES_SAVE_FILE="/etc/antiddos/iptables-antiddos.rules"
 AUTOBAN_SCRIPT="/opt/proxy-manager/auto-ban.sh"
 AUTOBAN_SERVICE="/etc/systemd/system/auto-ban.service"
 WHITELIST_FILE="/etc/antiddos/whitelist.list"
+SELF_IPS_FILE="/etc/antiddos/self-ips.list"
+EXEMPT_FILE="/etc/antiddos/exempt.list"
 
 [ "$EUID" -ne 0 ] && echo -e "${RED}Root required${NC}" && exit 1
 
@@ -56,5 +58,6 @@ sep()     { echo -e "${CYAN}═════════════════�
 
 # Get all server's own public IPs (auto-whitelist)
 # @include lib/server-ips.sh
+# @include lib/self-ips.sh
 
 # Detect environment

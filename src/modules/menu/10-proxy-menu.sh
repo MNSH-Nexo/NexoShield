@@ -28,9 +28,25 @@ menu_proxy() {
                # IPs are ALWAYS excluded from throttling (it can be deleted by an
                # earlier uninstall/antiddos --remove in the same session).
                mkdir -p /etc/antiddos
-               [ -s /etc/antiddos/cloudflare-ipv4.list ] || \
-                   printf "%s\n" "${CF_RANGES[@]}" > /etc/antiddos/cloudflare-ipv4.list
-               bash "$PROXY_SCRIPT" --install < /dev/tty; press_enter ;;
+               # BUG-005 fix: this script has no CF_RANGES - never fabricate
+               # the list here (the old code wrote a 1-byte blank file that
+               # then counted as "present" forever). Restore the installer's
+               # pristine copy; if there is none, refuse to install.
+               _CF_OK=1
+               if ! grep -q '[0-9]' /etc/antiddos/cloudflare-ipv4.list 2>/dev/null; then
+                   if [ -s /opt/proxy-manager/data/cloudflare-ipv4.list ]; then
+                       cp /opt/proxy-manager/data/cloudflare-ipv4.list \
+                           /etc/antiddos/cloudflare-ipv4.list
+                   else
+                       _CF_OK=0
+                   fi
+               fi
+               if [ "$_CF_OK" = 1 ]; then
+                   bash "$PROXY_SCRIPT" --install < /dev/tty
+               else
+                   warn "Cloudflare whitelist missing and no pristine copy found - re-run the NexoShield installer to repair it. Install aborted."
+               fi
+               press_enter ;;
             2) echo ""
                printf '%s' "  Remove 3proxy completely? (y/N): " >/dev/tty; read -r _RC </dev/tty || _RC=""
                [[ "$_RC" == "y" || "$_RC" == "Y" ]] && bash "$PROXY_SCRIPT" --remove < /dev/tty || echo -e "  ${DIM}Cancelled.${NC}"
@@ -146,8 +162,16 @@ _proxy_suspicious() {
     echo -e "  ${DIM}Enter an IP above to block it, or press Enter to skip.${NC}"
     printf '%s' "  Block IP (empty = skip): " >/dev/tty; read -r BIP </dev/tty || BIP=""
     if [ -n "$BIP" ]; then
-        iptables -I INPUT -s "$BIP" -m comment --comment "auto-ban" -j DROP 2>/dev/null && \
-            ok "$BIP blocked" || warn "Could not block $BIP"
+        bash "$ANTIDDOS_SCRIPT" --exempt-check "$BIP" >/dev/null 2>&1; _EC=$?
+        if [ "$_EC" -eq 0 ]; then
+            warn "$BIP is EXEMPT (Cloudflare / own IP / whitelist) - refusing to block"
+        elif [ "$_EC" -eq 2 ]; then
+            warn "Invalid IP/CIDR: $BIP"
+        elif iptables -I INPUT -s "$BIP" -m comment --comment "auto-ban" -j DROP 2>/dev/null; then
+            ok "$BIP blocked"
+        else
+            warn "Could not block $BIP"
+        fi
     fi
     press_enter
 }

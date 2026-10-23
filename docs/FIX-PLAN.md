@@ -13,6 +13,23 @@ those waves land.
   added (`.github/workflows/ci.yml`, runs `make check` + `make test` +
   install.sh sync guard), test skeleton added (`tests/unit/`, first
   suite: `valid_ip_or_cidr`, 30/30). `make check` + `make test` green.
+- Wave 1 — DONE. D1: canonical exempt set — `exempt.list`/`self-ips.list`
+  snapshots written by `apply_iptables`; fail2ban `ignoreip` now built
+  from CF + self + whitelist and refreshed live on every whitelist
+  add/remove (`update_f2b_ignoreip`); 3proxy per-port rules gained a
+  whitelist ACCEPT step (tagged `3proxy_wl_allow`, symmetric cleanup);
+  both manual Block-IP flows refuse exempt/invalid targets via the new
+  `antiddos.sh --exempt-check <ip>` (per-layer report, exit-code
+  contract). D2: `list_self_ips()` single lib implementation (all local
+  addresses); `ban_ip` choke-point self guard; subnet-ban guard checks
+  every self IP (BUG-065); `self_guard` watchdog sweeps DROP rules and
+  throttle state for self IPs every daemon cycle. Also: BUG-005 (menu
+  restores the CF list from the installer's new pristine copy
+  `/opt/proxy-manager/data/`, never fabricates it; blank file no longer
+  counts as present), BUG-027 (apply_iptables fails closed when the CF
+  list is empty). Tests: exempt_check 10/10, daemon whitelist
+  validation 5/5 (garbage masks can no longer widen a match, BUG-029
+  daemon half). `make check` + `make test` green.
 
 **Inputs:** `docs/BUGS.md` — 68 audited findings (BUG-001…068) plus the
 maintainer's field reports FR-1 (whitelist must exempt from *everything*),

@@ -71,6 +71,17 @@ EOF
     # line, so fail2ban NEVER bans a Cloudflare IP. Previously only 16 legacy
     # ranges were listed here, so CF IPs from newer ranges could get false bans.
     _F2B_IGNORE="127.0.0.1/8 ::1"
+    # FR-1/FR-2 (BUG-028): fail2ban must ignore the WHOLE exempt set, not
+    # just Cloudflare - the server's own IPs and the admin whitelist too.
+    while IFS= read -r _F2B_SELF; do
+        [ -n "$_F2B_SELF" ] && _F2B_IGNORE="$_F2B_IGNORE $_F2B_SELF/32"
+    done < <(list_self_ips)
+    if [ -f "$WHITELIST_FILE" ]; then
+        while IFS= read -r _F2B_WL; do
+            _F2B_WL="${_F2B_WL%%#*}"; _F2B_WL="${_F2B_WL// /}"
+            [ -n "$_F2B_WL" ] && _F2B_IGNORE="$_F2B_IGNORE $_F2B_WL"
+        done < "$WHITELIST_FILE"
+    fi
     _F2B_CF_N=0
     for _F2B_CF in "${CF_RANGES[@]}"; do
         _F2B_CF_N=$((_F2B_CF_N + 1))
@@ -159,6 +170,16 @@ EOF
     ACTIVE_JAILS=$(fail2ban-client status 2>/dev/null | grep "Jail list" | \
         sed 's/.*://;s/,/ /g' | wc -w || echo 0)
     success "fail2ban: $ACTIVE_JAILS jails active"
+}
+
+# Regenerate the jail file (its ignoreip is built from the live exempt
+# set) and reload fail2ban. Called by the whitelist manager after every
+# add/remove so a whitelisted IP is exempt in fail2ban immediately (FR-1).
+update_f2b_ignoreip() {
+    [ -f "$F2B_JAIL_DIR/antiddos.conf" ] || return 0
+    apply_fail2ban >/dev/null 2>&1 || true
+    fail2ban-client reload >/dev/null 2>&1 || \
+        systemctl reload fail2ban >/dev/null 2>&1 || true
 }
 
 # ════════════════════════════════════════════════

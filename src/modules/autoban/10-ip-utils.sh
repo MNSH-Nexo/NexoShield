@@ -38,6 +38,9 @@ is_self_ip() {
     done
     ip -4 addr show 2>/dev/null | grep -oP '(?<=inet )\d+\.\d+\.\d+\.\d+' | grep -qxF "$ip" && return 0
     hostname -I 2>/dev/null | tr ' ' '\n' | grep -qxF "$ip" && return 0
+    # Freshness fallback: the installer's self-IP snapshot (FR-2)
+    [ -f /etc/antiddos/self-ips.list ] && \
+        grep -qxF "$ip" /etc/antiddos/self-ips.list 2>/dev/null && return 0
     return 1
 }
 
@@ -50,7 +53,15 @@ is_user_whitelisted() {
         entry="${entry// /}"            # drop spaces
         [ -z "$entry" ] && continue
         case "$entry" in
-            */*) ip_in_cidr "$ip" "$entry" 2>/dev/null && return 0 ;;
+            */*)
+                # BUG-029 (daemon half): a malformed mask must NEVER widen
+                # the match (arithmetic on garbage treated it as a number).
+                # Invalid entries are skipped, never "close enough".
+                _m="${entry#*/}"
+                case "$_m" in ''|*[!0-9]*) continue ;; esac
+                [ "${#_m}" -le 2 ] || continue
+                (( 10#$_m <= 32 )) || continue
+                ip_in_cidr "$ip" "$entry" 2>/dev/null && return 0 ;;
             *)   [ "$entry" = "$ip" ] && return 0 ;;
         esac
     done < "$WHITELIST_FILE"

@@ -42,6 +42,13 @@ hard_throttle_ip() {
 
 ban_ip() {
     local ip="$1"
+    # FR-2 choke-point guard: ban_ip is the funnel for EVERY ban path
+    # (classic, reputation, instant). A self IP must never pass, even if
+    # some other check regresses.
+    if is_self_ip "$ip"; then
+        log " SELF-GUARD: refused to ban the server's own IP $ip"
+        return 1
+    fi
     is_exempt "$ip" && return 0
     grep -qF "$ip " "$BANNED_LIST" 2>/dev/null && return 0
     local UNBAN_TIME

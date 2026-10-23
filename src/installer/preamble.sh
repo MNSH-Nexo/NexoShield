@@ -63,6 +63,10 @@ CF_RANGES=(
 )
 mkdir -p /etc/antiddos
 printf "%s\n" "${CF_RANGES[@]}" > /etc/antiddos/cloudflare-ipv4.list
+# Pristine copy: the menu restores the runtime list from here if it is
+# ever deleted/emptied, instead of fabricating one (see BUG-005).
+mkdir -p "$INSTALL_DIR/data"
+printf "%s\n" "${CF_RANGES[@]}" > "$INSTALL_DIR/data/cloudflare-ipv4.list"
 
 touch "$LOG" && chmod 600 "$LOG"
 

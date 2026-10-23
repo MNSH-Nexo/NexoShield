@@ -3,6 +3,13 @@
 apply_iptables() {
     info "Applying iptables rules..."
 
+    # BUG-027 (fail closed): with no Cloudflare ranges loaded, every rule
+    # below would treat CF IPs as ordinary traffic. Refuse to arm.
+    if [ "${#CF_RANGES[@]}" -eq 0 ]; then
+        err "Cloudflare range list is empty/missing - refusing to apply iptables rules (CF would lose its exemption)"
+        return 1
+    fi
+
     # Helper: add if not already present
     ipt_add() { iptables -C "$@" 2>/dev/null || iptables -A "$@"; }
     ipt_ins() { iptables -C "$@" 2>/dev/null || iptables -I "$@"; }
@@ -45,6 +52,20 @@ apply_iptables() {
         done < "$WHITELIST_FILE"
     fi
     success "CF + self whitelist: added (${#CF_RANGES[@]} CF ranges + own IPs)"
+
+    # ── Step 4c: Canonical exempt-set snapshot (D1) ──
+    # One file every layer can consult: CF ranges + ALL self IPs + the
+    # admin whitelist. Also snapshot the self IPs on their own (FR-2).
+    list_self_ips > "$SELF_IPS_FILE" 2>/dev/null || true
+    { printf '%s\n' "${CF_RANGES[@]}"
+      list_self_ips
+      if [ -f "$WHITELIST_FILE" ]; then
+          while IFS= read -r _EX; do
+              _EX="${_EX%%#*}"; _EX="${_EX// /}"
+              [ -n "$_EX" ] && printf '%s\n' "$_EX"
+          done < "$WHITELIST_FILE"
+      fi
+    } | grep -v '^$' | sort -u > "$EXEMPT_FILE" || true
 
     # ── Step 5: SYN Flood protection ─────────────────
     # NOTE: CF IPs already accepted above — these rules only apply to non-CF

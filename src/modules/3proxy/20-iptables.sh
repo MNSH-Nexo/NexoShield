@@ -21,6 +21,15 @@ setup_iptables_for_port() {
         --hitcount $((MAX_CONN * 2)) -j DROP 2>/dev/null || true
     iptables -D INPUT -p tcp --dport "$PORT" -m state --state NEW \
         -m recent --name "3proxy_$PORT" --set 2>/dev/null || true
+    # Remove old user-whitelist rules (spec mirrors the create below)
+    if [ -f /etc/antiddos/whitelist.list ]; then
+        while IFS= read -r WIP; do
+            WIP="${WIP%%#*}"; WIP="${WIP// /}"
+            [ -z "$WIP" ] && continue
+            iptables -D INPUT -p tcp --dport "$PORT" -s "$WIP" \
+                -m comment --comment "3proxy_wl_allow" -j ACCEPT 2>/dev/null || true
+        done < /etc/antiddos/whitelist.list
+    fi
 
     # ── Step 1: CF IPs → ACCEPT immediately (no limits!) ─
     for CF in "${CF_RANGES[@]}"; do
@@ -35,6 +44,17 @@ setup_iptables_for_port() {
         iptables -A INPUT -p tcp --dport "$PORT" -s "$SIP/32" \
             -m comment --comment "3proxy_self_allow" -j ACCEPT 2>/dev/null || true
     done < <(get_server_ips)
+
+    # ── Step 2b: User whitelist → ACCEPT (FR-1: exempt means exempt
+    # in EVERY layer, including this port's rate limits) ──────
+    if [ -f /etc/antiddos/whitelist.list ]; then
+        while IFS= read -r WIP; do
+            WIP="${WIP%%#*}"; WIP="${WIP// /}"
+            [ -z "$WIP" ] && continue
+            iptables -A INPUT -p tcp --dport "$PORT" -s "$WIP" \
+                -m comment --comment "3proxy_wl_allow" -j ACCEPT 2>/dev/null || true
+        done < /etc/antiddos/whitelist.list
+    fi
 
     # ── Step 3: Non-CF rate-limit (new conns per IP) ──────
     # Only apply to IPs NOT from CF (CF already accepted above)
