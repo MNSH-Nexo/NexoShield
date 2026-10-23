@@ -58,6 +58,9 @@ def expected_body(filename):
         body = body.replace(
             "@@AUTOBAN_BODY@@", build_mod.assemble_module("auto-ban.sh")
         )
+        body = body.replace(
+            "@@NXCOUNTD_C@@", build_mod.read("src/native/nxcountd.c")
+        )
     return body.replace("@@VERSION@@", version)
 
 

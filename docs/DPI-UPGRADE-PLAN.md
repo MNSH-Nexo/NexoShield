@@ -66,7 +66,7 @@ is logged (`GATE:` lines). SyncookiesSent rising is logged as a global
 SYN-pressure signal — this is the counter that stays truthful exactly
 when SYN-RECV socket state disappears under syncookies (RFC 4987).
 
-## Phase 2 — measurement core
+## Phase 2 — measurement core — DONE in v3.9.0
 
 ### 2a. nxcountd — conntrack event counter (C, libc + kernel headers only)
 Subscribes to NFNLGRP_CONNTRACK_NEW/UPDATE/DESTROY over raw netlink.

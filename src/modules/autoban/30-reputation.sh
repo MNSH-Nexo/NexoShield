@@ -20,6 +20,8 @@ load_reputation() {
     REP_RATE=0
     REP_STRIKES=0
     REP_LAST_BAN=0
+    REP_CUSUM_ARR=0
+    REP_CUSUM_SYN=0
     local line prev prob frac rate strikes lastban
     line=$(awk -v x="$ip" '$1==x' "$SCORE_FILE" 2>/dev/null | tail -1 || true)
     [ -z "$line" ] && return 0
@@ -39,6 +41,11 @@ load_reputation() {
     REP_RATE="${rate:-0}"; REP_RATE="${REP_RATE//[^0-9]/}"; REP_RATE="${REP_RATE:-0}"
     REP_STRIKES="${strikes:-0}"; REP_STRIKES="${REP_STRIKES//[^0-9]/}"; REP_STRIKES="${REP_STRIKES:-0}"
     REP_LAST_BAN="${lastban:-0}"; REP_LAST_BAN="${REP_LAST_BAN//[^0-9]/}"; REP_LAST_BAN="${REP_LAST_BAN:-0}"
+    local cusarr cussyn
+    cusarr=$(echo "$line" | awk '{print $10}')
+    cussyn=$(echo "$line" | awk '{print $11}')
+    REP_CUSUM_ARR="${cusarr:-0}"; REP_CUSUM_ARR="${REP_CUSUM_ARR//[^0-9]/}"; REP_CUSUM_ARR="${REP_CUSUM_ARR:-0}"
+    REP_CUSUM_SYN="${cussyn:-0}"; REP_CUSUM_SYN="${REP_CUSUM_SYN//[^0-9]/}"; REP_CUSUM_SYN="${REP_CUSUM_SYN:-0}"
     [ "$REP_SCORE" -gt 100 ] && REP_SCORE=100
     [ "$REP_SCORE" -lt 0 ] && REP_SCORE=0
 }
@@ -48,7 +55,7 @@ load_reputation() {
 save_reputation() {
     local ip="$1"
     awk -v x="$ip" '$1!=x' "$SCORE_FILE" > "$SCORE_FILE.tmp.$$" 2>/dev/null || true
-    echo "$ip $REP_SCORE $REP_PREV_CNT $(date +%s) ${REP_PROB_UNTIL:-0} ${REP_FRAC:-0} ${REP_RATE:-0} ${REP_STRIKES:-0} ${REP_LAST_BAN:-0}" >> "$SCORE_FILE.tmp.$$"
+    echo "$ip $REP_SCORE $REP_PREV_CNT $(date +%s) ${REP_PROB_UNTIL:-0} ${REP_FRAC:-0} ${REP_RATE:-0} ${REP_STRIKES:-0} ${REP_LAST_BAN:-0} ${REP_CUSUM_ARR:-0} ${REP_CUSUM_SYN:-0}" >> "$SCORE_FILE.tmp.$$"
     mv "$SCORE_FILE.tmp.$$" "$SCORE_FILE" 2>/dev/null || true
 }
 
@@ -130,7 +137,7 @@ reputation_sweep() {
     now=$(date +%s)
     local tmp="$SCORE_FILE.sweep.$$"
     : > "$tmp"
-    while read -r ip score prev ts prob frac rate strikes lastban; do
+    while read -r ip score prev ts prob frac rate strikes lastban cusarr cussyn; do
         [ -z "$ip" ] && continue
         score="${score//[^0-9]/}"; score="${score:-100}"
         ts="${ts//[^0-9]/}"; ts="${ts:-0}"
@@ -139,11 +146,13 @@ reputation_sweep() {
         rate="${rate//[^0-9]/}"; rate="${rate:-0}"
         strikes="${strikes//[^0-9]/}"; strikes="${strikes:-0}"
         lastban="${lastban//[^0-9]/}"; lastban="${lastban:-0}"
+        cusarr="${cusarr//[^0-9]/}"; cusarr="${cusarr:-0}"
+        cussyn="${cussyn//[^0-9]/}"; cussyn="${cussyn:-0}"
         if state_has_ip "$BANNED_LIST" "$ip"; then
-            echo "$ip $score $prev $ts $prob $frac $rate $strikes $lastban" >> "$tmp"; continue
+            echo "$ip $score $prev $ts $prob $frac $rate $strikes $lastban $cusarr $cussyn" >> "$tmp"; continue
         fi
-        if [ "${CONN_COUNT[$ip]:-0}" -ge "$CONN_THRESHOLD" ]; then
-            echo "$ip $score $prev $ts $prob $frac $rate $strikes $lastban" >> "$tmp"; continue
+        if [ "${CONN_COUNT[$ip]:-0}" -ge "${EFF_CONN_THRESHOLD:-$CONN_THRESHOLD}" ]; then
+            echo "$ip $score $prev $ts $prob $frac $rate $strikes $lastban $cusarr $cussyn" >> "$tmp"; continue
         fi
         if [ "$score" -ge 100 ] && [ "$prob" -le "$now" ] && [ $(( now - ts )) -gt 86400 ]; then
             continue  # prune fully-recovered stale entries
@@ -161,9 +170,9 @@ reputation_sweep() {
             apply=$(( acc / 100 ))
             frac=$(( acc - apply * 100 ))
             ns=$(( score + apply )); [ "$ns" -gt 100 ] && ns=100
-            echo "$ip $ns $prev $now $prob $frac $rate $strikes $lastban" >> "$tmp"
+            echo "$ip $ns $prev $now $prob $frac $rate $strikes $lastban $cusarr $cussyn" >> "$tmp"
         else
-            echo "$ip $score $prev $ts $prob $frac $rate $strikes $lastban" >> "$tmp"
+            echo "$ip $score $prev $ts $prob $frac $rate $strikes $lastban $cusarr $cussyn" >> "$tmp"
         fi
     done < "$SCORE_FILE"
     mv "$tmp" "$SCORE_FILE" 2>/dev/null || true
@@ -209,10 +218,35 @@ update_score() {
     #   flood signature v1 could not see - it merged SYN-RECV into the
     #   same counter as ESTABLISHED). First sample of a tracked IP
     #   (prev=0): every connection is new within the window.
+    # ── Phase 2 event terms: armed only with a fresh nxcountd snapshot.
+    # Completion ratio (2b) and slow-attack features (2e) feed the awk
+    # below; CUSUM accumulators (2c) update here from this cycle's exact
+    # arrival deltas, paired with the true inter-snapshot interval.
+    local EVOK=0 S60=0 E60=0 AGES=0 BPC=0 CLOSEDN=0 CUSUM_PTS=0 R60="0.00" CRT=0 SLOW=0
+    if [ "${NX_EV_OK:-0}" = "1" ]; then
+        EVOK=1
+        S60="${EV_SYN60[$ip]:-0}"; E60="${EV_EST60[$ip]:-0}"
+        CLOSEDN="${EV_CLOSED[$ip]:-0}"
+        if [ "$CLOSEDN" -gt 0 ]; then
+            AGES=$(( ${EV_AGE[$ip]:-0} / CLOSEDN / 1000 ))
+            BPC=$(( ${EV_BYTES[$ip]:-0} / CLOSEDN ))
+        fi
+        [ "$S60" -gt 0 ] && R60=$(awk -v e="$E60" -v s="$S60" 'BEGIN{ printf "%.2f", e / s }')
+        local _a="${EV_DSYN[$ip]:-0}" _d="${EV_DEST[$ip]:-0}" _inc=0 _edt="${NX_EV_DT:-2}"
+        [ "$_a" -gt "$_d" ] && _inc=$(( _a - _d ))
+        REP_CUSUM_ARR=$(( ${REP_CUSUM_ARR:-0} + _a * 100 - 200 * _edt ))
+        [ "$REP_CUSUM_ARR" -lt 0 ] && REP_CUSUM_ARR=0
+        REP_CUSUM_SYN=$(( ${REP_CUSUM_SYN:-0} + _inc * 100 - 25 * _edt ))
+        [ "$REP_CUSUM_SYN" -lt 0 ] && REP_CUSUM_SYN=0
+        [ "$REP_CUSUM_ARR" -ge 12000 ] && CUSUM_PTS=$(( CUSUM_PTS + 8 ))
+        [ "$REP_CUSUM_SYN" -ge 6000 ] && CUSUM_PTS=$(( CUSUM_PTS + 8 ))
+    fi
+
     local CHURN SUST SYNP RS
-    read -r CHURN SUST SYNP RS <<< "$(awk \
+    read -r CHURN SUST SYNP RS CRT SLOW <<< "$(awk \
         -v cur="$cur" -v prev="$REP_PREV_CNT" -v syn="$syn" \
-        -v dt="$dt" -v rate_prev="${REP_RATE:-0}" -v thr="$CONN_THRESHOLD" \
+        -v dt="$dt" -v rate_prev="${REP_RATE:-0}" -v thr="${EFF_CONN_THRESHOLD:-$CONN_THRESHOLD}" \
+        -v evok="$EVOK" -v s60="$S60" -v e60="$E60" -v ages="$AGES" -v bpc="$BPC" -v cln="$CLOSEDN" \
         -v ca="${CHURN_ALLOW:-2}" -v cw="${CHURN_WEIGHT:-1.2}" -v ccap="${CHURN_CAP:-30}" \
         -v sdiv="${SUST_DIV:-40}" -v scap="${SUST_CAP:-20}" \
         -v smin="${SYN_MIN:-20}" -v srat="${SYN_RATIO:-0.5}" -v sw="${SYN_WEIGHT:-40}" -v sycap="${SYN_CAP:-15}" \
@@ -223,15 +257,21 @@ update_score() {
             ex = cur - thr; sust = (ex <= 0) ? 0 : ex / sdiv; if (sust > scap) sust = scap;
             synp = 0;
             if (syn >= smin && cur > 0) { ratio = syn / cur; if (ratio > srat) { synp = (ratio - srat) * sw; if (synp > sycap) synp = sycap; } }
-            printf "%.2f %.2f %.2f %.2f", churn, sust, synp, rs;
+            crt = 0;
+            if (evok && s60 >= smin) { rr = e60 / s60; if (rr < srat) { crt = (srat - rr) * sw; if (crt > sycap) crt = sycap; } }
+            if (crt > synp) synp = crt;
+            slow = 0;
+            if (evok && cln >= 10 && ages >= 120 && bpc <= 2000 && cur >= 30) { slow = (cur - 30) / 10; if (slow > 10) slow = 10; }
+            printf "%.2f %.2f %.2f %.2f %.2f %.2f", churn, sust, synp, rs, crt, slow;
         }')"
     REP_RATE=$(awk -v rs="$RS" 'BEGIN{ printf "%d", rs * 100 + 0.5 }')
 
     # Probation: drops count double; the total is capped per minute.
     local total_x100 acc apply
     total_x100=$(awk -v c="$CHURN" -v s="$SUST" -v y="$SYNP" \
+        -v cu="$CUSUM_PTS" -v sl="$SLOW" \
         -v prob="$in_prob" -v cap="$SCORE_DROP_CAP_PER_MIN" 'BEGIN{
-            t = c + s + y; if (prob) t *= 2; if (t > cap) t = cap;
+            t = c + s + y + cu + sl; if (prob) t *= 2; if (t > cap) t = cap;
             printf "%d", t * 100 + 0.5 }')
     if [ "$total_x100" -gt 0 ]; then
         acc=$(( REP_FRAC - total_x100 * dt / 60 ))
@@ -252,7 +292,9 @@ update_score() {
     # recorded with the exact terms that produced it.
     if [ "$apply" -ne 0 ]; then
         local dstr; [ "$apply" -ge 0 ] && dstr="+$apply" || dstr="$apply"
-        log " SCORE: $ip | $old_score->$REP_SCORE (d$dstr) | churn=${CHURN}/min sust=${SUST}/min syn=${SYNP}/min rate=${RS}/s syn_n=$syn dt=${dt}s prob=$in_prob"
+        local evlog=""
+        [ "$EVOK" = "1" ] && evlog=" | ev comp=${CRT}/min cusum=${CUSUM_PTS}/min slow=${SLOW}/min r=$R60"
+        log " SCORE: $ip | $old_score->$REP_SCORE (d$dstr) | churn=${CHURN}/min sust=${SUST}/min syn=${SYNP}/min rate=${RS}/s syn_n=$syn dt=${dt}s prob=$in_prob$evlog"
     fi
 
     # ── Enforce band (graduated, only escalate) ──

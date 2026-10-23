@@ -8,6 +8,10 @@ setup_autoban() {
     # but shipping it documents every tunable in place.
     nx_ensure_scoring_config || true
 
+    # Phase 2a: the conntrack event counter feeds the daemon exact
+    # arrival/completion data (see setup_countd below).
+    setup_countd || true
+
     # Require tcpdump
     if ! command -v tcpdump >/dev/null 2>&1; then
         if command -v apt-get >/dev/null 2>&1; then
@@ -64,3 +68,50 @@ EOF
 # CF=unlimited, others=500Mbps, throttled=100Mbps
 # Uses SRC IP (not DST) to avoid breaking tunnels
 # ════════════════════════════════════════════════
+
+# setup_countd (Phase 2a): build + install nxcountd when a compiler
+# and the conntrack netlink headers are available. ANY failure is a
+# warning, never an install failure: without the snapshot file the
+# daemon simply keeps its polling behaviour.
+setup_countd() {
+    if ! command -v cc >/dev/null 2>&1 || [ ! -f /usr/include/linux/netfilter/nfnetlink_conntrack.h ]; then
+        warn "nxcountd: compiler/headers missing - event counting unavailable (daemon polls instead)"
+        return 0
+    fi
+    local build_dir
+    build_dir=$(mktemp -d) || return 0
+    cat > "$build_dir/nxcountd.c" << 'NXCOUNTD_EOF'
+@@NXCOUNTD_C@@
+NXCOUNTD_EOF
+    if ! cc -O2 -o /usr/local/bin/nxcountd "$build_dir/nxcountd.c" 2>/dev/null; then
+        warn "nxcountd: build failed - event counting unavailable (daemon polls instead)"
+        rm -rf "$build_dir"
+        return 0
+    fi
+    rm -rf "$build_dir"
+    cat > /etc/systemd/system/nexoshield-countd.service << 'EOF'
+[Unit]
+Description=NexoShield conntrack event counter
+After=network.target
+Before=auto-ban.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/nxcountd /run/nexoshield/counters.dat
+Restart=always
+RestartSec=5
+RuntimeDirectory=nexoshield
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/run/nexoshield
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable nexoshield-countd.service >/dev/null 2>&1
+    systemctl restart nexoshield-countd.service 2>/dev/null || true
+    success "nxcountd: conntrack event counter installed (exact arrival counting)"
+}

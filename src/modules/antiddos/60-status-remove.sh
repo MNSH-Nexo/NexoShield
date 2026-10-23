@@ -91,6 +91,11 @@ remove_rules() {
     fi
     [[ "$CONF_R" != "y" && "$CONF_R" != "Y" ]] && echo -e "  ${DIM}Cancelled.${NC}" && return
 
+    # Phase 2a: the event counter leaves with the rest of the daemon.
+    systemctl disable --now nexoshield-countd.service >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/nexoshield-countd.service /usr/local/bin/nxcountd 2>/dev/null || true
+    systemctl daemon-reload >/dev/null 2>&1 || true
+
     # Sysctl (note: removing the file does not reset values already
     # loaded into the running kernel - they reset at reboot)
     rm -f "$SYSCTL_FILE"

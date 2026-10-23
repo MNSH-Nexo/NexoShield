@@ -22,6 +22,37 @@ The auto-ban daemon scores every non-exempt IP from 100 down. Bands:
 50 Mbps, `<20` ban 4 h. Every ban ends in PROBATION (score 50, 30 min
 window) — see the D3 state machine in `docs/FIX-PLAN.md`.
 
+## Phase 2 addendum — model v3 (v3.9.0, DPI upgrade)
+
+The score now consumes **measured arrivals**, not just sampled
+concurrency, whenever `nxcountd` (a small C helper subscribing to
+conntrack netlink events) publishes a fresh snapshot:
+
+- **Handshake-completion term (2b).** Per IP over a rolling 60 s:
+  `r = est/syn`; when `syn >= 20` and `r < 0.5`, the deficit costs
+  `min(15, (0.5 - r) * 40)` points/min, replacing the instantaneous
+  SYN-share term when larger. Immune to the syncookies trap (RFC
+  4987): it counts *outcomes*, not visible half-open sockets.
+- **CUSUM accumulators (2c).** Reputation fields 10/11 accumulate
+  exact arrivals beyond a 2/s allowance and incomplete handshakes
+  beyond 0.25/s. Past 120 (resp. 60) net excess, each contributes
+  +8 points/min. Pulse trains and slow ramps that never cross an
+  instantaneous threshold now accumulate — the EWMA gap, closed.
+- **Slow-attack term (2e).** Mean connection age >= 120 s with
+  <= 2000 bytes/connection and >= 30 concurrent costs up to
+  +10 points/min — the behavioural pair (Ye et al., IoT 2025).
+- **Adaptive gates (2d).** An EWMA mu/sigma baseline of total
+  arrivals drives an ATTACK state (z >= 4 x3 cycles, exits at
+  z < 2 x30) that tightens the connection gate x0.6 and halves the
+  observe window, with the baseline frozen while it lasts.
+
+Every Phase-2 term disarms when the snapshot is stale; the daemon
+then behaves exactly as v2.1. Known residual: live netlink delivery
+was smoke-test-blocked in the build sandbox (no netns permission);
+the parser is unit-proven on synthetic kernel-format messages
+(`nxcountd --selftest`) and field verification joins the owed
+live-fire battery.
+
 ## Why v2 (measured defects of v1)
 
 1. **Step cliffs.** v1's churn table jumped from +2 to +18 points

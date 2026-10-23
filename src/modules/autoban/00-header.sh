@@ -131,6 +131,7 @@ nx_load_scoring_config() {
     SUBNET_MIN_OFFENDERS=$(nx_cfg subnet_min_offenders 5)
     SUBNET_BAN_MINUTES=$(nx_cfg subnet_ban_minutes 60)
     STRESS_GATE=$(nx_cfg stress_gate 1)
+    ADAPTIVE_ENABLED=$(nx_cfg adaptive_enabled 1)
     _NX_CFG_LOADED_MTIME="$(_nx_cfg_stat)"
 }
 nx_maybe_reload_scoring_config() {

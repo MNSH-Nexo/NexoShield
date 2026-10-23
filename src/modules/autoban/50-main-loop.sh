@@ -96,6 +96,11 @@ self_guard() {
 }
 
 log " Smart throttle+ban started (conn_threshold:${CONN_THRESHOLD} ban_threshold:${BAN_CONN_THRESHOLD} subnet_threshold:${SUBNET_THRESHOLD} observe:${OBSERVE_SECONDS}s throttle:${THROTTLE_MBPS}Mbps ban:${BAN_HOURS}h)"
+if [ -f "$NX_COUNTERS_FILE" ]; then
+    log " EVENTS: nxcountd snapshot present - exact arrival counting armed (Phase 2 terms active)"
+else
+    log " EVENTS: no nxcountd snapshot - polling mode (Phase 2 terms disarmed)"
+fi
 
 score_init
 
@@ -169,10 +174,14 @@ while true; do
     fi
     sleep "$SAMPLE_INTERVAL"
 
+    # Phase 2: exact event aggregates for this cycle + adaptive gates.
+    nx_load_event_counters
+    nx_update_adaptive
+
     # Process results — based on real connection count, not packets
     for ip in "${!CONN_COUNT[@]}"; do
         count="${CONN_COUNT[$ip]}"
-        [ "${count:-0}" -lt "$CONN_THRESHOLD" ] && continue
+        [ "${count:-0}" -lt "${EFF_CONN_THRESHOLD:-$CONN_THRESHOLD}" ] && continue
 
         # Skip exempt IPs (CF + self)
         is_exempt_any "$ip" && continue
@@ -203,7 +212,7 @@ while true; do
             NOW=$(date +%s)
             ELAPSED=$(( NOW - ${WATCH_START:-$NOW} ))
 
-            if [ "$ELAPSED" -ge "$OBSERVE_SECONDS" ]; then
+            if [ "$ELAPSED" -ge "${EFF_OBSERVE:-$OBSERVE_SECONDS}" ]; then
                 # Watched for full period and still high
                 if state_has_ip "$THROTTLE_LIST" "$ip"; then
                     # Already throttled — now ban (ban_ip cleans the
@@ -222,7 +231,7 @@ while true; do
         else
             # Start watching
             echo "$ip $(date +%s)" >> "$WATCH_LIST"
-            log " WATCHING: $ip | ${count} active connections (threshold: ${CONN_THRESHOLD})"
+            log " WATCHING: $ip | ${count} active connections (threshold: ${EFF_CONN_THRESHOLD:-$CONN_THRESHOLD})"
         fi
     done
 
@@ -230,7 +239,7 @@ while true; do
     while IFS=' ' read -r ip ts; do
         [ -z "$ip" ] && continue
         # If IP is now below threshold and not being throttled, remove from watch
-        if [ "${CONN_COUNT[$ip]:-0}" -lt "$CONN_THRESHOLD" ] && \
+        if [ "${CONN_COUNT[$ip]:-0}" -lt "${EFF_CONN_THRESHOLD:-$CONN_THRESHOLD}" ] && \
            ! state_has_ip "$THROTTLE_LIST" "$ip"; then
             state_del_ip "$WATCH_LIST" "$ip"
         fi
@@ -246,7 +255,7 @@ while true; do
         is_exempt_any "$ip" && continue
         state_has_ip "$BANNED_LIST" "$ip" && continue
         # Still hot → keep throttled, let scoring manage it.
-        [ "${CONN_COUNT[$ip]:-0}" -ge "$CONN_THRESHOLD" ] && continue
+        [ "${CONN_COUNT[$ip]:-0}" -ge "${EFF_CONN_THRESHOLD:-$CONN_THRESHOLD}" ] && continue
         # Not banned, no longer hot → release to normal class (1:20).
         # Remove THIS IP's throttle filter by its recorded prio (never a bare
         # 'parent 1:' delete, and never a competing add — an added release
@@ -285,7 +294,7 @@ while true; do
         # individually over the per-IP gate. A /24 whose total comes
         # from one heavy member (or a CGNAT pool of normal users) is
         # not a botnet signature.
-        [ "${CONN_COUNT[$ip]:-0}" -ge "$CONN_THRESHOLD" ] && \
+        [ "${CONN_COUNT[$ip]:-0}" -ge "${EFF_CONN_THRESHOLD:-$CONN_THRESHOLD}" ] && \
             SUBNET_OFFENDERS["$subnet"]=$(( ${SUBNET_OFFENDERS[$subnet]:-0} + 1 ))
     done
 
@@ -318,7 +327,7 @@ while true; do
                 # for OBSERVE_SECONDS used to ban a /24 the design says
                 # to merely watch - the effective trigger was 400/45s,
                 # not the documented 1000.
-                if [ "$SELAPSED" -ge "$OBSERVE_SECONDS" ] && [ "$total" -ge "$SUBNET_BAN_THRESHOLD" ] \
+                if [ "$SELAPSED" -ge "${EFF_OBSERVE:-$OBSERVE_SECONDS}" ] && [ "$total" -ge "$SUBNET_BAN_THRESHOLD" ] \
                    && [ "${SUBNET_OFFENDERS[$subnet]:-0}" -ge "$SUBNET_MIN_OFFENDERS" ]; then
                     log " SUBNET HIGH: ${subnet}.0/24 | ${total} conns for ${SELAPSED}s → banning"
                     ban_subnet "$subnet"

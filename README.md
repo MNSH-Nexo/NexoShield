@@ -10,7 +10,7 @@
 
 <img src="https://img.shields.io/badge/Platform-Ubuntu%2020%2B-E95420?style=flat-square&logo=ubuntu&logoColor=white" alt="Platform"/>
 <img src="https://img.shields.io/badge/Shell-Bash%205%2B-4EAA25?style=flat-square&logo=gnubash&logoColor=white" alt="Shell"/>
-<img src="https://img.shields.io/badge/Version-3.8.0-7c3aed?style=flat-square" alt="Version"/>
+<img src="https://img.shields.io/badge/Version-3.9.0-7c3aed?style=flat-square" alt="Version"/>
 <img src="https://img.shields.io/badge/License-MIT-1a73e8?style=flat-square" alt="License"/>
 
 </div>

@@ -54,7 +54,7 @@ eq "$(rep_ban_duration_secs 3.3.3.3)" "1800" "legacy record = first ban"
 : > "$SCORE_FILE"
 printf '%s\n' "4.4.4.4 $NOW 1800" > "$BANNED_LIST"
 rep_on_ban 4.4.4.4
-read -r _ip _sc _pc _ts _pu _fr _rt _st _lb <<< "$(cat "$SCORE_FILE")"
+read -r _ip _sc _pc _ts _pu _fr _rt _st _lb _c1 _c2 <<< "$(cat "$SCORE_FILE")"
 eq "$_sc" "50" "post-ban score is probation score"
 eq "$_st" "1" "strike recorded"
 [ "$_lb" -ge $((NOW - 2)) ] && [ "$_lb" -le $(( $(date +%s) + 2 )) ] && ok || bad "last_ban stamped (got $_lb)"
@@ -69,7 +69,7 @@ eq "$_st" "2" "second ban increments strikes"
 printf '%s\n' "5.5.5.5 90 0 $((NOW - 100)) 0 0 0 2 $((NOW - 1000))" > "$SCORE_FILE"
 : > "$BANNED_LIST"
 reputation_sweep
-read -r _ip _sc _pc _ts _pu _fr _rt _st _lb <<< "$(cat "$SCORE_FILE")"
+read -r _ip _sc _pc _ts _pu _fr _rt _st _lb _c1 _c2 <<< "$(cat "$SCORE_FILE")"
 eq "$_st" "2" "sweep preserves strikes"
 eq "$_lb" "$((NOW - 1000))" "sweep preserves last_ban"
 

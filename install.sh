@@ -3,7 +3,7 @@ exec bash <(tr -d '\r' < "$0" | tail -n +3) "$@"
 #!/bin/bash
 # ── GENERATED FILE ─ built by tools/build.py from src/ ─ do not edit directly; edit the sources and rebuild ──
 # ============================================================
-#  Proxy Manager - Auto Installer  v3.8.0
+#  Proxy Manager - Auto Installer  v3.9.0
 #  One file, one command, everything ready
 #
 #  Install:
@@ -28,7 +28,7 @@ exec bash <(tr -d '\r' < "$0" | tail -n +3) "$@"
 # ============================================================
 set -euo pipefail
 
-VERSION="3.8.0"
+VERSION="3.9.0"
 INSTALL_DIR="/opt/proxy-manager"
 BIN_LINK="/usr/local/bin/proxy"
 LOG="/var/log/proxy-manager-install.log"
@@ -2003,7 +2003,7 @@ TARGET_FILE="/etc/sysctl.d/99-vpn-optimized.conf"
 SNAPSHOT_DIR="/var/lib/vpn-sysctl-snapshots"
 LOG_FILE="/var/log/vpn-sysctl-optimizer.log"
 LOCK_FILE="/var/run/vpn-sysctl.lock"
-SCRIPT_VERSION="3.8.0"
+SCRIPT_VERSION="3.9.0"
 
 [ "$EUID" -ne 0 ] && echo -e "${RED}Root required${NC}" && exit 1
 
@@ -2594,7 +2594,7 @@ cat > "$INSTALL_DIR/.proxy-menu.sh.nxnew" << 'MENU_SCRIPT'
 # SC2094 - atomic state writes via tmp-file + rename, which the
 # checker flags as same-file pipelines. Both classes were audited
 # site-by-site during the fix waves (docs/FIX-PLAN.md).
-VERSION="3.8.0"
+VERSION="3.9.0"
 INSTALL_DIR="/opt/proxy-manager"
 _BSRC="${BASH_SOURCE[0]:-}"
 if [ -n "$_BSRC" ] && [ "$_BSRC" != "/dev/stdin" ] && [[ "$_BSRC" != /dev/fd/* ]]; then
@@ -3707,7 +3707,7 @@ cat > "$INSTALL_DIR/.antiddos.sh.nxnew" << 'ANTIDDOS_SCRIPT'
 # checker flags as same-file pipelines. Both classes were audited
 # site-by-site during the fix waves (docs/FIX-PLAN.md).
 # ============================================================
-#  Anti-DDoS Protection Manager v3.8.0
+#  Anti-DDoS Protection Manager v3.9.0
 #
 #  Layers:
 #    1. Kernel (sysctl hardening + tight conntrack timeouts)
@@ -3731,7 +3731,7 @@ set -euo pipefail
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 CYAN='\033[0;36m'; WHITE='\033[1;37m'; DIM='\033[2m'; BOLD='\033[1m'; NC='\033[0m'
 
-SCRIPT_VERSION="3.8.0"
+SCRIPT_VERSION="3.9.0"
 LOG_FILE="/var/log/antiddos.log"
 STATE_FILE="/etc/antiddos/state.conf"
 BANNED_LIST="/etc/antiddos/banned.list"
@@ -4038,6 +4038,9 @@ subnet_ban_minutes=60
 
 # ── Stress gate (Phase 1d) ──
 stress_gate=1           # 1: score bans need host stress (or score < 10)
+
+# ── Adaptive thresholds (Phase 2d; needs nxcountd) ──
+adaptive_enabled=1      # 1: tighten gates under a global arrival anomaly
 EOF
     chmod 644 "$f" 2>/dev/null || true
 }
@@ -4946,6 +4949,10 @@ setup_autoban() {
     # but shipping it documents every tunable in place.
     nx_ensure_scoring_config || true
 
+    # Phase 2a: the conntrack event counter feeds the daemon exact
+    # arrival/completion data (see setup_countd below).
+    setup_countd || true
+
     # Require tcpdump
     if ! command -v tcpdump >/dev/null 2>&1; then
         if command -v apt-get >/dev/null 2>&1; then
@@ -5103,6 +5110,9 @@ subnet_ban_minutes=60
 
 # ── Stress gate (Phase 1d) ──
 stress_gate=1           # 1: score bans need host stress (or score < 10)
+
+# ── Adaptive thresholds (Phase 2d; needs nxcountd) ──
+adaptive_enabled=1      # 1: tighten gates under a global arrival anomaly
 EOF
     chmod 644 "$f" 2>/dev/null || true
 }
@@ -5196,6 +5206,7 @@ nx_load_scoring_config() {
     SUBNET_MIN_OFFENDERS=$(nx_cfg subnet_min_offenders 5)
     SUBNET_BAN_MINUTES=$(nx_cfg subnet_ban_minutes 60)
     STRESS_GATE=$(nx_cfg stress_gate 1)
+    ADAPTIVE_ENABLED=$(nx_cfg adaptive_enabled 1)
     _NX_CFG_LOADED_MTIME="$(_nx_cfg_stat)"
 }
 nx_maybe_reload_scoring_config() {
@@ -5995,6 +6006,157 @@ ban_ip6() {
     echo "$ip $(date +%s) $DUR" >> "$BANNED_LIST"
     log " BANNED (v6): $ip for $((DUR / 60))min (progressive)"
 }
+#
+# Phase 2 measurement core. nxcountd publishes exact conntrack event
+# aggregates every second; this loader diffs consecutive snapshots
+# into per-cycle arrival deltas and 60 s window sums. When the
+# snapshot is missing or stale, NX_EV_OK=0 and EVERY Phase-2 term
+# disarms — behaviour is then exactly the pre-Phase-2 daemon.
+
+NX_COUNTERS_FILE="${NX_COUNTERS_FILE:-/run/nexoshield/counters.dat}"
+declare -A EV_SYN60 EV_EST60 EV_CLOSED EV_BYTES EV_AGE
+declare -A EV_DSYN EV_DEST EV_PSYN EV_PEST
+NX_EV_OK=0
+NX_EV_BASE=""
+NX_EV_TOT_DSYN=0
+NX_EV_TOT_DEST=0
+NX_EV_DT=2
+_NX_EV_PREV_TS=""
+_NX_EV_PREV_TOTSYN=""
+_NX_EV_PREV_TOTEST=""
+
+nx_load_event_counters() {
+    NX_EV_OK=0
+    NX_EV_TOT_DSYN=0
+    NX_EV_TOT_DEST=0
+    [ -f "$NX_COUNTERS_FILE" ] || return 0
+    local hdr kv ts="" base="" totsyn="" totest="" now
+    hdr=$(head -n 1 "$NX_COUNTERS_FILE" 2>/dev/null) || return 0
+    case "$hdr" in "# nxcountd 1 "*) ;; *) return 0 ;; esac
+    for kv in $hdr; do
+        case "$kv" in
+            ts=*) ts="${kv#ts=}" ;;
+            base=*) base="${kv#base=}" ;;
+            totalsyn=*) totsyn="${kv#totalsyn=}" ;;
+            totalest=*) totest="${kv#totalest=}" ;;
+        esac
+    done
+    ts="${ts//[^0-9]/}"; [ -n "$ts" ] || return 0
+    now=$(date +%s)
+    # Fresh = published within the last 5 s (clock skew tolerated).
+    [ $(( now - ts )) -gt 5 ] && return 0
+    [ $(( ts - now )) -gt 5 ] && return 0
+    if [ "$base" != "$NX_EV_BASE" ]; then
+        # Helper (re)started: cumulative counters reset — re-base the
+        # delta windows instead of diffing across the restart.
+        NX_EV_BASE="$base"
+        EV_PSYN=(); EV_PEST=()
+        _NX_EV_PREV_TOTSYN=""
+        log " EVENTS: nxcountd counters (re)based - arrival windows re-arming"
+    fi
+    totsyn="${totsyn//[^0-9]/}"; totest="${totest//[^0-9]/}"
+    if [ -n "$_NX_EV_PREV_TOTSYN" ] && [ -n "$totsyn" ]; then
+        NX_EV_TOT_DSYN=$(( totsyn - _NX_EV_PREV_TOTSYN ))
+        [ "$NX_EV_TOT_DSYN" -lt 0 ] && NX_EV_TOT_DSYN=0
+        NX_EV_TOT_DEST=$(( totest - _NX_EV_PREV_TOTEST ))
+        [ "$NX_EV_TOT_DEST" -lt 0 ] && NX_EV_TOT_DEST=0
+    fi
+    _NX_EV_PREV_TOTSYN="${totsyn:-}"
+    _NX_EV_PREV_TOTEST="${totest:-}"
+    if [ -n "$_NX_EV_PREV_TS" ]; then
+        local _ddt=$(( ts - _NX_EV_PREV_TS ))
+        [ "$_ddt" -ge 1 ] && [ "$_ddt" -le 30 ] && NX_EV_DT="$_ddt"
+    fi
+    _NX_EV_PREV_TS="$ts"
+    EV_SYN60=(); EV_EST60=(); EV_CLOSED=(); EV_BYTES=(); EV_AGE=(); EV_DSYN=(); EV_DEST=()
+    local ip s e s60 e60 cl b a ps pe d
+    while read -r ip s e s60 e60 _ _ cl b a; do
+        case "$ip" in \#*|"") continue ;; esac
+        EV_SYN60["$ip"]="$s60"; EV_EST60["$ip"]="$e60"
+        EV_CLOSED["$ip"]="$cl"; EV_BYTES["$ip"]="$b"; EV_AGE["$ip"]="$a"
+        ps="${EV_PSYN[$ip]:-}"; pe="${EV_PEST[$ip]:-}"
+        if [ -n "$ps" ]; then
+            d=$(( s - ps )); [ "$d" -lt 0 ] && d=0; EV_DSYN["$ip"]="$d"
+            d=$(( e - pe )); [ "$d" -lt 0 ] && d=0; EV_DEST["$ip"]="$d"
+        else
+            EV_DSYN["$ip"]=0; EV_DEST["$ip"]=0
+        fi
+        EV_PSYN["$ip"]="$s"; EV_PEST["$ip"]="$e"
+    done < <(tail -n +2 "$NX_COUNTERS_FILE" 2>/dev/null)
+    NX_EV_OK=1
+}
+
+# ── Adaptive global thresholds (Phase 2d) ────────────────────────
+# EWMA mean/deviation of total SYN arrivals per cycle. ATTACK state
+# (z >= 4 sustained 3 cycles) tightens the gates and FREEZES the
+# baseline — attack traffic must never train its own threshold
+# (F5's rule; Wang et al.'s 3-sigma stage is the same shape).
+# Calm resumes after z < 2 for 30 cycles (hysteresis). Without event
+# data the adaptive layer simply does not move: EFF_* stay at the
+# configured values.
+NX_ADAPT_FILE="${NX_ADAPT_FILE:-/etc/antiddos/adaptive.dat}"
+NX_MU=""
+NX_SIG=""
+NX_ATTACK=0
+_NX_AD_HI=0
+_NX_AD_LO=0
+_NX_AD_INIT=0
+_NX_AD_CYC=0
+_NX_AD_PREV=0
+EFF_CONN_THRESHOLD=120
+EFF_OBSERVE=45
+
+nx_update_adaptive() {
+    EFF_CONN_THRESHOLD="$CONN_THRESHOLD"
+    EFF_OBSERVE="$OBSERVE_SECONDS"
+    [ "${ADAPTIVE_ENABLED:-1}" = "1" ] || return 0
+    [ "$NX_EV_OK" = "1" ] || return 0
+    if [ "$_NX_AD_INIT" -eq 0 ]; then
+        _NX_AD_INIT=1
+        if [ -f "$NX_ADAPT_FILE" ]; then
+            read -r NX_MU NX_SIG NX_ATTACK < "$NX_ADAPT_FILE" || true
+            [[ "${NX_MU:-}" =~ ^[0-9.]+$ ]] || NX_MU=""
+            [[ "${NX_SIG:-}" =~ ^[0-9.]+$ ]] || NX_SIG=""
+            [ "${NX_ATTACK:-0}" = "1" ] || NX_ATTACK=0
+        fi
+    fi
+    read -r NX_MU NX_SIG NX_ATTACK _NX_AD_HI _NX_AD_LO <<< "$(awk \
+        -v A="$NX_EV_TOT_DSYN" -v mu="${NX_MU:-0}" -v sig="${NX_SIG:-0}" \
+        -v atk="$NX_ATTACK" -v hi="$_NX_AD_HI" -v lo="$_NX_AD_LO" 'BEGIN{
+            if (mu == 0 && sig == 0) { mu = A; sig = (A > 0 ? A * 0.25 : 1); }
+            z = (sig > 0.5) ? (A - mu) / sig : ((A > mu * 3 && A > 50) ? 99 : 0);
+            if (!atk) {
+                if (z >= 4) { hi++; lo = 0; } else { hi = 0; }
+                if (hi >= 3) { atk = 1; hi = 0; lo = 0; }
+                else {
+                    d = A - mu; mu += 0.02 * d;
+                    ad = (d < 0 ? -d : d) * 1.2533; sig += 0.02 * (ad - sig);
+                    if (sig < 0.5) sig = 0.5;
+                }
+            } else {
+                if (z < 2) { lo++; } else { lo = 0; }
+                if (lo >= 30) { atk = 0; lo = 0; hi = 0; }
+            }
+            printf "%.4f %.4f %d %d %d", mu, sig, atk, hi, lo;
+        }')"
+    if [ "$NX_ATTACK" = "1" ]; then
+        EFF_CONN_THRESHOLD=$(awk -v t="$CONN_THRESHOLD" 'BEGIN{ v = int(t * 0.6); if (v < 40) v = 40; if (v > 400) v = 400; print v }')
+        EFF_OBSERVE=$(awk -v o="$OBSERVE_SECONDS" 'BEGIN{ v = int(o * 0.5); if (v < 10) v = 10; print v }')
+    fi
+    _NX_AD_CYC=$(( _NX_AD_CYC + 1 ))
+    if [ $(( _NX_AD_CYC % 30 )) -eq 0 ]; then
+        printf '%s %s %s\n' "$NX_MU" "$NX_SIG" "$NX_ATTACK" > "$NX_ADAPT_FILE.tmp.$$" 2>/dev/null && \
+            mv "$NX_ADAPT_FILE.tmp.$$" "$NX_ADAPT_FILE" 2>/dev/null || true
+    fi
+    if [ "$NX_ATTACK" != "$_NX_AD_PREV" ]; then
+        if [ "$NX_ATTACK" = "1" ]; then
+            log " ADAPTIVE: ATTACK state - gates tightened (conn=$EFF_CONN_THRESHOLD observe=${EFF_OBSERVE}s), baseline frozen"
+        else
+            log " ADAPTIVE: calm - baseline learning resumed (mu=$NX_MU sig=$NX_SIG)"
+        fi
+        _NX_AD_PREV="$NX_ATTACK"
+    fi
+}
 score_init() {
     mkdir -p "$SCORE_DIR" 2>/dev/null || true
     touch "$SCORE_FILE" 2>/dev/null || true
@@ -6015,6 +6177,8 @@ load_reputation() {
     REP_RATE=0
     REP_STRIKES=0
     REP_LAST_BAN=0
+    REP_CUSUM_ARR=0
+    REP_CUSUM_SYN=0
     local line prev prob frac rate strikes lastban
     line=$(awk -v x="$ip" '$1==x' "$SCORE_FILE" 2>/dev/null | tail -1 || true)
     [ -z "$line" ] && return 0
@@ -6034,6 +6198,11 @@ load_reputation() {
     REP_RATE="${rate:-0}"; REP_RATE="${REP_RATE//[^0-9]/}"; REP_RATE="${REP_RATE:-0}"
     REP_STRIKES="${strikes:-0}"; REP_STRIKES="${REP_STRIKES//[^0-9]/}"; REP_STRIKES="${REP_STRIKES:-0}"
     REP_LAST_BAN="${lastban:-0}"; REP_LAST_BAN="${REP_LAST_BAN//[^0-9]/}"; REP_LAST_BAN="${REP_LAST_BAN:-0}"
+    local cusarr cussyn
+    cusarr=$(echo "$line" | awk '{print $10}')
+    cussyn=$(echo "$line" | awk '{print $11}')
+    REP_CUSUM_ARR="${cusarr:-0}"; REP_CUSUM_ARR="${REP_CUSUM_ARR//[^0-9]/}"; REP_CUSUM_ARR="${REP_CUSUM_ARR:-0}"
+    REP_CUSUM_SYN="${cussyn:-0}"; REP_CUSUM_SYN="${REP_CUSUM_SYN//[^0-9]/}"; REP_CUSUM_SYN="${REP_CUSUM_SYN:-0}"
     [ "$REP_SCORE" -gt 100 ] && REP_SCORE=100
     [ "$REP_SCORE" -lt 0 ] && REP_SCORE=0
 }
@@ -6043,7 +6212,7 @@ load_reputation() {
 save_reputation() {
     local ip="$1"
     awk -v x="$ip" '$1!=x' "$SCORE_FILE" > "$SCORE_FILE.tmp.$$" 2>/dev/null || true
-    echo "$ip $REP_SCORE $REP_PREV_CNT $(date +%s) ${REP_PROB_UNTIL:-0} ${REP_FRAC:-0} ${REP_RATE:-0} ${REP_STRIKES:-0} ${REP_LAST_BAN:-0}" >> "$SCORE_FILE.tmp.$$"
+    echo "$ip $REP_SCORE $REP_PREV_CNT $(date +%s) ${REP_PROB_UNTIL:-0} ${REP_FRAC:-0} ${REP_RATE:-0} ${REP_STRIKES:-0} ${REP_LAST_BAN:-0} ${REP_CUSUM_ARR:-0} ${REP_CUSUM_SYN:-0}" >> "$SCORE_FILE.tmp.$$"
     mv "$SCORE_FILE.tmp.$$" "$SCORE_FILE" 2>/dev/null || true
 }
 
@@ -6125,7 +6294,7 @@ reputation_sweep() {
     now=$(date +%s)
     local tmp="$SCORE_FILE.sweep.$$"
     : > "$tmp"
-    while read -r ip score prev ts prob frac rate strikes lastban; do
+    while read -r ip score prev ts prob frac rate strikes lastban cusarr cussyn; do
         [ -z "$ip" ] && continue
         score="${score//[^0-9]/}"; score="${score:-100}"
         ts="${ts//[^0-9]/}"; ts="${ts:-0}"
@@ -6134,11 +6303,13 @@ reputation_sweep() {
         rate="${rate//[^0-9]/}"; rate="${rate:-0}"
         strikes="${strikes//[^0-9]/}"; strikes="${strikes:-0}"
         lastban="${lastban//[^0-9]/}"; lastban="${lastban:-0}"
+        cusarr="${cusarr//[^0-9]/}"; cusarr="${cusarr:-0}"
+        cussyn="${cussyn//[^0-9]/}"; cussyn="${cussyn:-0}"
         if state_has_ip "$BANNED_LIST" "$ip"; then
-            echo "$ip $score $prev $ts $prob $frac $rate $strikes $lastban" >> "$tmp"; continue
+            echo "$ip $score $prev $ts $prob $frac $rate $strikes $lastban $cusarr $cussyn" >> "$tmp"; continue
         fi
-        if [ "${CONN_COUNT[$ip]:-0}" -ge "$CONN_THRESHOLD" ]; then
-            echo "$ip $score $prev $ts $prob $frac $rate $strikes $lastban" >> "$tmp"; continue
+        if [ "${CONN_COUNT[$ip]:-0}" -ge "${EFF_CONN_THRESHOLD:-$CONN_THRESHOLD}" ]; then
+            echo "$ip $score $prev $ts $prob $frac $rate $strikes $lastban $cusarr $cussyn" >> "$tmp"; continue
         fi
         if [ "$score" -ge 100 ] && [ "$prob" -le "$now" ] && [ $(( now - ts )) -gt 86400 ]; then
             continue  # prune fully-recovered stale entries
@@ -6156,9 +6327,9 @@ reputation_sweep() {
             apply=$(( acc / 100 ))
             frac=$(( acc - apply * 100 ))
             ns=$(( score + apply )); [ "$ns" -gt 100 ] && ns=100
-            echo "$ip $ns $prev $now $prob $frac $rate $strikes $lastban" >> "$tmp"
+            echo "$ip $ns $prev $now $prob $frac $rate $strikes $lastban $cusarr $cussyn" >> "$tmp"
         else
-            echo "$ip $score $prev $ts $prob $frac $rate $strikes $lastban" >> "$tmp"
+            echo "$ip $score $prev $ts $prob $frac $rate $strikes $lastban $cusarr $cussyn" >> "$tmp"
         fi
     done < "$SCORE_FILE"
     mv "$tmp" "$SCORE_FILE" 2>/dev/null || true
@@ -6204,10 +6375,35 @@ update_score() {
     #   flood signature v1 could not see - it merged SYN-RECV into the
     #   same counter as ESTABLISHED). First sample of a tracked IP
     #   (prev=0): every connection is new within the window.
+    # ── Phase 2 event terms: armed only with a fresh nxcountd snapshot.
+    # Completion ratio (2b) and slow-attack features (2e) feed the awk
+    # below; CUSUM accumulators (2c) update here from this cycle's exact
+    # arrival deltas, paired with the true inter-snapshot interval.
+    local EVOK=0 S60=0 E60=0 AGES=0 BPC=0 CLOSEDN=0 CUSUM_PTS=0 R60="0.00" CRT=0 SLOW=0
+    if [ "${NX_EV_OK:-0}" = "1" ]; then
+        EVOK=1
+        S60="${EV_SYN60[$ip]:-0}"; E60="${EV_EST60[$ip]:-0}"
+        CLOSEDN="${EV_CLOSED[$ip]:-0}"
+        if [ "$CLOSEDN" -gt 0 ]; then
+            AGES=$(( ${EV_AGE[$ip]:-0} / CLOSEDN / 1000 ))
+            BPC=$(( ${EV_BYTES[$ip]:-0} / CLOSEDN ))
+        fi
+        [ "$S60" -gt 0 ] && R60=$(awk -v e="$E60" -v s="$S60" 'BEGIN{ printf "%.2f", e / s }')
+        local _a="${EV_DSYN[$ip]:-0}" _d="${EV_DEST[$ip]:-0}" _inc=0 _edt="${NX_EV_DT:-2}"
+        [ "$_a" -gt "$_d" ] && _inc=$(( _a - _d ))
+        REP_CUSUM_ARR=$(( ${REP_CUSUM_ARR:-0} + _a * 100 - 200 * _edt ))
+        [ "$REP_CUSUM_ARR" -lt 0 ] && REP_CUSUM_ARR=0
+        REP_CUSUM_SYN=$(( ${REP_CUSUM_SYN:-0} + _inc * 100 - 25 * _edt ))
+        [ "$REP_CUSUM_SYN" -lt 0 ] && REP_CUSUM_SYN=0
+        [ "$REP_CUSUM_ARR" -ge 12000 ] && CUSUM_PTS=$(( CUSUM_PTS + 8 ))
+        [ "$REP_CUSUM_SYN" -ge 6000 ] && CUSUM_PTS=$(( CUSUM_PTS + 8 ))
+    fi
+
     local CHURN SUST SYNP RS
-    read -r CHURN SUST SYNP RS <<< "$(awk \
+    read -r CHURN SUST SYNP RS CRT SLOW <<< "$(awk \
         -v cur="$cur" -v prev="$REP_PREV_CNT" -v syn="$syn" \
-        -v dt="$dt" -v rate_prev="${REP_RATE:-0}" -v thr="$CONN_THRESHOLD" \
+        -v dt="$dt" -v rate_prev="${REP_RATE:-0}" -v thr="${EFF_CONN_THRESHOLD:-$CONN_THRESHOLD}" \
+        -v evok="$EVOK" -v s60="$S60" -v e60="$E60" -v ages="$AGES" -v bpc="$BPC" -v cln="$CLOSEDN" \
         -v ca="${CHURN_ALLOW:-2}" -v cw="${CHURN_WEIGHT:-1.2}" -v ccap="${CHURN_CAP:-30}" \
         -v sdiv="${SUST_DIV:-40}" -v scap="${SUST_CAP:-20}" \
         -v smin="${SYN_MIN:-20}" -v srat="${SYN_RATIO:-0.5}" -v sw="${SYN_WEIGHT:-40}" -v sycap="${SYN_CAP:-15}" \
@@ -6218,15 +6414,21 @@ update_score() {
             ex = cur - thr; sust = (ex <= 0) ? 0 : ex / sdiv; if (sust > scap) sust = scap;
             synp = 0;
             if (syn >= smin && cur > 0) { ratio = syn / cur; if (ratio > srat) { synp = (ratio - srat) * sw; if (synp > sycap) synp = sycap; } }
-            printf "%.2f %.2f %.2f %.2f", churn, sust, synp, rs;
+            crt = 0;
+            if (evok && s60 >= smin) { rr = e60 / s60; if (rr < srat) { crt = (srat - rr) * sw; if (crt > sycap) crt = sycap; } }
+            if (crt > synp) synp = crt;
+            slow = 0;
+            if (evok && cln >= 10 && ages >= 120 && bpc <= 2000 && cur >= 30) { slow = (cur - 30) / 10; if (slow > 10) slow = 10; }
+            printf "%.2f %.2f %.2f %.2f %.2f %.2f", churn, sust, synp, rs, crt, slow;
         }')"
     REP_RATE=$(awk -v rs="$RS" 'BEGIN{ printf "%d", rs * 100 + 0.5 }')
 
     # Probation: drops count double; the total is capped per minute.
     local total_x100 acc apply
     total_x100=$(awk -v c="$CHURN" -v s="$SUST" -v y="$SYNP" \
+        -v cu="$CUSUM_PTS" -v sl="$SLOW" \
         -v prob="$in_prob" -v cap="$SCORE_DROP_CAP_PER_MIN" 'BEGIN{
-            t = c + s + y; if (prob) t *= 2; if (t > cap) t = cap;
+            t = c + s + y + cu + sl; if (prob) t *= 2; if (t > cap) t = cap;
             printf "%d", t * 100 + 0.5 }')
     if [ "$total_x100" -gt 0 ]; then
         acc=$(( REP_FRAC - total_x100 * dt / 60 ))
@@ -6247,7 +6449,9 @@ update_score() {
     # recorded with the exact terms that produced it.
     if [ "$apply" -ne 0 ]; then
         local dstr; [ "$apply" -ge 0 ] && dstr="+$apply" || dstr="$apply"
-        log " SCORE: $ip | $old_score->$REP_SCORE (d$dstr) | churn=${CHURN}/min sust=${SUST}/min syn=${SYNP}/min rate=${RS}/s syn_n=$syn dt=${dt}s prob=$in_prob"
+        local evlog=""
+        [ "$EVOK" = "1" ] && evlog=" | ev comp=${CRT}/min cusum=${CUSUM_PTS}/min slow=${SLOW}/min r=$R60"
+        log " SCORE: $ip | $old_score->$REP_SCORE (d$dstr) | churn=${CHURN}/min sust=${SUST}/min syn=${SYNP}/min rate=${RS}/s syn_n=$syn dt=${dt}s prob=$in_prob$evlog"
     fi
 
     # ── Enforce band (graduated, only escalate) ──
@@ -6453,6 +6657,11 @@ self_guard() {
 }
 
 log " Smart throttle+ban started (conn_threshold:${CONN_THRESHOLD} ban_threshold:${BAN_CONN_THRESHOLD} subnet_threshold:${SUBNET_THRESHOLD} observe:${OBSERVE_SECONDS}s throttle:${THROTTLE_MBPS}Mbps ban:${BAN_HOURS}h)"
+if [ -f "$NX_COUNTERS_FILE" ]; then
+    log " EVENTS: nxcountd snapshot present - exact arrival counting armed (Phase 2 terms active)"
+else
+    log " EVENTS: no nxcountd snapshot - polling mode (Phase 2 terms disarmed)"
+fi
 
 score_init
 
@@ -6526,10 +6735,14 @@ while true; do
     fi
     sleep "$SAMPLE_INTERVAL"
 
+    # Phase 2: exact event aggregates for this cycle + adaptive gates.
+    nx_load_event_counters
+    nx_update_adaptive
+
     # Process results — based on real connection count, not packets
     for ip in "${!CONN_COUNT[@]}"; do
         count="${CONN_COUNT[$ip]}"
-        [ "${count:-0}" -lt "$CONN_THRESHOLD" ] && continue
+        [ "${count:-0}" -lt "${EFF_CONN_THRESHOLD:-$CONN_THRESHOLD}" ] && continue
 
         # Skip exempt IPs (CF + self)
         is_exempt_any "$ip" && continue
@@ -6560,7 +6773,7 @@ while true; do
             NOW=$(date +%s)
             ELAPSED=$(( NOW - ${WATCH_START:-$NOW} ))
 
-            if [ "$ELAPSED" -ge "$OBSERVE_SECONDS" ]; then
+            if [ "$ELAPSED" -ge "${EFF_OBSERVE:-$OBSERVE_SECONDS}" ]; then
                 # Watched for full period and still high
                 if state_has_ip "$THROTTLE_LIST" "$ip"; then
                     # Already throttled — now ban (ban_ip cleans the
@@ -6579,7 +6792,7 @@ while true; do
         else
             # Start watching
             echo "$ip $(date +%s)" >> "$WATCH_LIST"
-            log " WATCHING: $ip | ${count} active connections (threshold: ${CONN_THRESHOLD})"
+            log " WATCHING: $ip | ${count} active connections (threshold: ${EFF_CONN_THRESHOLD:-$CONN_THRESHOLD})"
         fi
     done
 
@@ -6587,7 +6800,7 @@ while true; do
     while IFS=' ' read -r ip ts; do
         [ -z "$ip" ] && continue
         # If IP is now below threshold and not being throttled, remove from watch
-        if [ "${CONN_COUNT[$ip]:-0}" -lt "$CONN_THRESHOLD" ] && \
+        if [ "${CONN_COUNT[$ip]:-0}" -lt "${EFF_CONN_THRESHOLD:-$CONN_THRESHOLD}" ] && \
            ! state_has_ip "$THROTTLE_LIST" "$ip"; then
             state_del_ip "$WATCH_LIST" "$ip"
         fi
@@ -6603,7 +6816,7 @@ while true; do
         is_exempt_any "$ip" && continue
         state_has_ip "$BANNED_LIST" "$ip" && continue
         # Still hot → keep throttled, let scoring manage it.
-        [ "${CONN_COUNT[$ip]:-0}" -ge "$CONN_THRESHOLD" ] && continue
+        [ "${CONN_COUNT[$ip]:-0}" -ge "${EFF_CONN_THRESHOLD:-$CONN_THRESHOLD}" ] && continue
         # Not banned, no longer hot → release to normal class (1:20).
         # Remove THIS IP's throttle filter by its recorded prio (never a bare
         # 'parent 1:' delete, and never a competing add — an added release
@@ -6642,7 +6855,7 @@ while true; do
         # individually over the per-IP gate. A /24 whose total comes
         # from one heavy member (or a CGNAT pool of normal users) is
         # not a botnet signature.
-        [ "${CONN_COUNT[$ip]:-0}" -ge "$CONN_THRESHOLD" ] && \
+        [ "${CONN_COUNT[$ip]:-0}" -ge "${EFF_CONN_THRESHOLD:-$CONN_THRESHOLD}" ] && \
             SUBNET_OFFENDERS["$subnet"]=$(( ${SUBNET_OFFENDERS[$subnet]:-0} + 1 ))
     done
 
@@ -6675,7 +6888,7 @@ while true; do
                 # for OBSERVE_SECONDS used to ban a /24 the design says
                 # to merely watch - the effective trigger was 400/45s,
                 # not the documented 1000.
-                if [ "$SELAPSED" -ge "$OBSERVE_SECONDS" ] && [ "$total" -ge "$SUBNET_BAN_THRESHOLD" ] \
+                if [ "$SELAPSED" -ge "${EFF_OBSERVE:-$OBSERVE_SECONDS}" ] && [ "$total" -ge "$SUBNET_BAN_THRESHOLD" ] \
                    && [ "${SUBNET_OFFENDERS[$subnet]:-0}" -ge "$SUBNET_MIN_OFFENDERS" ]; then
                     log " SUBNET HIGH: ${subnet}.0/24 | ${total} conns for ${SELAPSED}s → banning"
                     ban_subnet "$subnet"
@@ -6745,6 +6958,612 @@ EOF
 # CF=unlimited, others=500Mbps, throttled=100Mbps
 # Uses SRC IP (not DST) to avoid breaking tunnels
 # ════════════════════════════════════════════════
+
+# setup_countd (Phase 2a): build + install nxcountd when a compiler
+# and the conntrack netlink headers are available. ANY failure is a
+# warning, never an install failure: without the snapshot file the
+# daemon simply keeps its polling behaviour.
+setup_countd() {
+    if ! command -v cc >/dev/null 2>&1 || [ ! -f /usr/include/linux/netfilter/nfnetlink_conntrack.h ]; then
+        warn "nxcountd: compiler/headers missing - event counting unavailable (daemon polls instead)"
+        return 0
+    fi
+    local build_dir
+    build_dir=$(mktemp -d) || return 0
+    cat > "$build_dir/nxcountd.c" << 'NXCOUNTD_EOF'
+/*
+ * nxcountd — NexoShield conntrack event counter (DPI upgrade Phase 2a).
+ *
+ * Subscribes to kernel conntrack events (NEW/UPDATE/DESTROY) over a
+ * raw NETLINK_NETFILTER socket and maintains exact per-source-IP
+ * aggregates for inbound TCP flows:
+ *
+ *   syn_cum / est_cum   cumulative SYN births / handshake completions
+ *   syn60 / est60       the same over a rolling 60 s window
+ *   cur_syn / cur_est   current half-open / established concurrency
+ *   closed_cum          completed flows
+ *   bytes_cum           originator bytes of closed flows
+ *   age_ms_cum          total lifetime of closed flows
+ *
+ * Every second the top-500 active sources are published atomically
+ * (tmp + rename) to the snapshot file the auto-ban daemon reads.
+ * Polling `ss` samples a stock; these counters measure the flow —
+ * Little's Law (L = lambda * W) makes arrival rate underivable from
+ * concurrency deltas, which is the gap this helper closes.
+ *
+ * Only libc + kernel headers. Flows originated BY this host (source
+ * is a local address) are ignored: the daemon scores clients, and the
+ * sampler it replaces deliberately subtracted outbound traffic too.
+ *
+ * `--selftest` feeds synthetic conntrack messages through the same
+ * parser/aggregator and prints the resulting snapshot body, so the
+ * parser is unit-testable without a live kernel.
+ */
+#define _GNU_SOURCE
+#include <arpa/inet.h>
+#include <errno.h>
+#include <ifaddrs.h>
+#include <linux/netfilter/nfnetlink.h>
+#include <linux/netfilter/nfnetlink_conntrack.h>
+#include <linux/netlink.h>
+#include <net/if.h>
+#include <poll.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <time.h>
+#include <unistd.h>
+
+#define FLOW_SLOTS 16384
+#define IP_SLOTS   32768
+#define TOP_N      500
+#define RING       60
+
+/* tcp_conntrack states (linux/netfilter/nf_conntrack_tcp.h) */
+enum { TS_NONE = 0, TS_SYN_SENT = 1, TS_SYN_RECV = 2, TS_ESTABLISHED = 3 };
+
+static int is_syn_state(int s) { return s == TS_SYN_SENT || s == TS_SYN_RECV || s == 12; }
+
+/* ── local address set (flows FROM these are outbound: skip) ── */
+static uint32_t g_local4[64]; static int g_nlocal4;
+static uint8_t  g_local6[32][16]; static int g_nlocal6;
+
+static int is_local4(uint32_t be)
+{
+    if ((ntohl(be) >> 24) == 127) return 1;
+    for (int i = 0; i < g_nlocal4; i++) if (g_local4[i] == be) return 1;
+    return 0;
+}
+static int is_local6(const uint8_t *ip)
+{
+    static const uint8_t lo[16] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1};
+    if (!memcmp(ip, lo, 16)) return 1;
+    for (int i = 0; i < g_nlocal6; i++) if (!memcmp(g_local6[i], ip, 16)) return 1;
+    return 0;
+}
+
+static void load_local_addrs(void)
+{
+    struct ifaddrs *ifa, *p;
+    if (getifaddrs(&ifa) != 0) return;
+    for (p = ifa; p; p = p->ifa_next) {
+        if (!p->ifa_addr) continue;
+        if (p->ifa_addr->sa_family == AF_INET && g_nlocal4 < 64) {
+            g_local4[g_nlocal4++] = ((struct sockaddr_in *)p->ifa_addr)->sin_addr.s_addr;
+        } else if (p->ifa_addr->sa_family == AF_INET6 && g_nlocal6 < 32) {
+            memcpy(g_local6[g_nlocal6++], &((struct sockaddr_in6 *)p->ifa_addr)->sin6_addr, 16);
+        }
+    }
+    freeifaddrs(ifa);
+}
+
+/* ── flow table (by conntrack ID) ── */
+typedef struct {
+    uint32_t id; uint8_t used, family, state;
+    uint8_t ip[16];
+    uint64_t created_ms, last_ms, last_bytes;
+} Flow;
+static Flow g_flows[FLOW_SLOTS];
+static uint64_t g_flows_dropped;
+
+/* ── per-IP aggregates ── */
+typedef struct {
+    uint8_t used, family;
+    uint8_t ip[16];
+    uint64_t syn_cum, est_cum, closed_cum, bytes_cum, age_ms_cum;
+    int64_t  cur_syn, cur_est;
+    uint32_t ring_syn[RING], ring_est[RING];
+    int64_t  last_seen_s;
+} Agg;
+static Agg g_ips[IP_SLOTS];
+static uint64_t g_total_syn, g_total_est, g_dropped_msgs;
+
+static uint64_t hash_bytes(const uint8_t *p, int n, uint32_t seed)
+{
+    uint64_t h = 1469598103934665603ULL ^ seed;
+    for (int i = 0; i < n; i++) { h ^= p[i]; h *= 1099511628211ULL; }
+    return h;
+}
+
+static Agg *agg_get(const uint8_t *ip, int family, int create, int64_t now_s)
+{
+    int len = family == AF_INET ? 4 : 16;
+    uint64_t h = hash_bytes(ip, len, family) % IP_SLOTS;
+    for (uint64_t k = 0; k < IP_SLOTS; k++) {
+        Agg *a = &g_ips[(h + k) % IP_SLOTS];
+        if (!a->used) {
+            if (!create) return NULL;
+            memset(a, 0, sizeof *a);
+            a->used = 1; a->family = (uint8_t)family;
+            memcpy(a->ip, ip, len);
+            a->last_seen_s = now_s;
+            return a;
+        }
+        if (a->family == family && !memcmp(a->ip, ip, len)) {
+            a->last_seen_s = now_s;
+            return a;
+        }
+    }
+    return NULL;
+}
+
+static Flow *flow_get(uint32_t id, int create)
+{
+    uint64_t h = (id * 2654435761u) % FLOW_SLOTS;
+    for (uint64_t k = 0; k < FLOW_SLOTS; k++) {
+        Flow *f = &g_flows[(h + k) % FLOW_SLOTS];
+        if (!f->used) {
+            if (!create) return NULL;
+            memset(f, 0, sizeof *f);
+            f->used = 1; f->id = id;
+            return f;
+        }
+        if (f->id == id) return f;
+    }
+    if (create) g_flows_dropped++;
+    return NULL;
+}
+
+/* ── event application (shared by live loop and selftest) ── */
+typedef struct {
+    uint32_t id; int family; uint8_t ip[16];
+    int has_state, state;
+    uint64_t bytes; int is_destroy;
+} Event;
+
+static void apply_event(const Event *e, uint64_t now_ms, int64_t now_s)
+{
+    if (e->family == AF_INET  && is_local4(*(const uint32_t *)e->ip)) return;
+    if (e->family == AF_INET6 && is_local6(e->ip)) return;
+
+    Flow *f = flow_get(e->id, !e->is_destroy);
+    Agg *a = agg_get(e->ip, e->family, 1, now_s);
+    if (!a) return;
+    int slot = (int)(now_s % RING);
+
+    if (e->is_destroy) {
+        if (f && f->used) {
+            if (is_syn_state(f->state)) a->cur_syn--;
+            else if (f->state == TS_ESTABLISHED) a->cur_est--;
+            a->closed_cum++;
+            a->age_ms_cum += now_ms - f->created_ms;
+            a->bytes_cum += e->bytes ? e->bytes : f->last_bytes;
+            f->used = 0;
+        }
+        return;
+    }
+    if (!f) return;
+    if (!f->created_ms) {           /* first sighting of this flow */
+        f->family = (uint8_t)e->family;
+        memcpy(f->ip, e->ip, e->family == AF_INET ? 4 : 16);
+        f->created_ms = now_ms;
+        f->state = TS_NONE;
+    }
+    f->last_ms = now_ms;
+    if (e->bytes > f->last_bytes) f->last_bytes = e->bytes;
+    if (!e->has_state) return;
+    int prev = f->state, cur = e->state;
+    if (prev == cur) return;
+    if (is_syn_state(cur) && !is_syn_state(prev) && prev != TS_ESTABLISHED) {
+        a->syn_cum++; g_total_syn++;
+        a->ring_syn[slot]++; a->cur_syn++;
+    }
+    if (cur == TS_ESTABLISHED && is_syn_state(prev)) {
+        a->est_cum++; g_total_est++;
+        a->ring_est[slot]++; a->cur_syn--; a->cur_est++;
+    }
+    if (cur == TS_ESTABLISHED && prev == TS_NONE) {
+        /* First seen already established (we missed the SYN, e.g.
+         * helper started mid-flow): count the completion only. */
+        a->est_cum++; g_total_est++;
+        a->ring_est[slot]++; a->cur_est++;
+    }
+    if (is_syn_state(prev) && !is_syn_state(cur) && cur != TS_ESTABLISHED && prev != TS_NONE) {
+        a->cur_syn--;               /* SYN died without completing */
+    }
+    /* Leaving ESTABLISHED for a closing state releases concurrency
+     * only at DESTROY (age accounting lives there too), so cur_est
+     * stays until the flow is finalized. */
+    f->state = (uint8_t)cur;
+}
+
+/* ── netlink attribute walking ── */
+#define NX_NLA_TYPE(a) ((a)->nla_type & 0x3fff)
+static const struct nlattr *find_attr(const char *p, int len, int type)
+{
+    while (len >= (int)sizeof(struct nlattr)) {
+        const struct nlattr *a = (const struct nlattr *)p;
+        if (a->nla_len < (int)sizeof(struct nlattr) || a->nla_len > len) break;
+        if (NX_NLA_TYPE(a) == type) return a;
+        int adv = NLA_ALIGN(a->nla_len);
+        p += adv; len -= adv;
+    }
+    return NULL;
+}
+static const char *attr_payload(const struct nlattr *a, int *len)
+{
+    *len = a->nla_len - NLA_HDRLEN;
+    return (const char *)a + NLA_HDRLEN;
+}
+
+static int parse_message(const struct nlmsghdr *nlh, Event *e)
+{
+    memset(e, 0, sizeof *e);
+    int len = NLMSG_PAYLOAD(nlh, sizeof(struct nfgenmsg));
+    const char *p = (const char *)NLMSG_DATA(nlh) + NLMSG_ALIGN(sizeof(struct nfgenmsg));
+    const struct nfgenmsg *fg = NLMSG_DATA(nlh);
+    e->family = fg->nfgen_family;
+    e->is_destroy = ((nlh->nlmsg_type & 0xff) == IPCTNL_MSG_CT_DELETE);
+
+    const struct nlattr *a;
+    int plen;
+    if ((a = find_attr(p, len, CTA_ID))) {
+        const char *v = attr_payload(a, &plen);
+        if (plen >= 4) e->id = ntohl(*(const uint32_t *)v);
+    }
+    const struct nlattr *tup = find_attr(p, len, CTA_TUPLE_ORIG);
+    if (!tup) return -1;
+    const char *tp = attr_payload(tup, &plen);
+    int tlen = plen;
+    const struct nlattr *ipn = find_attr(tp, tlen, CTA_TUPLE_IP);
+    if (!ipn) return -1;
+    const char *ipp = attr_payload(ipn, &plen);
+    if (e->family == AF_INET) {
+        const struct nlattr *s = find_attr(ipp, plen, CTA_IP_V4_SRC);
+        if (!s) return -1;
+        memcpy(e->ip, attr_payload(s, &plen), 4);
+    } else if (e->family == AF_INET6) {
+        const struct nlattr *s = find_attr(ipp, plen, CTA_IP_V6_SRC);
+        if (!s) return -1;
+        memcpy(e->ip, attr_payload(s, &plen), 16);
+    } else return -1;
+    const struct nlattr *pro = find_attr(tp, tlen, CTA_TUPLE_PROTO);
+    if (pro) {
+        const char *pp = attr_payload(pro, &plen);
+        const struct nlattr *pn = find_attr(pp, plen, CTA_PROTO_NUM);
+        if (pn) {
+            const char *v = attr_payload(pn, &plen);
+            if (plen >= 1 && *(const uint8_t *)v != 6) return -1; /* TCP only */
+        }
+    }
+    const struct nlattr *pi = find_attr(p, len, CTA_PROTOINFO);
+    if (pi) {
+        const char *pp = attr_payload(pi, &plen);
+        const struct nlattr *tcp = find_attr(pp, plen, CTA_PROTOINFO_TCP);
+        if (tcp) {
+            const char *tcpp = attr_payload(tcp, &plen);
+            const struct nlattr *st = find_attr(tcpp, plen, CTA_PROTOINFO_TCP_STATE);
+            if (st) {
+                const char *v = attr_payload(st, &plen);
+                if (plen >= 1) { e->has_state = 1; e->state = *(const uint8_t *)v; }
+            }
+        }
+    }
+    const struct nlattr *cnt = find_attr(p, len, CTA_COUNTERS_ORIG);
+    if (cnt) {
+        const char *cp = attr_payload(cnt, &plen);
+        const struct nlattr *b = find_attr(cp, plen, CTA_COUNTERS_BYTES);
+        if (b) {
+            const char *v = attr_payload(b, &plen);
+            if (plen >= 8) {
+                uint64_t be; memcpy(&be, v, 8);
+                e->bytes = be64toh(be);
+            }
+        }
+    }
+    return 0;
+}
+
+/* ── snapshot ── */
+static uint64_t g_base;
+static int cmp_agg(const void *x, const void *y)
+{
+    const Agg *a = *(Agg *const *)x, *b = *(Agg *const *)y;
+    uint64_t sa = a->syn_cum + a->est_cum, sb = b->syn_cum + b->est_cum;
+    return sa < sb ? 1 : sa > sb ? -1 : 0;
+}
+
+static void write_snapshot(const char *path, int64_t now_s)
+{
+    static Agg *top[TOP_N];
+    int n = 0;
+    for (int i = 0; i < IP_SLOTS; i++) {
+        Agg *a = &g_ips[i];
+        if (!a->used) continue;
+        if (a->syn_cum + a->est_cum == 0 && a->cur_syn + a->cur_est == 0 && a->closed_cum == 0) continue;
+        if (n < TOP_N) top[n++] = a;
+        else {
+            /* keep the TOP_N largest by activity */
+            int min = 0;
+            for (int j = 1; j < n; j++)
+                if (top[j]->syn_cum + top[j]->est_cum < top[min]->syn_cum + top[min]->est_cum) min = j;
+            if (a->syn_cum + a->est_cum > top[min]->syn_cum + top[min]->est_cum) top[min] = a;
+        }
+    }
+    qsort(top, n, sizeof top[0], cmp_agg);
+    char tmp[1024];
+    snprintf(tmp, sizeof tmp, "%s.tmp", path);
+    FILE *fp = fopen(tmp, "w");
+    if (!fp) return;
+    fprintf(fp, "# nxcountd 1 ts=%lld base=%llu dropped=%llu flows_dropped=%llu totalsyn=%llu totalest=%llu\n",
+            (long long)now_s, (unsigned long long)g_base,
+            (unsigned long long)g_dropped_msgs, (unsigned long long)g_flows_dropped,
+            (unsigned long long)g_total_syn, (unsigned long long)g_total_est);
+    for (int i = 0; i < n; i++) {
+        Agg *a = top[i];
+        char ipbuf[INET6_ADDRSTRLEN];
+        inet_ntop(a->family, a->ip, ipbuf, sizeof ipbuf);
+        uint64_t s60 = 0, e60 = 0;
+        for (int r = 0; r < RING; r++) { s60 += a->ring_syn[r]; e60 += a->ring_est[r]; }
+        fprintf(fp, "%s %llu %llu %llu %llu %lld %lld %llu %llu %llu\n",
+                ipbuf,
+                (unsigned long long)a->syn_cum, (unsigned long long)a->est_cum,
+                (unsigned long long)s60, (unsigned long long)e60,
+                (long long)a->cur_syn, (long long)a->cur_est,
+                (unsigned long long)a->closed_cum,
+                (unsigned long long)a->bytes_cum,
+                (unsigned long long)a->age_ms_cum);
+    }
+    fclose(fp);
+    rename(tmp, path);
+}
+
+/* Ring hygiene: slot (second % 60) must be zeroed when its second
+ * rolls into the window, BEFORE that second's increments land —
+ * otherwise the slot still holds the data of the second that just
+ * fell out of the window (60 s ago, same slot). Epoch-checked so
+ * each slot is zeroed exactly once per minute. */
+static int64_t g_slot_epoch[RING];
+static void ring_zero_slot(int64_t now_s)
+{
+    int slot = (int)(now_s % RING);
+    if (g_slot_epoch[slot] == now_s) return;
+    g_slot_epoch[slot] = now_s;
+    for (int i = 0; i < IP_SLOTS; i++) {
+        if (!g_ips[i].used) continue;
+        g_ips[i].ring_syn[slot] = 0;
+        g_ips[i].ring_est[slot] = 0;
+    }
+}
+
+/* Stale-flow expiry: a flow whose DESTROY was missed (event loss
+ * under flood is exactly when drops happen) would otherwise pin
+ * cur_* counts forever. Sweep a rotating slice of the flow table
+ * once per second; flows silent for 30 min are finalized as if
+ * destroyed (bytes = last counter seen). */
+static void flow_sweep_slice(uint64_t now_ms, int64_t now_s)
+{
+    static int cursor;
+    int span = FLOW_SLOTS / 60 + 1;
+    for (int k = 0; k < span; k++) {
+        Flow *f = &g_flows[(cursor + k) % FLOW_SLOTS];
+        if (f->used && f->last_ms && now_ms - f->last_ms > 1800000ULL) {
+            Agg *a = agg_get(f->ip, f->family, 0, now_s);
+            if (a) {
+                if (is_syn_state(f->state)) a->cur_syn--;
+                else if (f->state == TS_ESTABLISHED) a->cur_est--;
+                a->closed_cum++;
+                a->age_ms_cum += now_ms - f->created_ms;
+                a->bytes_cum += f->last_bytes;
+            }
+            f->used = 0;
+        }
+    }
+    cursor = (cursor + span) % FLOW_SLOTS;
+}
+
+/* ── selftest: synthetic messages through the real parser ── */
+static void put_attr(char *buf, int *off, uint16_t type, const void *data, int len)
+{
+    struct nlattr *a = (struct nlattr *)(buf + *off);
+    a->nla_len = NLA_HDRLEN + len;
+    a->nla_type = type;
+    memcpy(buf + *off + NLA_HDRLEN, data, len);
+    *off += NLA_ALIGN(a->nla_len);
+}
+static void nest_start(char *buf, int *off, uint16_t type, int *save)
+{
+    *save = *off;
+    struct nlattr *a = (struct nlattr *)(buf + *off);
+    a->nla_type = type | NLA_F_NESTED;
+    *off += NLA_HDRLEN;
+}
+static void nest_end(char *buf, int *off, int save)
+{
+    struct nlattr *a = (struct nlattr *)(buf + save);
+    a->nla_len = *off - save;
+    *off = save + NLA_ALIGN(a->nla_len);
+}
+
+static int selftest(void)
+{
+    load_local_addrs();
+    /* pretend 10.0.0.5 is local for the outbound-filter case */
+    struct in_addr la; inet_pton(AF_INET, "10.0.0.5", &la);
+    g_local4[g_nlocal4++] = la.s_addr;
+
+    static char buf[4096];
+    int64_t now_s = 1700000000;
+    uint64_t now_ms = 1700000000000ULL;
+    g_base = 42;
+
+    struct { uint32_t id; const char *ip; int fam; int state; int destroy; uint64_t bytes; } script[] = {
+        {100, "203.0.113.7", AF_INET,  TS_SYN_RECV,   0, 0},
+        {100, "203.0.113.7", AF_INET,  TS_ESTABLISHED,0, 0},
+        {101, "203.0.113.7", AF_INET,  TS_SYN_RECV,   0, 0},
+        {101, "203.0.113.7", AF_INET,  0,             1, 4000},
+        {102, "10.0.0.5",    AF_INET,  TS_SYN_RECV,   0, 0},   /* local: ignored */
+        {103, "2001:db8::1", AF_INET6, TS_SYN_SENT,   0, 0},
+        {103, "2001:db8::1", AF_INET6, 0,             1, 500},
+    };
+    for (unsigned k = 0; k < sizeof script / sizeof script[0]; k++) {
+        memset(buf, 0, sizeof buf);
+        struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
+        nlh->nlmsg_type = (NFNL_SUBSYS_CTNETLINK << 8) | (script[k].destroy ? IPCTNL_MSG_CT_DELETE : IPCTNL_MSG_CT_NEW);
+        struct nfgenmsg *fg = (struct nfgenmsg *)(buf + NLMSG_HDRLEN);
+        fg->nfgen_family = (uint8_t)script[k].fam;
+        int off = NLMSG_HDRLEN + NLMSG_ALIGN(sizeof(struct nfgenmsg));
+        uint32_t idbe = htonl(script[k].id);
+        put_attr(buf, &off, CTA_ID, &idbe, 4);
+        int s1, s2;
+        nest_start(buf, &off, CTA_TUPLE_ORIG, &s1);
+        nest_start(buf, &off, CTA_TUPLE_IP, &s2);
+        if (script[k].fam == AF_INET) {
+            struct in_addr a4; inet_pton(AF_INET, script[k].ip, &a4);
+            put_attr(buf, &off, CTA_IP_V4_SRC, &a4, 4);
+        } else {
+            struct in6_addr a6; inet_pton(AF_INET6, script[k].ip, &a6);
+            put_attr(buf, &off, CTA_IP_V6_SRC, &a6, 16);
+        }
+        nest_end(buf, &off, s2);
+        nest_start(buf, &off, CTA_TUPLE_PROTO, &s2);
+        uint8_t proto = 6;
+        put_attr(buf, &off, CTA_PROTO_NUM, &proto, 1);
+        nest_end(buf, &off, s2);
+        nest_end(buf, &off, s1);
+        if (!script[k].destroy) {
+            nest_start(buf, &off, CTA_PROTOINFO, &s1);
+            nest_start(buf, &off, CTA_PROTOINFO_TCP, &s2);
+            uint8_t st = (uint8_t)script[k].state;
+            put_attr(buf, &off, CTA_PROTOINFO_TCP_STATE, &st, 1);
+            nest_end(buf, &off, s2);
+            nest_end(buf, &off, s1);
+        } else {
+            nest_start(buf, &off, CTA_COUNTERS_ORIG, &s1);
+            uint64_t be = htobe64(script[k].bytes);
+            put_attr(buf, &off, CTA_COUNTERS_BYTES, &be, 8);
+            nest_end(buf, &off, s1);
+        }
+        nlh->nlmsg_len = off;
+        Event e;
+        if (script[k].destroy) now_ms += 5000;   /* flows lived 5 s */
+        if (parse_message(nlh, &e) == 0) apply_event(&e, now_ms, now_s);
+    }
+    /* write the snapshot body to stdout (no header semantics needed) */
+    char path[] = "/tmp/nxcountd-selftest-XXXXXX";
+    int fd = mkstemp(path);
+    if (fd >= 0) close(fd);
+    write_snapshot(path, now_s);
+    FILE *fp = fopen(path, "r");
+    if (fp) { char line[512]; while (fgets(line, sizeof line, fp)) fputs(line, stdout); fclose(fp); }
+    unlink(path);
+    return 0;
+}
+
+int main(int argc, char **argv)
+{
+    if (argc > 1 && !strcmp(argv[1], "--selftest")) return selftest();
+    const char *out = argc > 1 ? argv[1] : "/run/nexoshield/counters.dat";
+
+    FILE *rnd = fopen("/dev/urandom", "r");
+    if (rnd) { if (fread(&g_base, 1, sizeof g_base, rnd) != sizeof g_base) g_base = 0; fclose(rnd); }
+    if (!g_base) g_base = (uint64_t)getpid() << 32 | (uint64_t)time(NULL);
+
+    load_local_addrs();
+
+    int fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_NETFILTER);
+    if (fd < 0) { perror("socket"); return 1; }
+    int rcvbuf = 4 * 1024 * 1024;
+    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof rcvbuf);
+    struct sockaddr_nl sa = {0};
+    sa.nl_family = AF_NETLINK;
+    sa.nl_groups = (1u << (NFNLGRP_CONNTRACK_NEW - 1)) |
+                   (1u << (NFNLGRP_CONNTRACK_UPDATE - 1)) |
+                   (1u << (NFNLGRP_CONNTRACK_DESTROY - 1));
+    if (bind(fd, (struct sockaddr *)&sa, sizeof sa) < 0) { perror("bind"); return 1; }
+
+    static char buf[65536];
+    int64_t last_snap = 0;
+    for (;;) {
+        struct timespec ts0;
+        clock_gettime(CLOCK_MONOTONIC, &ts0);
+        uint64_t now_ms0 = (uint64_t)ts0.tv_sec * 1000 + ts0.tv_nsec / 1000000;
+        int64_t now_s0 = time(NULL);
+        if (now_s0 != last_snap) {
+            last_snap = now_s0;
+            ring_zero_slot(now_s0);
+            flow_sweep_slice(now_ms0, now_s0);
+            write_snapshot(out, now_s0);
+        }
+        struct pollfd pfd = { .fd = fd, .events = POLLIN };
+        int pr = poll(&pfd, 1, 250);
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        uint64_t now_ms = (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+        int64_t now_s = time(NULL);
+        if (pr > 0 && (pfd.revents & POLLIN)) {
+            for (;;) {
+                ssize_t n = recv(fd, buf, sizeof buf, MSG_DONTWAIT);
+                if (n <= 0) {
+                    if (n < 0 && errno == ENOBUFS) g_dropped_msgs++;
+                    break;
+                }
+                for (struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
+                     NLMSG_OK(nlh, (unsigned)n); nlh = NLMSG_NEXT(nlh, n)) {
+                    if (nlh->nlmsg_type == NLMSG_ERROR || nlh->nlmsg_type == NLMSG_DONE) continue;
+                    Event e;
+                    if (parse_message(nlh, &e) == 0) apply_event(&e, now_ms, now_s);
+                }
+            }
+        }
+    }
+    return 0;
+}
+NXCOUNTD_EOF
+    if ! cc -O2 -o /usr/local/bin/nxcountd "$build_dir/nxcountd.c" 2>/dev/null; then
+        warn "nxcountd: build failed - event counting unavailable (daemon polls instead)"
+        rm -rf "$build_dir"
+        return 0
+    fi
+    rm -rf "$build_dir"
+    cat > /etc/systemd/system/nexoshield-countd.service << 'EOF'
+[Unit]
+Description=NexoShield conntrack event counter
+After=network.target
+Before=auto-ban.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/nxcountd /run/nexoshield/counters.dat
+Restart=always
+RestartSec=5
+RuntimeDirectory=nexoshield
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/run/nexoshield
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable nexoshield-countd.service >/dev/null 2>&1
+    systemctl restart nexoshield-countd.service 2>/dev/null || true
+    success "nxcountd: conntrack event counter installed (exact arrival counting)"
+}
 setup_tc() {
     command -v tc >/dev/null 2>&1 || {
         warn "tc (iproute2) not installed - skipping bandwidth control"
@@ -7083,6 +7902,11 @@ remove_rules() {
         printf '%s' "  Are you sure? This will remove ALL protection. (y/N): " >/dev/tty; read -r CONF_R </dev/tty || CONF_R=""
     fi
     [[ "$CONF_R" != "y" && "$CONF_R" != "Y" ]] && echo -e "  ${DIM}Cancelled.${NC}" && return
+
+    # Phase 2a: the event counter leaves with the rest of the daemon.
+    systemctl disable --now nexoshield-countd.service >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/nexoshield-countd.service /usr/local/bin/nxcountd 2>/dev/null || true
+    systemctl daemon-reload >/dev/null 2>&1 || true
 
     # Sysctl (note: removing the file does not reset values already
     # loaded into the running kernel - they reset at reboot)

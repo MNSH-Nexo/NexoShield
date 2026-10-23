@@ -144,6 +144,10 @@ def build():
             body = body.replace(
                 "@@AUTOBAN_BODY@@", assemble_module("auto-ban.sh")
             )
+            assert "@@NXCOUNTD_C@@" in body
+            body = body.replace(
+                "@@NXCOUNTD_C@@", read("src/native/nxcountd.c")
+            )
         parts.append(subst(body))
         parts.append(delim)
 
@@ -157,6 +161,7 @@ def build():
             "@@CF_ENTRIES@@",
             "@@CF6_ENTRIES@@",
             "@@AUTOBAN_BODY@@",
+            "@@NXCOUNTD_C@@",
             "# @include",
             "# @part",
         )
@@ -185,6 +190,9 @@ def main():
             if filename == "antiddos.sh":
                 body = body.replace(
                     "@@AUTOBAN_BODY@@", assemble_module("auto-ban.sh")
+                )
+                body = body.replace(
+                    "@@NXCOUNTD_C@@", read("src/native/nxcountd.c")
                 )
             body = body.replace("@@VERSION@@", version)
             (out_dir / filename).write_text(body + "\n", encoding="utf-8")

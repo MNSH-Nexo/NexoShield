@@ -117,6 +117,9 @@ subnet_ban_minutes=60
 
 # ── Stress gate (Phase 1d) ──
 stress_gate=1           # 1: score bans need host stress (or score < 10)
+
+# ── Adaptive thresholds (Phase 2d; needs nxcountd) ──
+adaptive_enabled=1      # 1: tighten gates under a global arrival anomaly
 EOF
     chmod 644 "$f" 2>/dev/null || true
 }
