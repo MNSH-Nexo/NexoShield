@@ -1,0 +1,75 @@
+# @part modules/autoban/10-ip-utils.sh - log, ip helpers, Cloudflare/self/whitelist exemption checks
+# Assembled into auto-ban.sh by tools/build.py - not a standalone script.
+log() { echo "[$(date '+%H:%M:%S')] $*" | tee -a "$LOG"; }
+
+# Convert IP to integer for CIDR comparison
+ip_to_int() {
+    local IFS=.
+    # shellcheck disable=SC2206
+    local -a A=($1)
+    echo $(( (A[0]<<24) + (A[1]<<16) + (A[2]<<8) + A[3] ))
+}
+
+# Check if IP is inside a CIDR range (e.g. "104.16.0.0/13")
+ip_in_cidr() {
+    local ip="$1" cidr="$2"
+    local base mask_bits ip_int base_int mask
+    base="${cidr%/*}"; mask_bits="${cidr#*/}"
+    ip_int=$(ip_to_int "$ip")     2>/dev/null || return 1
+    base_int=$(ip_to_int "$base") 2>/dev/null || return 1
+    mask=$(( 0xFFFFFFFF << (32 - mask_bits) & 0xFFFFFFFF ))
+    [ $(( ip_int & mask )) -eq $(( base_int & mask )) ]
+}
+
+# Check if IP is in CF ranges (pure bash CIDR match — no ipcalc needed)
+is_cf_ip() {
+    local ip="$1"
+    for CF in "${CF_RANGES[@]}"; do
+        ip_in_cidr "$ip" "$CF" 2>/dev/null && return 0
+    done
+    return 1
+}
+
+# Check if IP is server's own IP
+is_self_ip() {
+    local ip="$1"
+    for sip in "${SELF_IPS[@]}"; do
+        [ "$sip" = "$ip" ] && return 0
+    done
+    ip -4 addr show 2>/dev/null | grep -oP '(?<=inet )\d+\.\d+\.\d+\.\d+' | grep -qxF "$ip" && return 0
+    hostname -I 2>/dev/null | tr ' ' '\n' | grep -qxF "$ip" && return 0
+    return 1
+}
+
+# Check if IP is in the user whitelist (exact or within a listed CIDR)
+is_user_whitelisted() {
+    local ip="$1" entry
+    [ -f "$WHITELIST_FILE" ] || return 1
+    while IFS= read -r entry; do
+        entry="${entry%%#*}"            # strip comments
+        entry="${entry// /}"            # drop spaces
+        [ -z "$entry" ] && continue
+        case "$entry" in
+            */*) ip_in_cidr "$ip" "$entry" 2>/dev/null && return 0 ;;
+            *)   [ "$entry" = "$ip" ] && return 0 ;;
+        esac
+    done < "$WHITELIST_FILE"
+    return 1
+}
+
+# Check if IP should be exempt (CF or self or user-whitelisted)
+is_exempt() {
+    local ip="$1"
+    is_self_ip "$ip"  && return 0
+    is_cf_ip   "$ip"  && return 0
+    is_user_whitelisted "$ip" && return 0
+    return 1
+}
+
+# Reserved tc filter priority bands (must never overlap):
+#   whitelist (CF + server-own + user)  : 10 .. <10000  (allocated in tc-setup.sh)
+#   throttle (100Mbps class 1:30)       : 10000 ..
+#   hard-throttle (50Mbps class 1:40)   : 20000 ..
+# This guarantees a throttle filter can NEVER collide with a Cloudflare/server
+# whitelist filter, so CF and the server itself stay exempt even at ban time
+# (ban_ip deletes only the recorded throttle-band prio).

@@ -1,21 +1,25 @@
 #!/usr/bin/env python3
 """Assemble the single-file installer (install.sh) from modular sources.
 
-Layout:
-    VERSION                        single source of truth for the version
-    src/installer/preamble.sh      installer head (contains @@CF_ENTRIES@@)
-    src/installer/outro.sh         installer tail (permissions, final banner)
-    src/modules/3proxy-socks5.sh   -> written to /opt/proxy-manager/ at install
-    src/modules/optimize-sysctl.sh -> idem
-    src/modules/proxy-menu.sh      -> idem
-    src/modules/antiddos.sh        -> idem (contains @@AUTOBAN_BODY@@)
-    src/modules/auto-ban.sh        -> nested inside antiddos.sh at install
-    src/data/cloudflare-ipv4.list  Cloudflare IPv4 ranges, one per line
+Two assembly stages:
 
-Placeholders substituted at build time: @@VERSION@@, @@CF_ENTRIES@@,
-@@AUTOBAN_BODY@@. The build fails if any placeholder survives.
+  Stage 1 - modules. Each runtime script is assembled from small topic
+  parts under src/modules/<name>/ (files starting with `# @part` headers,
+  which are stripped). Lines of the form `# @include lib/<file>` are
+  replaced with the body of src/lib/<file> (the part below its
+  `# @lib-body` marker), so shared snippets exist exactly once.
 
-Usage:  python3 tools/build.py [--output PATH]   (default: install.sh)
+  Stage 2 - installer. The assembled modules are embedded as heredocs
+  into the installer, between src/installer/preamble.sh and outro.sh.
+
+Substitutions: @@VERSION@@ (from the VERSION file), @@CF_ENTRIES@@
+(from src/data/cloudflare-ipv4.list), @@AUTOBAN_BODY@@ (the assembled
+auto-ban module, nested inside antiddos.sh). The build fails if any
+placeholder or directive survives.
+
+Usage:
+    python3 tools/build.py [--output PATH]        build install.sh
+    python3 tools/build.py --emit-modules DIR     write assembled modules
 """
 import argparse
 import pathlib
@@ -28,19 +32,66 @@ GENERATED_NOTICE = (
     "do not edit directly; edit the sources and rebuild ──"
 )
 
-# (banner title, target path variable, heredoc delimiter, module file)
-MODULES = [
+# Runtime module -> directory of its parts (assembled in filename order).
+MODULE_DIRS = {
+    "3proxy-socks5.sh": "3proxy",
+    "optimize-sysctl.sh": "sysctl",
+    "proxy-menu.sh": "menu",
+    "antiddos.sh": "antiddos",
+    "auto-ban.sh": "autoban",
+}
+
+# (banner title, target filename, heredoc delimiter) embedded in installer.
+INSTALLER_MODULES = [
     ("File 1: 3proxy-socks5.sh", "3proxy-socks5.sh", "PROXY_SCRIPT"),
     ("File 2: optimize-sysctl.sh", "optimize-sysctl.sh", "SYSCTL_SCRIPT"),
     ("File 3: proxy-menu.sh (main menu)", "proxy-menu.sh", "MENU_SCRIPT"),
     ("File 4: antiddos.sh", "antiddos.sh", "ANTIDDOS_SCRIPT"),
 ]
+MODULES = INSTALLER_MODULES  # backwards-compatible alias for verify.py
 
 BANNER = "# ══════════════════════════════════════════════════════════"
 
 
 def read(rel):
     return (ROOT / rel).read_text(encoding="utf-8").rstrip("\n")
+
+
+def lib_body(name):
+    text = read(f"src/lib/{name}")
+    marker = "# @lib-body\n"
+    assert marker in text, f"src/lib/{name} misses its # @lib-body marker"
+    return text.split(marker, 1)[1]
+
+
+def expand_includes(text):
+    out = []
+    for line in text.split("\n"):
+        if line.startswith("# @include lib/"):
+            out.append(lib_body(line.split("lib/", 1)[1].strip()))
+        else:
+            out.append(line)
+    return "\n".join(out)
+
+
+def assemble_module(filename):
+    """Stage 1: parts (sorted by name) -> one module, includes expanded."""
+    part_dir = ROOT / "src/modules" / MODULE_DIRS[filename]
+    parts = sorted(part_dir.glob("*.sh"))
+    assert parts, f"no parts found for {filename} in {part_dir}"
+    chunks = []
+    for part in parts:
+        raw = part.read_text(encoding="utf-8")
+        if raw.endswith("\n"):
+            raw = raw[:-1]  # strip exactly one: trailing blank lines are content
+        lines = raw.split("\n")
+        # Strip the two `# @part` header lines; they are dev-only metadata.
+        while lines and (
+            lines[0].startswith("# @part ") or lines[0].startswith("# Assembled into")
+        ):
+            lines.pop(0)
+        chunks.append("\n".join(lines))
+    return expand_includes("\n".join(chunks))
 
 
 def build():
@@ -63,7 +114,7 @@ def build():
     preamble.insert(3, GENERATED_NOTICE)
 
     parts = ["\n".join(preamble)]
-    for idx, (title, filename, delim) in enumerate(MODULES):
+    for idx, (title, filename, delim) in enumerate(INSTALLER_MODULES):
         if idx > 0:
             # Blank line(s) + banner + opener, matching the historic layout:
             # two blank lines before File 4, one before the others.
@@ -74,11 +125,12 @@ def build():
             parts.append(f"# {title}")
             parts.append(BANNER)
         parts.append(f'cat > "$INSTALL_DIR/{filename}" << \'{delim}\'')
-        body = read(f"src/modules/{filename}")
+        body = assemble_module(filename)
         if filename == "antiddos.sh":
-            autoban = read("src/modules/auto-ban.sh")
             assert "@@AUTOBAN_BODY@@" in body
-            body = body.replace("@@AUTOBAN_BODY@@", autoban)
+            body = body.replace(
+                "@@AUTOBAN_BODY@@", assemble_module("auto-ban.sh")
+            )
         parts.append(subst(body))
         parts.append(delim)
 
@@ -87,18 +139,43 @@ def build():
 
     leftovers = [
         tok
-        for tok in ("@@VERSION@@", "@@CF_ENTRIES@@", "@@AUTOBAN_BODY@@")
+        for tok in (
+            "@@VERSION@@",
+            "@@CF_ENTRIES@@",
+            "@@AUTOBAN_BODY@@",
+            "# @include",
+            "# @part",
+        )
         if tok in result
     ]
     if leftovers:
-        sys.exit(f"build failed: unsubstituted placeholders: {leftovers}")
+        sys.exit(f"build failed: unsubstituted directives: {leftovers}")
     return result
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--output", default=str(ROOT / "install.sh"))
+    ap.add_argument(
+        "--emit-modules",
+        metavar="DIR",
+        help="write the assembled runtime modules to DIR and exit",
+    )
     args = ap.parse_args()
+    if args.emit_modules:
+        out_dir = pathlib.Path(args.emit_modules)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        version = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
+        for filename in MODULE_DIRS:
+            body = assemble_module(filename)
+            if filename == "antiddos.sh":
+                body = body.replace(
+                    "@@AUTOBAN_BODY@@", assemble_module("auto-ban.sh")
+                )
+            body = body.replace("@@VERSION@@", version)
+            (out_dir / filename).write_text(body + "\n", encoding="utf-8")
+        print(f"modules emitted to {out_dir}")
+        return
     out = pathlib.Path(args.output)
     out.write_text(build(), encoding="utf-8")
     print(f"built {out} ({out.stat().st_size} bytes)")

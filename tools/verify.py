@@ -4,9 +4,11 @@
 Checks:
   1. install.sh on disk is byte-identical to a fresh build (src/ is in sync).
   2. Round-trip: every heredoc body extracted from install.sh matches its
-     (substituted) module source exactly.
+     assembled module source exactly.
   3. The Cloudflare list holds 753 unique, well-formed CIDRs.
-  4. No build placeholder survives in install.sh.
+  4. No build placeholder or directive survives in install.sh.
+  5. De-duplication: the Cloudflare loader body exists in exactly ONE
+     source file (src/lib/), and no module part contains a private copy.
 """
 import importlib.util
 import pathlib
@@ -51,13 +53,15 @@ version = (ROOT / "VERSION").read_text().strip()
 
 
 def expected_body(filename):
-    body = build_mod.read(f"src/modules/{filename}")
+    body = build_mod.assemble_module(filename)
     if filename == "antiddos.sh":
-        body = body.replace("@@AUTOBAN_BODY@@", build_mod.read("src/modules/auto-ban.sh"))
+        body = body.replace(
+            "@@AUTOBAN_BODY@@", build_mod.assemble_module("auto-ban.sh")
+        )
     return body.replace("@@VERSION@@", version)
 
 
-for _title, filename, delim in build_mod.MODULES:
+for _title, filename, delim in build_mod.INSTALLER_MODULES:
     start = next(
         i for i, ln in enumerate(lines) if ln.endswith(f"<< '{delim}'")
     )
@@ -66,6 +70,22 @@ for _title, filename, delim in build_mod.MODULES:
     check(extracted == expected_body(filename), f"round-trip: {filename}")
 
 check("@@" not in built, "no placeholders in install.sh")
+check(
+    "# @include" not in built and "# @part" not in built,
+    "no build directives in install.sh",
+)
+
+# --- De-duplication ----------------------------------------------------------
+needle = "while IFS= read -r _cfl"
+holders = [
+    str(p.relative_to(ROOT))
+    for p in (ROOT / "src").rglob("*.sh")
+    if needle in p.read_text(encoding="utf-8")
+]
+check(
+    holders == ["src/lib/cloudflare-loader.sh"],
+    f"cloudflare loader exists only in src/lib (found: {holders})",
+)
 
 if failures:
     sys.exit(f"\n{len(failures)} check(s) failed")
