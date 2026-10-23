@@ -75,6 +75,34 @@ those waves land.
   Residual (documented): the hashlimit-less fallback UDP/ICMP limit
   pairs are not pattern-deleted. Tests: static-filter 10/10, wave-3
   source regressions 10/10. `make check` + `make test` green (77 tests).
+- Wave 4 — DONE. BUG-003: all daemon state matching now goes through
+  `state_has_ip`/`state_get_field`/`state_del_ip` (exact field-1 awk
+  matches, atomic rewrites); no substring grep/sed on IPs remains in the
+  daemon. FR-3/D3: the reputation lifecycle is an explicit machine —
+  `rep_on_ban` (every ban path: score := 50, probation window opens
+  after the ban), `rep_on_unban` (expiry and manual-release transition:
+  raise to 50 + fresh window), in-`update_score` normalization of any
+  stale sub-ban-band score found on a non-banned IP, probation drop
+  doubling with faster in-probation recovery, quiet-IP recovery via
+  `reputation_sweep` (+3/+5 per cycle, banned IPs frozen, stale
+  full-score entries pruned after 24 h), and real elapsed `dt` from the
+  persisted timestamp (BUG-020 scoring half). BUG-004:
+  `reconcile_bans` re-applies unexpired bans to iptables at daemon
+  startup, then expires stale ones through the D3 transition. BUG-020
+  (perf half): CF membership uses startup-precomputed network integers
+  — zero forks per check instead of ~1,500. BUG-011: subnet totals
+  exclude exempt traffic, the CF check is a true range-overlap test,
+  and the sustained path can only ban at the 1000 threshold (the
+  effective trigger was 400-for-45 s). BUG-030: the sampler counts
+  ESTABLISHED + SYN-RECV sockets and excludes the server's own outbound
+  flows (ephemeral local port). BUG-033: reputation and ban-list
+  rewrites are tmp+rename atomic. BUG-045: logrotate config for both
+  daemon logs. Also fixed en route: Wave 1's `self_guard` throttle leg
+  called a helper that never existed — it now removes the filter and
+  state entry with the state helpers, like auto-release does. Tests:
+  reputation lifecycle suite 17/17 (incl. the FR-3 scenario: a stale
+  score-5 IP at 130 conns is normalized to probation, NOT re-banned).
+  `make check` + `make test` green (94 tests).
 
 **Inputs:** `docs/BUGS.md` — 68 audited findings (BUG-001…068) plus the
 maintainer's field reports FR-1 (whitelist must exempt from *everything*),

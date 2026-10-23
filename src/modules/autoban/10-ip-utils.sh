@@ -10,6 +10,24 @@ iptables() { command iptables -w 5 "$@"; }
 
 log() { echo "[$(date '+%H:%M:%S')] $*" | tee -a "$LOG"; }
 
+# ── Exact state-file matching (BUG-003) ─────────────
+# State files are "IP field field..." per line. The ONLY correct match
+# is field 1 == IP, exactly. The old grep -qF "$ip" / sed "/$ip/d"
+# substring+regex patterns made 1.2.3.4 match 11.2.3.4 and 1.2.3.45,
+# corrupting other IPs' watch/ban/throttle state.
+state_has_ip() {  # <file> <ip>
+    [ -f "$1" ] || return 1
+    awk -v x="$2" '$1==x{f=1} END{exit !f}' "$1" 2>/dev/null
+}
+state_get_field() {  # <file> <ip> <field#> -> prints the field (or empty)
+    [ -f "$1" ] || return 0
+    awk -v x="$2" -v n="$3" '$1==x{print $n; exit}' "$1" 2>/dev/null
+}
+state_del_ip() {  # <file> <ip>  (atomic rewrite)
+    [ -f "$1" ] || return 0
+    awk -v x="$2" '$1!=x' "$1" > "$1.tmp.$$" 2>/dev/null && mv "$1.tmp.$$" "$1"
+}
+
 # Convert IP to integer for CIDR comparison
 ip_to_int() {
     local IFS=.
@@ -31,9 +49,23 @@ ip_in_cidr() {
 
 # Check if IP is in CF ranges (pure bash CIDR match — no ipcalc needed)
 is_cf_ip() {
-    local ip="$1"
+    # Fast path (BUG-020): precomputed network integers, zero forks.
+    local _i
+    ip_int "$1"
+    for _i in "${!CF_NET_INT[@]}"; do
+        [ $(( IP_INT >> CF_SHIFT[_i] )) -eq $(( CF_NET_INT[_i] >> CF_SHIFT[_i] )) ] && return 0
+    done
+    return 1
+}
+
+# subnet_overlaps_cf <a.b.c> — TRUE range-overlap test between a /24 and
+# every CF range (BUG-011: the old check tested only the .1 address, so
+# a CF range starting mid-/24 was missed).
+subnet_overlaps_cf() {
+    local subnet="$1" CF
     for CF in "${CF_RANGES[@]}"; do
-        ip_in_cidr "$ip" "$CF" 2>/dev/null && return 0
+        ip_in_cidr "${subnet}.0" "$CF" 2>/dev/null && return 0
+        ip_in_cidr "${CF%%/*}" "${subnet}.0/24" 2>/dev/null && return 0
     done
     return 1
 }

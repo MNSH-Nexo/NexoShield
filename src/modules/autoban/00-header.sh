@@ -35,6 +35,16 @@ SCORE_THROTTLE=60
 SCORE_SUSPECT=80
 # Recovery: how fast a well-behaved IP regains reputation (per cycle).
 SCORE_RECOVER=3
+# Probation (D3, FR-3): EVERY ban - reputation, classic or instant - ends
+# in the same defined state: the IP returns at PROBATION_SCORE with a
+# probation window. During probation, recovery is faster (+5/cycle) but
+# score drops are doubled; a ban still requires the score to actually
+# reach the ban band again, so one minor spike cannot re-ban (the old
+# behaviour: score stayed wherever the ban path left it, often <20, so
+# the smallest trigger re-banned instantly - a de-facto permanent ban).
+PROBATION_SCORE=50
+PROBATION_SECONDS=1800
+PROBATION_RECOVER=5
 # When connections are counted we snapshot the previous sample to derive the
 # new-connection rate (attacker signature) without per-packet overhead.
 
@@ -89,4 +99,20 @@ SELF_IPS=()
 while IFS= read -r sip; do
     [ -n "$sip" ] && SELF_IPS+=("$sip")
 done < <(list_self_ips)
+
+# BUG-020: precompute Cloudflare network integers ONCE. is_cf_ip() then
+# costs zero forks per check (previously up to ~1,500 per call: 753 ranges
+# x 2 subshells in ip_to_int, paid for every hot IP every cycle).
+declare -a CF_NET_INT=() CF_SHIFT=()
+ip_int() {
+    local IFS=. _a _b _c _d
+    read -r _a _b _c _d <<< "$1"
+    IP_INT=$(( (10#$_a << 24) + (10#$_b << 16) + (10#$_c << 8) + 10#$_d ))
+}
+for _cfr in "${CF_RANGES[@]}"; do
+    ip_int "${_cfr%%/*}"
+    CF_NET_INT+=("$IP_INT")
+    CF_SHIFT+=("$(( 32 - ${_cfr#*/} ))")
+done
+unset _cfr
 

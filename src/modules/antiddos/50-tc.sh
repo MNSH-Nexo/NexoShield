@@ -169,6 +169,20 @@ EOF
     systemctl daemon-reload
     systemctl enable antiddos-restore.service >/dev/null 2>&1
     success "iptables persistence: enabled (antiddos-restore)"
+
+    # Log rotation (BUG-045): the daemon logs every cycle's events with
+    # no rotation - an unbounded /var/log/auto-ban.log on a busy box.
+    cat > /etc/logrotate.d/nexoshield << 'LREOF'
+/var/log/auto-ban.log /var/log/antiddos.log {
+    weekly
+    rotate 4
+    compress
+    missingok
+    notifempty
+    copytruncate
+}
+LREOF
+    success "logrotate: /etc/logrotate.d/nexoshield"
 }
 
 # ════════════════════════════════════════════════

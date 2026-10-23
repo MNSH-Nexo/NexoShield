@@ -3,8 +3,10 @@
 ban_subnet() {
     local subnet="$1"   # e.g. "1.2.3"  (first 3 octets)
     local cidr="${subnet}.0/24"
-    # Don't ban if any CF range overlaps (rough check: skip 103.x, 104.x, 108.x, 141.x, 162.x, 172.x, 173.x, 188.x, 190.x, 197.x, 198.x)
-    is_cf_ip "${subnet}.1" 2>/dev/null && return 0
+    # Don't ban if any CF range overlaps this /24 (BUG-011: the old
+    # check tested only the .1 address and missed ranges starting
+    # mid-/24; subnet_overlaps_cf tests real range intersection)
+    subnet_overlaps_cf "$subnet" && { log " SUBNET SKIP: $cidr overlaps a Cloudflare range"; return 0; }
     # Don't ban own server subnet - check EVERY local address (BUG-065:
     # the old code compared only the first `ip addr` line via head -1)
     local _sip
@@ -58,6 +60,7 @@ unban_subnet_expired() {
             NEWLIST="${NEWLIST}${ip} ${ts} ${duration}\n"
         fi
     done < "$BANNED_LIST"
-    printf "%b" "$NEWLIST" > "$BANNED_LIST" 2>/dev/null || true
+    printf "%b" "$NEWLIST" > "$BANNED_LIST.tmp.$$" 2>/dev/null && \
+        mv "$BANNED_LIST.tmp.$$" "$BANNED_LIST" 2>/dev/null || true
 }
 

@@ -46,6 +46,10 @@ extract_fn() {
 for fn in next_tc_prio tc_class_exists throttle_ip hard_throttle_ip; do
     extract_fn "$SRC" "$fn" "$TMP/fns.sh" || { echo "FAIL: cannot extract $fn"; exit 1; }
 done
+# Wave 4: the throttle path uses the exact-match state helpers
+for fn in state_has_ip state_get_field state_del_ip; do
+    extract_fn src/modules/autoban/10-ip-utils.sh "$fn" "$TMP/fns.sh" || { echo "FAIL: cannot extract $fn"; exit 1; }
+done
 
 # Daemon environment fixtures
 IF="eth0"

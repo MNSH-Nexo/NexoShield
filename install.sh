@@ -4114,6 +4114,16 @@ SCORE_THROTTLE=60
 SCORE_SUSPECT=80
 # Recovery: how fast a well-behaved IP regains reputation (per cycle).
 SCORE_RECOVER=3
+# Probation (D3, FR-3): EVERY ban - reputation, classic or instant - ends
+# in the same defined state: the IP returns at PROBATION_SCORE with a
+# probation window. During probation, recovery is faster (+5/cycle) but
+# score drops are doubled; a ban still requires the score to actually
+# reach the ban band again, so one minor spike cannot re-ban (the old
+# behaviour: score stayed wherever the ban path left it, often <20, so
+# the smallest trigger re-banned instantly - a de-facto permanent ban).
+PROBATION_SCORE=50
+PROBATION_SECONDS=1800
+PROBATION_RECOVER=5
 # When connections are counted we snapshot the previous sample to derive the
 # new-connection rate (attacker signature) without per-packet overhead.
 
@@ -4186,6 +4196,22 @@ while IFS= read -r sip; do
     [ -n "$sip" ] && SELF_IPS+=("$sip")
 done < <(list_self_ips)
 
+# BUG-020: precompute Cloudflare network integers ONCE. is_cf_ip() then
+# costs zero forks per check (previously up to ~1,500 per call: 753 ranges
+# x 2 subshells in ip_to_int, paid for every hot IP every cycle).
+declare -a CF_NET_INT=() CF_SHIFT=()
+ip_int() {
+    local IFS=. _a _b _c _d
+    read -r _a _b _c _d <<< "$1"
+    IP_INT=$(( (10#$_a << 24) + (10#$_b << 16) + (10#$_c << 8) + 10#$_d ))
+}
+for _cfr in "${CF_RANGES[@]}"; do
+    ip_int "${_cfr%%/*}"
+    CF_NET_INT+=("$IP_INT")
+    CF_SHIFT+=("$(( 32 - ${_cfr#*/} ))")
+done
+unset _cfr
+
 # BUG-019: every iptables call in this script takes the xtables lock with
 # a 5s wait. The daemon, fail2ban and the menus mutate rules concurrently;
 # without -w a contended call fails with "Resource temporarily
@@ -4195,6 +4221,24 @@ done < <(list_self_ips)
 iptables() { command iptables -w 5 "$@"; }
 
 log() { echo "[$(date '+%H:%M:%S')] $*" | tee -a "$LOG"; }
+
+# ── Exact state-file matching (BUG-003) ─────────────
+# State files are "IP field field..." per line. The ONLY correct match
+# is field 1 == IP, exactly. The old grep -qF "$ip" / sed "/$ip/d"
+# substring+regex patterns made 1.2.3.4 match 11.2.3.4 and 1.2.3.45,
+# corrupting other IPs' watch/ban/throttle state.
+state_has_ip() {  # <file> <ip>
+    [ -f "$1" ] || return 1
+    awk -v x="$2" '$1==x{f=1} END{exit !f}' "$1" 2>/dev/null
+}
+state_get_field() {  # <file> <ip> <field#> -> prints the field (or empty)
+    [ -f "$1" ] || return 0
+    awk -v x="$2" -v n="$3" '$1==x{print $n; exit}' "$1" 2>/dev/null
+}
+state_del_ip() {  # <file> <ip>  (atomic rewrite)
+    [ -f "$1" ] || return 0
+    awk -v x="$2" '$1!=x' "$1" > "$1.tmp.$$" 2>/dev/null && mv "$1.tmp.$$" "$1"
+}
 
 # Convert IP to integer for CIDR comparison
 ip_to_int() {
@@ -4217,9 +4261,23 @@ ip_in_cidr() {
 
 # Check if IP is in CF ranges (pure bash CIDR match — no ipcalc needed)
 is_cf_ip() {
-    local ip="$1"
+    # Fast path (BUG-020): precomputed network integers, zero forks.
+    local _i
+    ip_int "$1"
+    for _i in "${!CF_NET_INT[@]}"; do
+        [ $(( IP_INT >> CF_SHIFT[_i] )) -eq $(( CF_NET_INT[_i] >> CF_SHIFT[_i] )) ] && return 0
+    done
+    return 1
+}
+
+# subnet_overlaps_cf <a.b.c> — TRUE range-overlap test between a /24 and
+# every CF range (BUG-011: the old check tested only the .1 address, so
+# a CF range starting mid-/24 was missed).
+subnet_overlaps_cf() {
+    local subnet="$1" CF
     for CF in "${CF_RANGES[@]}"; do
-        ip_in_cidr "$ip" "$CF" 2>/dev/null && return 0
+        ip_in_cidr "${subnet}.0" "$CF" 2>/dev/null && return 0
+        ip_in_cidr "${CF%%/*}" "${subnet}.0/24" 2>/dev/null && return 0
     done
     return 1
 }
@@ -4321,7 +4379,7 @@ reapply_throttles() {
 throttle_ip() {
     local ip="$1"
     is_exempt "$ip" && return 0
-    grep -qF "$ip " "$THROTTLE_LIST" 2>/dev/null && return 0
+    state_has_ip "$THROTTLE_LIST" "$ip" && return 0
     # BUG-024: never record state for a throttle that does not exist.
     # In autoban-only mode there are no tc classes at all - say so.
     if ! tc_class_exists 1:30; then
@@ -4352,9 +4410,9 @@ hard_throttle_ip() {
     # Drop any earlier throttle entry for this IP so the tc filter list stays
     # consistent and no stale prio is left behind (its filter would still match).
     local _OLD
-    _OLD=$(grep -F "$ip " "$THROTTLE_LIST" 2>/dev/null | awk '{print $2}' | head -1 || true)
+    _OLD=$(state_get_field "$THROTTLE_LIST" "$ip" 2)
     [ -n "$_OLD" ] && tc filter del dev "$IF" parent 1: prio "$_OLD" 2>/dev/null || true
-    sed -i "/^$ip /d" "$THROTTLE_LIST" 2>/dev/null || true
+    state_del_ip "$THROTTLE_LIST" "$ip"
     # Pick the strongest class that actually exists (BUG-024: state is
     # written only after the filter lands).
     local FLOW=""
@@ -4385,7 +4443,7 @@ ban_ip() {
         return 1
     fi
     is_exempt "$ip" && return 0
-    grep -qF "$ip " "$BANNED_LIST" 2>/dev/null && return 0
+    state_has_ip "$BANNED_LIST" "$ip" && return 0
     local UNBAN_TIME
     UNBAN_TIME=$(date -d "+${BAN_HOURS} hours" '+%H:%M:%S' 2>/dev/null || \
                  date -v "+${BAN_HOURS}H" '+%H:%M:%S' 2>/dev/null || echo "N/A")
@@ -4396,9 +4454,9 @@ ban_ip() {
     # EVERY filter including the Cloudflare + server-own whitelist, which would
     # throttle CF traffic. We remove the one filter recorded for this IP.
     local _PRIO
-    _PRIO=$(grep -F "$ip " "$THROTTLE_LIST" 2>/dev/null | awk '{print $2}' | head -1 || true)
+    _PRIO=$(state_get_field "$THROTTLE_LIST" "$ip" 2)
     [ -n "$_PRIO" ] && tc filter del dev "$IF" parent 1: prio "$_PRIO" 2>/dev/null || true
-    sed -i "/^$ip /d" "$THROTTLE_LIST" 2>/dev/null || true
+    state_del_ip "$THROTTLE_LIST" "$ip"
     log " BANNED: $ip | unban: $UNBAN_TIME"
 }
 
@@ -4419,36 +4477,106 @@ score_init() {
     touch "$SCORE_FILE" 2>/dev/null || true
 }
 
-# load_reputation <ip> -> sets REP_SCORE, REP_PREV_CNT, REP_TS (or defaults)
+# load_reputation <ip> -> sets REP_SCORE, REP_PREV_CNT, REP_TS,
+# REP_PROB_UNTIL (or defaults). Exact field-1 match (BUG-003: the old
+# grep -F "$ip " also matched 11.2.3.4 when asked for 1.2.3.4).
+# Format: IP SCORE PREV_CNT TS PROB_UNTIL   (PROB_UNTIL added by D3;
+# older 4-field lines read as 0.)
 load_reputation() {
     local ip="$1"
     REP_SCORE=100
     REP_PREV_CNT=0
     REP_TS=0
-    local line prev
-    line=$(grep -F "$ip " "$SCORE_FILE" 2>/dev/null | tail -1 || true)
+    REP_PROB_UNTIL=0
+    local line prev prob
+    line=$(awk -v x="$ip" '$1==x' "$SCORE_FILE" 2>/dev/null | tail -1 || true)
     [ -z "$line" ] && return 0
-    # format: IP SCORE PREV_CNT TS
     REP_SCORE=$(echo "$line" | awk '{print $2}')
     prev=$(echo "$line" | awk '{print $3}')
     REP_TS=$(echo "$line" | awk '{print $4}')
+    prob=$(echo "$line" | awk '{print $5}')
     REP_SCORE="${REP_SCORE:-100}"; REP_SCORE="${REP_SCORE//[^0-9]/}"; REP_SCORE="${REP_SCORE:-100}"
     REP_PREV_CNT="${prev:-0}"; REP_PREV_CNT="${REP_PREV_CNT//[^0-9]/}"; REP_PREV_CNT="${REP_PREV_CNT:-0}"
     REP_TS="${REP_TS:-0}"; REP_TS="${REP_TS//[^0-9]/}"; REP_TS="${REP_TS:-0}"
+    REP_PROB_UNTIL="${prob:-0}"; REP_PROB_UNTIL="${REP_PROB_UNTIL//[^0-9]/}"; REP_PROB_UNTIL="${REP_PROB_UNTIL:-0}"
     [ "$REP_SCORE" -gt 100 ] && REP_SCORE=100
     [ "$REP_SCORE" -lt 0 ] && REP_SCORE=0
 }
 
+# save_reputation: atomic rewrite (tmp + rename, BUG-033) - a crash
+# mid-write can no longer corrupt the whole score file.
 save_reputation() {
     local ip="$1"
-    sed -i "/^$ip /d" "$SCORE_FILE" 2>/dev/null || true
-    echo "$ip $REP_SCORE $REP_PREV_CNT $(date +%s)" >> "$SCORE_FILE"
+    awk -v x="$ip" '$1!=x' "$SCORE_FILE" > "$SCORE_FILE.tmp.$$" 2>/dev/null || true
+    echo "$ip $REP_SCORE $REP_PREV_CNT $(date +%s) ${REP_PROB_UNTIL:-0}" >> "$SCORE_FILE.tmp.$$"
+    mv "$SCORE_FILE.tmp.$$" "$SCORE_FILE" 2>/dev/null || true
 }
 
-# clear_reputation <ip> — remove score after ban/unban/cleanup
+# clear_reputation <ip> — remove score after cleanup
 clear_reputation() {
     local ip="$1"
-    sed -i "/^$ip /d" "$SCORE_FILE" 2>/dev/null || true
+    state_del_ip "$SCORE_FILE" "$ip"
+}
+
+# rep_on_unban <ip> — the D3 release transition, identical for EVERY ban
+# path: a served ban ends in PROBATION (score PROBATION_SCORE + window),
+# never in a stale low score and never wiped to a fresh 100.
+rep_on_ban() {
+    local ip="$1" now
+    now=$(date +%s)
+    load_reputation "$ip"
+    REP_SCORE="$PROBATION_SCORE"
+    REP_PROB_UNTIL=$(( now + BAN_HOURS * 3600 + PROBATION_SECONDS ))
+    save_reputation "$ip"
+}
+
+rep_on_unban() {
+    local ip="$1" now
+    now=$(date +%s)
+    load_reputation "$ip"
+    if state_has_ip "$SCORE_FILE" "$ip"; then
+        [ "$REP_SCORE" -lt "$PROBATION_SCORE" ] && REP_SCORE="$PROBATION_SCORE"
+        [ "$REP_PROB_UNTIL" -lt $(( now + PROBATION_SECONDS )) ] && \
+            REP_PROB_UNTIL=$(( now + PROBATION_SECONDS ))
+    else
+        REP_SCORE="$PROBATION_SCORE"
+        REP_PREV_CNT=0
+        REP_PROB_UNTIL=$(( now + PROBATION_SECONDS ))
+    fi
+    save_reputation "$ip"
+}
+
+# reputation_sweep — recovery for QUIET IPs (FR-3/BUG-034: update_score
+# only ever ran for hot IPs, so a quiet low score could never recover).
+# Runs every cycle over the score file: clean quiet IPs regain points
+# (+SCORE_RECOVER, or +PROBATION_RECOVER during probation); banned IPs
+# are frozen; fully-recovered stale entries (>24h) are pruned. IPs the
+# main loop scored this cycle (hot right now) are left to update_score.
+reputation_sweep() {
+    [ -f "$SCORE_FILE" ] || return 0
+    local now ip score prev ts prob rec ns
+    now=$(date +%s)
+    local tmp="$SCORE_FILE.sweep.$$"
+    : > "$tmp"
+    while read -r ip score prev ts prob; do
+        [ -z "$ip" ] && continue
+        score="${score//[^0-9]/}"; score="${score:-100}"
+        ts="${ts//[^0-9]/}"; ts="${ts:-0}"
+        prob="${prob//[^0-9]/}"; prob="${prob:-0}"
+        if state_has_ip "$BANNED_LIST" "$ip"; then
+            echo "$ip $score $prev $ts $prob" >> "$tmp"; continue
+        fi
+        if [ "${CONN_COUNT[$ip]:-0}" -ge "$CONN_THRESHOLD" ]; then
+            echo "$ip $score $prev $ts $prob" >> "$tmp"; continue
+        fi
+        if [ "$score" -ge 100 ] && [ "$prob" -le "$now" ] && [ $(( now - ts )) -gt 86400 ]; then
+            continue  # prune
+        fi
+        rec="$SCORE_RECOVER"; [ "$prob" -gt "$now" ] && rec="$PROBATION_RECOVER"
+        ns=$(( score + rec )); [ "$ns" -gt 100 ] && ns=100
+        echo "$ip $ns $prev $ts $prob" >> "$tmp"
+    done < "$SCORE_FILE"
+    mv "$tmp" "$SCORE_FILE" 2>/dev/null || true
 }
 
 # update_score <ip> <current_conn_count> <elapsed_seconds_since_last>
@@ -4457,9 +4585,28 @@ update_score() {
     local ip="$1" cur="$2" dt="$3"
     [ "$dt" -lt 1 ] && dt=1
     is_exempt "$ip" && { clear_reputation "$ip"; return 0; }
-    grep -qF "$ip " "$SCORE_FILE" 2>/dev/null || echo "$ip 100 0 0" >> "$SCORE_FILE" 2>/dev/null || true
+    state_has_ip "$SCORE_FILE" "$ip" || echo "$ip 100 0 0 0" >> "$SCORE_FILE" 2>/dev/null || true
 
     load_reputation "$ip"
+
+    # ── D3: real elapsed time (BUG-020: the caller-supplied dt was a
+    # constant; measure from the persisted timestamp instead, clamped)
+    local now; now=$(date +%s)
+    if [ "$REP_TS" -gt 0 ] && [ "$REP_TS" -le "$now" ]; then
+        dt=$(( now - REP_TS ))
+        [ "$dt" -lt 1 ] && dt=1
+        [ "$dt" -gt 60 ] && dt=60
+    fi
+
+    # ── D3 normalization (FR-3): a score in the ban band while the IP is
+    # NOT banned is a leftover from a ban that ended outside this path
+    # (manual unban, older daemon, expiry race). That state was a
+    # de-facto permanent ban. Normalize it to a probation release.
+    if [ "$REP_SCORE" -lt "$SCORE_BAN" ] && ! state_has_ip "$BANNED_LIST" "$ip"; then
+        REP_SCORE="$PROBATION_SCORE"
+        REP_PROB_UNTIL=$(( now + PROBATION_SECONDS ))
+        log " REP-PROBATION: $ip | stale post-ban score normalized to $PROBATION_SCORE (probation ${PROBATION_SECONDS}s)"
+    fi
     local new_rate=0  # new connections per second
     if [ "$REP_PREV_CNT" -gt 0 ] && [ "$cur" -ge "$REP_PREV_CNT" ]; then
         new_rate=$(( (cur - REP_PREV_CNT) / dt ))
@@ -4485,9 +4632,18 @@ update_score() {
         drop=$(( drop + 1 ))
     fi
 
+    # Probation (D3): during the window, drops count double - a real
+    # repeat offender returns to the ban band quickly - but a ban still
+    # only fires from the band itself, never from a stale state.
+    if [ "$drop" -gt 0 ] && [ "$now" -lt "${REP_PROB_UNTIL:-0}" ]; then
+        drop=$(( drop * 2 ))
+    fi
+
     # Recover if this cycle was clean (below churn, below flood, low enough)
     if [ "$drop" -eq 0 ]; then
-        REP_SCORE=$(( REP_SCORE + SCORE_RECOVER ))
+        local _rec="$SCORE_RECOVER"
+        [ "$now" -lt "${REP_PROB_UNTIL:-0}" ] && _rec="$PROBATION_RECOVER"
+        REP_SCORE=$(( REP_SCORE + _rec ))
         [ "$REP_SCORE" -gt 100 ] && REP_SCORE=100
     else
         REP_SCORE=$(( REP_SCORE - drop ))
@@ -4498,12 +4654,15 @@ update_score() {
 
     # ── Enforce band (graduated, only escalate; never penalize a NORMAL IP) ──
     if [ "$REP_SCORE" -lt "$SCORE_BAN" ]; then
-        if ! grep -qF "$ip" "$BANNED_LIST" 2>/dev/null; then
+        if ! state_has_ip "$BANNED_LIST" "$ip"; then
             log " REP-BAN: $ip | score $REP_SCORE (below $SCORE_BAN) → ban ${BAN_HOURS}h"
             throttle_ip "$ip"
             ban_ip "$ip"
+            # D3: the ban sets up its own release - when it expires, the
+            # IP returns in PROBATION at PROBATION_SCORE (rep_on_unban
+            # enforces the same transition on the expiry path).
+            rep_on_ban "$ip"
         fi
-        clear_reputation "$ip"
     elif [ "$REP_SCORE" -lt "$SCORE_HARD" ]; then
         hard_throttle_ip "$ip"
         log " REP-HARD: $ip | score $REP_SCORE → 50Mbps"
@@ -4513,7 +4672,7 @@ update_score() {
     elif [ "$REP_SCORE" -lt "$SCORE_SUSPECT" ]; then
         # SUSPECT band: watch only, no bandwidth penalty. But ensure it is on
         # the watch list so the classic per-IP path can escalate it if it grows.
-        if ! grep -qF "$ip" "$WATCH_LIST" 2>/dev/null; then
+        if ! state_has_ip "$WATCH_LIST" "$ip"; then
             echo "$ip $(date +%s)" >> "$WATCH_LIST" 2>/dev/null || true
         fi
     fi
@@ -4525,8 +4684,10 @@ update_score() {
 ban_subnet() {
     local subnet="$1"   # e.g. "1.2.3"  (first 3 octets)
     local cidr="${subnet}.0/24"
-    # Don't ban if any CF range overlaps (rough check: skip 103.x, 104.x, 108.x, 141.x, 162.x, 172.x, 173.x, 188.x, 190.x, 197.x, 198.x)
-    is_cf_ip "${subnet}.1" 2>/dev/null && return 0
+    # Don't ban if any CF range overlaps this /24 (BUG-011: the old
+    # check tested only the .1 address and missed ranges starting
+    # mid-/24; subnet_overlaps_cf tests real range intersection)
+    subnet_overlaps_cf "$subnet" && { log " SUBNET SKIP: $cidr overlaps a Cloudflare range"; return 0; }
     # Don't ban own server subnet - check EVERY local address (BUG-065:
     # the old code compared only the first `ip addr` line via head -1)
     local _sip
@@ -4580,7 +4741,8 @@ unban_subnet_expired() {
             NEWLIST="${NEWLIST}${ip} ${ts} ${duration}\n"
         fi
     done < "$BANNED_LIST"
-    printf "%b" "$NEWLIST" > "$BANNED_LIST" 2>/dev/null || true
+    printf "%b" "$NEWLIST" > "$BANNED_LIST.tmp.$$" 2>/dev/null && \
+        mv "$BANNED_LIST.tmp.$$" "$BANNED_LIST" 2>/dev/null || true
 }
 
 unban_expired() {
@@ -4597,12 +4759,42 @@ unban_expired() {
             [[ "$ip" == *"/"* ]] && NEWLIST="${NEWLIST}${ip} ${ts} ${duration}\n" && continue
             iptables -D INPUT -s "$ip" -m comment --comment "auto-ban" -j DROP \
                 2>/dev/null || true
-            log " UNBANNED: $ip (ban expired)"
+            # D3 (FR-3): expiry is a probation release, never a return to
+            # a stale low score - identical for every ban path.
+            rep_on_unban "$ip"
+            log " UNBANNED: $ip (ban expired) → probation (score $PROBATION_SCORE, ${PROBATION_SECONDS}s)"
         else
             NEWLIST="${NEWLIST}${ip} ${ts} ${duration}\n"
         fi
     done < "$BANNED_LIST"
-    printf "%b" "$NEWLIST" > "$BANNED_LIST" 2>/dev/null || true
+    printf "%b" "$NEWLIST" > "$BANNED_LIST.tmp.$$" 2>/dev/null && \
+        mv "$BANNED_LIST.tmp.$$" "$BANNED_LIST" 2>/dev/null || true
+}
+
+# reconcile_bans (BUG-004/D6): state files and the kernel drifted apart
+# across reboots - bans were recorded in BANNED_LIST but the iptables
+# rules were gone, while the loop skipped those IPs as "already banned".
+# At startup, re-apply every unexpired ban to the kernel; expiry (with
+# the D3 probation transition) is handled by unban_expired right after.
+reconcile_bans() {
+    [ -f "$BANNED_LIST" ] || return 0
+    local now ip ts duration
+    now=$(date +%s)
+    while read -r ip ts duration; do
+        [ -z "$ip" ] && continue
+        ts="${ts//[^0-9]/}"; ts="${ts:-0}"
+        duration="${duration//[^0-9]/}"; duration="${duration:-14400}"
+        [ $(( ts + duration )) -le "$now" ] && continue
+        case "$ip" in
+            */*) iptables -C INPUT -s "$ip" -m comment --comment "subnet-ban" -j DROP 2>/dev/null || \
+                 iptables -I INPUT -s "$ip" -m comment --comment "subnet-ban" -j DROP 2>/dev/null || true ;;
+            *)   iptables -C INPUT -s "$ip" -m comment --comment "auto-ban" -j DROP 2>/dev/null || \
+                 iptables -I INPUT -s "$ip" -m comment --comment "auto-ban" -j DROP 2>/dev/null || true ;;
+        esac
+    done < "$BANNED_LIST"
+    unban_expired
+    unban_subnet_expired
+    log " RECONCILE: unexpired bans re-applied to iptables from state"
 }
 
 # FR-2 watchdog (D2): if a DROP rule or throttle entry ever targets one
@@ -4623,10 +4815,12 @@ self_guard() {
         done < <(iptables -S INPUT 2>/dev/null | grep -E -- "-s ${_esc}(/32)?[[:space:]]" | grep -- '-j DROP' | sed 's/^-A /INPUT /')
     done
     if [ -f "$THROTTLE_LIST" ]; then
+        local _prio
         for _sip in "${SELF_IPS[@]}"; do
-            if grep -q "^${_sip} " "$THROTTLE_LIST" 2>/dev/null; then
-                unthrottle_ip "$_sip" hard 2>/dev/null || true
-                unthrottle_ip "$_sip" soft 2>/dev/null || true
+            if state_has_ip "$THROTTLE_LIST" "$_sip"; then
+                _prio=$(state_get_field "$THROTTLE_LIST" "$_sip" 2)
+                [ -n "$_prio" ] && tc filter del dev "$IF" parent 1: prio "$_prio" 2>/dev/null || true
+                state_del_ip "$THROTTLE_LIST" "$_sip"
                 log " SELF-GUARD: removed throttle state for own IP $_sip"
             fi
         done
@@ -4641,6 +4835,10 @@ score_init
 # may have been rebuilt without them - see reapply_throttles, BUG-022).
 reapply_throttles
 
+# Re-apply recorded bans to the kernel (BUG-004) and expire the stale
+# ones through the D3 transition.
+reconcile_bans
+
 CYCLE=0
 while true; do
     CYCLE=$((CYCLE + 1))
@@ -4651,10 +4849,17 @@ while true; do
     # Every cycle: enforce self-IP immunity (cheap; iptables -S scan)
     self_guard
 
-    # Measure active connections per IP (accurate, zero CPU overhead)
-    # Normal user: 5-20 connections. Attacker: 100s-1000s.
+    # Measure active connections per IP. Counting definition (BUG-030):
+    # only ESTABLISHED and SYN-RECV sockets count (the old `ss -tn`
+    # sample also counted TIME-WAIT/CLOSING states), and flows whose
+    # LOCAL port is ephemeral (>=32768) are the server's own OUTBOUND
+    # connections - the peer of an outbound flow is not an attacker.
     declare -A CONN_COUNT
-    SS_OUT=$(ss -tn 2>/dev/null | awk 'NR>1{print $5}' | \
+    SS_OUT=$({ ss -tnH state established 2>/dev/null; ss -tnH state syn-recv 2>/dev/null; } | \
+        awk '{ split($4, L, ":"); lp = L[length(L)];
+               if (lp !~ /^[0-9]+$/) next;
+               if (lp >= 32768) next;
+               print $5 }' | \
         grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | \
         sort | uniq -c | sort -rn | head -100 || true)
     if [ -n "$SS_OUT" ]; then
@@ -4675,7 +4880,7 @@ while true; do
         is_exempt "$ip" && continue
 
         # Skip already banned
-        grep -qF "$ip" "$BANNED_LIST" 2>/dev/null && continue
+        state_has_ip "$BANNED_LIST" "$ip" && continue
 
         # Reputation scoring: adjust score for this sample and enforce band.
         # Uses the connection count and the interval since the last sample.
@@ -4683,34 +4888,36 @@ while true; do
 
         # Immediate action if way over limit (≥ BAN_CONN_THRESHOLD conns)
         if [ "${count:-0}" -ge "$BAN_CONN_THRESHOLD" ]; then
-            if ! grep -qF "$ip" "$THROTTLE_LIST" 2>/dev/null; then
+            if ! state_has_ip "$THROTTLE_LIST" "$ip"; then
                 throttle_ip "$ip"
             fi
             ban_ip "$ip"
-            sed -i "/$ip/d" "$WATCH_LIST" 2>/dev/null || true
+            rep_on_ban "$ip"
+            state_del_ip "$WATCH_LIST" "$ip"
             log " INSTANT BAN: $ip | ${count} active connections (>=${BAN_CONN_THRESHOLD})"
             continue
         fi
 
-        if grep -qF "$ip" "$WATCH_LIST" 2>/dev/null; then
+        if state_has_ip "$WATCH_LIST" "$ip"; then
             # Was being watched — check if still high
-            WATCH_START=$(grep -F "$ip" "$WATCH_LIST" | awk '{print $2}' | head -1)
+            WATCH_START=$(state_get_field "$WATCH_LIST" "$ip" 2)
             WATCH_START="${WATCH_START//[^0-9]/}"
             NOW=$(date +%s)
             ELAPSED=$(( NOW - ${WATCH_START:-$NOW} ))
 
             if [ "$ELAPSED" -ge "$OBSERVE_SECONDS" ]; then
                 # Watched for full period and still high
-                if grep -qF "$ip" "$THROTTLE_LIST" 2>/dev/null; then
-                    # Already throttled — now ban
+                if state_has_ip "$THROTTLE_LIST" "$ip"; then
+                    # Already throttled — now ban (ban_ip cleans the
+                    # throttle filter + its state entry itself)
                     ban_ip "$ip"
-                    sed -i "/$ip/d" "$WATCH_LIST" 2>/dev/null || true
-                    sed -i "/$ip/d" "$THROTTLE_LIST" 2>/dev/null || true
+                    rep_on_ban "$ip"
+                    state_del_ip "$WATCH_LIST" "$ip"
                 else
                     # Not yet throttled — throttle now
                     throttle_ip "$ip"
                     # Reset watch timer
-                    sed -i "/$ip/d" "$WATCH_LIST" 2>/dev/null || true
+                    state_del_ip "$WATCH_LIST" "$ip"
                     echo "$ip $(date +%s)" >> "$WATCH_LIST"
                 fi
             fi
@@ -4726,8 +4933,8 @@ while true; do
         [ -z "$ip" ] && continue
         # If IP is now below threshold and not being throttled, remove from watch
         if [ "${CONN_COUNT[$ip]:-0}" -lt "$CONN_THRESHOLD" ] && \
-           ! grep -qF "$ip" "$THROTTLE_LIST" 2>/dev/null; then
-            sed -i "/$ip/d" "$WATCH_LIST" 2>/dev/null || true
+           ! state_has_ip "$THROTTLE_LIST" "$ip"; then
+            state_del_ip "$WATCH_LIST" "$ip"
         fi
     done < "$WATCH_LIST" 2>/dev/null || true
 
@@ -4739,7 +4946,7 @@ while true; do
     while IFS=' ' read -r ip ts; do
         [ -z "$ip" ] && continue
         is_exempt "$ip" && continue
-        grep -qF "$ip" "$BANNED_LIST" 2>/dev/null && continue
+        state_has_ip "$BANNED_LIST" "$ip" && continue
         # Still hot → keep throttled, let scoring manage it.
         [ "${CONN_COUNT[$ip]:-0}" -ge "$CONN_THRESHOLD" ] && continue
         # Not banned, no longer hot → release to normal class (1:20).
@@ -4747,12 +4954,11 @@ while true; do
         # 'parent 1:' delete, and never a competing add — an added release
         # filter would out-prio the throttle band and permanently defeat
         # re-throttling of this IP, plus it would accumulate on the iface).
-        _RELEASE_PRIO=$(grep -F "$ip " "$THROTTLE_LIST" 2>/dev/null | \
-                        awk '{print $2}' | head -1 || true)
+        _RELEASE_PRIO=$(state_get_field "$THROTTLE_LIST" "$ip" 2)
         [ -n "$_RELEASE_PRIO" ] && \
             tc filter del dev "$IF" parent 1: prio "$_RELEASE_PRIO" 2>/dev/null || true
-        sed -i "/^$ip /d" "$THROTTLE_LIST" 2>/dev/null || true
-        sed -i "/$ip/d" "$WATCH_LIST" 2>/dev/null || true
+        state_del_ip "$THROTTLE_LIST" "$ip"
+        state_del_ip "$WATCH_LIST" "$ip"
         clear_reputation "$ip"
         log " AUTO-RELEASE: $ip (calmed down) → normal class (1:20)"
     done < "$THROTTLE_LIST" 2>/dev/null || true
@@ -4762,6 +4968,9 @@ while true; do
     # where each attacker IP stays under the per-IP threshold.
     declare -A SUBNET_COUNT
     for ip in "${!CONN_COUNT[@]}"; do
+        # BUG-011: exempt traffic (CF/self/whitelist) never counts toward
+        # a subnet ban - it used to inflate the totals.
+        is_exempt "$ip" && continue
         subnet=$(echo "$ip" | grep -oP '^\d+\.\d+\.\d+')
         [ -z "$subnet" ] && continue
         SUBNET_COUNT["$subnet"]=$(( ${SUBNET_COUNT[$subnet]:-0} + ${CONN_COUNT[$ip]:-0} ))
@@ -4770,8 +4979,8 @@ while true; do
     for subnet in "${!SUBNET_COUNT[@]}"; do
         total="${SUBNET_COUNT[$subnet]:-0}"
         [ "$total" -lt "$SUBNET_THRESHOLD" ] && continue
-        # Skip if CF subnet
-        is_cf_ip "${subnet}.1" 2>/dev/null && continue
+        # Skip if a CF range overlaps this /24 (real overlap test)
+        subnet_overlaps_cf "$subnet" && continue
         # Already banned as subnet?
         iptables -C INPUT -s "${subnet}.0/24" -m comment --comment "subnet-ban" \
             -j DROP 2>/dev/null && continue
@@ -4780,17 +4989,22 @@ while true; do
             ban_subnet "$subnet"
         else
             # Watch mode: log first sighting
-            if ! grep -qF "$subnet" "$SUBNET_WATCH_LIST" 2>/dev/null; then
+            if ! state_has_ip "$SUBNET_WATCH_LIST" "$subnet"; then
                 echo "$subnet $(date +%s)" >> "$SUBNET_WATCH_LIST"
                 log " SUBNET WATCHING: ${subnet}.0/24 | ${total} total conns from subnet"
             else
-                SWATCH_START=$(grep -F "$subnet" "$SUBNET_WATCH_LIST" | awk '{print $2}' | head -1)
+                SWATCH_START=$(state_get_field "$SUBNET_WATCH_LIST" "$subnet" 2)
                 SWATCH_START="${SWATCH_START//[^0-9]/}"; SWATCH_START="${SWATCH_START:-$(date +%s)}"
                 SELAPSED=$(( $(date +%s) - SWATCH_START ))
-                if [ "$SELAPSED" -ge "$OBSERVE_SECONDS" ]; then
+                # BUG-011: the sustained path may only ban at the BAN
+                # threshold. Sustained traffic at the WATCH level (400)
+                # for OBSERVE_SECONDS used to ban a /24 the design says
+                # to merely watch - the effective trigger was 400/45s,
+                # not the documented 1000.
+                if [ "$SELAPSED" -ge "$OBSERVE_SECONDS" ] && [ "$total" -ge "$SUBNET_BAN_THRESHOLD" ]; then
                     log " SUBNET HIGH: ${subnet}.0/24 | ${total} conns for ${SELAPSED}s → banning"
                     ban_subnet "$subnet"
-                    sed -i "/$subnet/d" "$SUBNET_WATCH_LIST" 2>/dev/null || true
+                    state_del_ip "$SUBNET_WATCH_LIST" "$subnet"
                 fi
             fi
         fi
@@ -4800,9 +5014,12 @@ while true; do
     while IFS=' ' read -r subnet ts; do
         [ -z "$subnet" ] && continue
         if [ "${SUBNET_COUNT[$subnet]:-0}" -lt "$SUBNET_THRESHOLD" ]; then
-            sed -i "/$subnet/d" "$SUBNET_WATCH_LIST" 2>/dev/null || true
+            state_del_ip "$SUBNET_WATCH_LIST" "$subnet"
         fi
     done < "$SUBNET_WATCH_LIST" 2>/dev/null || true
+
+    # Recovery for quiet IPs (D3): hot IPs were handled by update_score.
+    reputation_sweep
 
     unset CONN_COUNT SUBNET_COUNT
 done
@@ -5027,6 +5244,20 @@ EOF
     systemctl daemon-reload
     systemctl enable antiddos-restore.service >/dev/null 2>&1
     success "iptables persistence: enabled (antiddos-restore)"
+
+    # Log rotation (BUG-045): the daemon logs every cycle's events with
+    # no rotation - an unbounded /var/log/auto-ban.log on a busy box.
+    cat > /etc/logrotate.d/nexoshield << 'LREOF'
+/var/log/auto-ban.log /var/log/antiddos.log {
+    weekly
+    rotate 4
+    compress
+    missingok
+    notifempty
+    copytruncate
+}
+LREOF
+    success "logrotate: /etc/logrotate.d/nexoshield"
 }
 
 # ════════════════════════════════════════════════

@@ -14,12 +14,42 @@ unban_expired() {
             [[ "$ip" == *"/"* ]] && NEWLIST="${NEWLIST}${ip} ${ts} ${duration}\n" && continue
             iptables -D INPUT -s "$ip" -m comment --comment "auto-ban" -j DROP \
                 2>/dev/null || true
-            log " UNBANNED: $ip (ban expired)"
+            # D3 (FR-3): expiry is a probation release, never a return to
+            # a stale low score - identical for every ban path.
+            rep_on_unban "$ip"
+            log " UNBANNED: $ip (ban expired) → probation (score $PROBATION_SCORE, ${PROBATION_SECONDS}s)"
         else
             NEWLIST="${NEWLIST}${ip} ${ts} ${duration}\n"
         fi
     done < "$BANNED_LIST"
-    printf "%b" "$NEWLIST" > "$BANNED_LIST" 2>/dev/null || true
+    printf "%b" "$NEWLIST" > "$BANNED_LIST.tmp.$$" 2>/dev/null && \
+        mv "$BANNED_LIST.tmp.$$" "$BANNED_LIST" 2>/dev/null || true
+}
+
+# reconcile_bans (BUG-004/D6): state files and the kernel drifted apart
+# across reboots - bans were recorded in BANNED_LIST but the iptables
+# rules were gone, while the loop skipped those IPs as "already banned".
+# At startup, re-apply every unexpired ban to the kernel; expiry (with
+# the D3 probation transition) is handled by unban_expired right after.
+reconcile_bans() {
+    [ -f "$BANNED_LIST" ] || return 0
+    local now ip ts duration
+    now=$(date +%s)
+    while read -r ip ts duration; do
+        [ -z "$ip" ] && continue
+        ts="${ts//[^0-9]/}"; ts="${ts:-0}"
+        duration="${duration//[^0-9]/}"; duration="${duration:-14400}"
+        [ $(( ts + duration )) -le "$now" ] && continue
+        case "$ip" in
+            */*) iptables -C INPUT -s "$ip" -m comment --comment "subnet-ban" -j DROP 2>/dev/null || \
+                 iptables -I INPUT -s "$ip" -m comment --comment "subnet-ban" -j DROP 2>/dev/null || true ;;
+            *)   iptables -C INPUT -s "$ip" -m comment --comment "auto-ban" -j DROP 2>/dev/null || \
+                 iptables -I INPUT -s "$ip" -m comment --comment "auto-ban" -j DROP 2>/dev/null || true ;;
+        esac
+    done < "$BANNED_LIST"
+    unban_expired
+    unban_subnet_expired
+    log " RECONCILE: unexpired bans re-applied to iptables from state"
 }
 
 # FR-2 watchdog (D2): if a DROP rule or throttle entry ever targets one
@@ -40,10 +70,12 @@ self_guard() {
         done < <(iptables -S INPUT 2>/dev/null | grep -E -- "-s ${_esc}(/32)?[[:space:]]" | grep -- '-j DROP' | sed 's/^-A /INPUT /')
     done
     if [ -f "$THROTTLE_LIST" ]; then
+        local _prio
         for _sip in "${SELF_IPS[@]}"; do
-            if grep -q "^${_sip} " "$THROTTLE_LIST" 2>/dev/null; then
-                unthrottle_ip "$_sip" hard 2>/dev/null || true
-                unthrottle_ip "$_sip" soft 2>/dev/null || true
+            if state_has_ip "$THROTTLE_LIST" "$_sip"; then
+                _prio=$(state_get_field "$THROTTLE_LIST" "$_sip" 2)
+                [ -n "$_prio" ] && tc filter del dev "$IF" parent 1: prio "$_prio" 2>/dev/null || true
+                state_del_ip "$THROTTLE_LIST" "$_sip"
                 log " SELF-GUARD: removed throttle state for own IP $_sip"
             fi
         done
@@ -58,6 +90,10 @@ score_init
 # may have been rebuilt without them - see reapply_throttles, BUG-022).
 reapply_throttles
 
+# Re-apply recorded bans to the kernel (BUG-004) and expire the stale
+# ones through the D3 transition.
+reconcile_bans
+
 CYCLE=0
 while true; do
     CYCLE=$((CYCLE + 1))
@@ -68,10 +104,17 @@ while true; do
     # Every cycle: enforce self-IP immunity (cheap; iptables -S scan)
     self_guard
 
-    # Measure active connections per IP (accurate, zero CPU overhead)
-    # Normal user: 5-20 connections. Attacker: 100s-1000s.
+    # Measure active connections per IP. Counting definition (BUG-030):
+    # only ESTABLISHED and SYN-RECV sockets count (the old `ss -tn`
+    # sample also counted TIME-WAIT/CLOSING states), and flows whose
+    # LOCAL port is ephemeral (>=32768) are the server's own OUTBOUND
+    # connections - the peer of an outbound flow is not an attacker.
     declare -A CONN_COUNT
-    SS_OUT=$(ss -tn 2>/dev/null | awk 'NR>1{print $5}' | \
+    SS_OUT=$({ ss -tnH state established 2>/dev/null; ss -tnH state syn-recv 2>/dev/null; } | \
+        awk '{ split($4, L, ":"); lp = L[length(L)];
+               if (lp !~ /^[0-9]+$/) next;
+               if (lp >= 32768) next;
+               print $5 }' | \
         grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | \
         sort | uniq -c | sort -rn | head -100 || true)
     if [ -n "$SS_OUT" ]; then
@@ -92,7 +135,7 @@ while true; do
         is_exempt "$ip" && continue
 
         # Skip already banned
-        grep -qF "$ip" "$BANNED_LIST" 2>/dev/null && continue
+        state_has_ip "$BANNED_LIST" "$ip" && continue
 
         # Reputation scoring: adjust score for this sample and enforce band.
         # Uses the connection count and the interval since the last sample.
@@ -100,34 +143,36 @@ while true; do
 
         # Immediate action if way over limit (≥ BAN_CONN_THRESHOLD conns)
         if [ "${count:-0}" -ge "$BAN_CONN_THRESHOLD" ]; then
-            if ! grep -qF "$ip" "$THROTTLE_LIST" 2>/dev/null; then
+            if ! state_has_ip "$THROTTLE_LIST" "$ip"; then
                 throttle_ip "$ip"
             fi
             ban_ip "$ip"
-            sed -i "/$ip/d" "$WATCH_LIST" 2>/dev/null || true
+            rep_on_ban "$ip"
+            state_del_ip "$WATCH_LIST" "$ip"
             log " INSTANT BAN: $ip | ${count} active connections (>=${BAN_CONN_THRESHOLD})"
             continue
         fi
 
-        if grep -qF "$ip" "$WATCH_LIST" 2>/dev/null; then
+        if state_has_ip "$WATCH_LIST" "$ip"; then
             # Was being watched — check if still high
-            WATCH_START=$(grep -F "$ip" "$WATCH_LIST" | awk '{print $2}' | head -1)
+            WATCH_START=$(state_get_field "$WATCH_LIST" "$ip" 2)
             WATCH_START="${WATCH_START//[^0-9]/}"
             NOW=$(date +%s)
             ELAPSED=$(( NOW - ${WATCH_START:-$NOW} ))
 
             if [ "$ELAPSED" -ge "$OBSERVE_SECONDS" ]; then
                 # Watched for full period and still high
-                if grep -qF "$ip" "$THROTTLE_LIST" 2>/dev/null; then
-                    # Already throttled — now ban
+                if state_has_ip "$THROTTLE_LIST" "$ip"; then
+                    # Already throttled — now ban (ban_ip cleans the
+                    # throttle filter + its state entry itself)
                     ban_ip "$ip"
-                    sed -i "/$ip/d" "$WATCH_LIST" 2>/dev/null || true
-                    sed -i "/$ip/d" "$THROTTLE_LIST" 2>/dev/null || true
+                    rep_on_ban "$ip"
+                    state_del_ip "$WATCH_LIST" "$ip"
                 else
                     # Not yet throttled — throttle now
                     throttle_ip "$ip"
                     # Reset watch timer
-                    sed -i "/$ip/d" "$WATCH_LIST" 2>/dev/null || true
+                    state_del_ip "$WATCH_LIST" "$ip"
                     echo "$ip $(date +%s)" >> "$WATCH_LIST"
                 fi
             fi
@@ -143,8 +188,8 @@ while true; do
         [ -z "$ip" ] && continue
         # If IP is now below threshold and not being throttled, remove from watch
         if [ "${CONN_COUNT[$ip]:-0}" -lt "$CONN_THRESHOLD" ] && \
-           ! grep -qF "$ip" "$THROTTLE_LIST" 2>/dev/null; then
-            sed -i "/$ip/d" "$WATCH_LIST" 2>/dev/null || true
+           ! state_has_ip "$THROTTLE_LIST" "$ip"; then
+            state_del_ip "$WATCH_LIST" "$ip"
         fi
     done < "$WATCH_LIST" 2>/dev/null || true
 
@@ -156,7 +201,7 @@ while true; do
     while IFS=' ' read -r ip ts; do
         [ -z "$ip" ] && continue
         is_exempt "$ip" && continue
-        grep -qF "$ip" "$BANNED_LIST" 2>/dev/null && continue
+        state_has_ip "$BANNED_LIST" "$ip" && continue
         # Still hot → keep throttled, let scoring manage it.
         [ "${CONN_COUNT[$ip]:-0}" -ge "$CONN_THRESHOLD" ] && continue
         # Not banned, no longer hot → release to normal class (1:20).
@@ -164,12 +209,11 @@ while true; do
         # 'parent 1:' delete, and never a competing add — an added release
         # filter would out-prio the throttle band and permanently defeat
         # re-throttling of this IP, plus it would accumulate on the iface).
-        _RELEASE_PRIO=$(grep -F "$ip " "$THROTTLE_LIST" 2>/dev/null | \
-                        awk '{print $2}' | head -1 || true)
+        _RELEASE_PRIO=$(state_get_field "$THROTTLE_LIST" "$ip" 2)
         [ -n "$_RELEASE_PRIO" ] && \
             tc filter del dev "$IF" parent 1: prio "$_RELEASE_PRIO" 2>/dev/null || true
-        sed -i "/^$ip /d" "$THROTTLE_LIST" 2>/dev/null || true
-        sed -i "/$ip/d" "$WATCH_LIST" 2>/dev/null || true
+        state_del_ip "$THROTTLE_LIST" "$ip"
+        state_del_ip "$WATCH_LIST" "$ip"
         clear_reputation "$ip"
         log " AUTO-RELEASE: $ip (calmed down) → normal class (1:20)"
     done < "$THROTTLE_LIST" 2>/dev/null || true
@@ -179,6 +223,9 @@ while true; do
     # where each attacker IP stays under the per-IP threshold.
     declare -A SUBNET_COUNT
     for ip in "${!CONN_COUNT[@]}"; do
+        # BUG-011: exempt traffic (CF/self/whitelist) never counts toward
+        # a subnet ban - it used to inflate the totals.
+        is_exempt "$ip" && continue
         subnet=$(echo "$ip" | grep -oP '^\d+\.\d+\.\d+')
         [ -z "$subnet" ] && continue
         SUBNET_COUNT["$subnet"]=$(( ${SUBNET_COUNT[$subnet]:-0} + ${CONN_COUNT[$ip]:-0} ))
@@ -187,8 +234,8 @@ while true; do
     for subnet in "${!SUBNET_COUNT[@]}"; do
         total="${SUBNET_COUNT[$subnet]:-0}"
         [ "$total" -lt "$SUBNET_THRESHOLD" ] && continue
-        # Skip if CF subnet
-        is_cf_ip "${subnet}.1" 2>/dev/null && continue
+        # Skip if a CF range overlaps this /24 (real overlap test)
+        subnet_overlaps_cf "$subnet" && continue
         # Already banned as subnet?
         iptables -C INPUT -s "${subnet}.0/24" -m comment --comment "subnet-ban" \
             -j DROP 2>/dev/null && continue
@@ -197,17 +244,22 @@ while true; do
             ban_subnet "$subnet"
         else
             # Watch mode: log first sighting
-            if ! grep -qF "$subnet" "$SUBNET_WATCH_LIST" 2>/dev/null; then
+            if ! state_has_ip "$SUBNET_WATCH_LIST" "$subnet"; then
                 echo "$subnet $(date +%s)" >> "$SUBNET_WATCH_LIST"
                 log " SUBNET WATCHING: ${subnet}.0/24 | ${total} total conns from subnet"
             else
-                SWATCH_START=$(grep -F "$subnet" "$SUBNET_WATCH_LIST" | awk '{print $2}' | head -1)
+                SWATCH_START=$(state_get_field "$SUBNET_WATCH_LIST" "$subnet" 2)
                 SWATCH_START="${SWATCH_START//[^0-9]/}"; SWATCH_START="${SWATCH_START:-$(date +%s)}"
                 SELAPSED=$(( $(date +%s) - SWATCH_START ))
-                if [ "$SELAPSED" -ge "$OBSERVE_SECONDS" ]; then
+                # BUG-011: the sustained path may only ban at the BAN
+                # threshold. Sustained traffic at the WATCH level (400)
+                # for OBSERVE_SECONDS used to ban a /24 the design says
+                # to merely watch - the effective trigger was 400/45s,
+                # not the documented 1000.
+                if [ "$SELAPSED" -ge "$OBSERVE_SECONDS" ] && [ "$total" -ge "$SUBNET_BAN_THRESHOLD" ]; then
                     log " SUBNET HIGH: ${subnet}.0/24 | ${total} conns for ${SELAPSED}s → banning"
                     ban_subnet "$subnet"
-                    sed -i "/$subnet/d" "$SUBNET_WATCH_LIST" 2>/dev/null || true
+                    state_del_ip "$SUBNET_WATCH_LIST" "$subnet"
                 fi
             fi
         fi
@@ -217,9 +269,12 @@ while true; do
     while IFS=' ' read -r subnet ts; do
         [ -z "$subnet" ] && continue
         if [ "${SUBNET_COUNT[$subnet]:-0}" -lt "$SUBNET_THRESHOLD" ]; then
-            sed -i "/$subnet/d" "$SUBNET_WATCH_LIST" 2>/dev/null || true
+            state_del_ip "$SUBNET_WATCH_LIST" "$subnet"
         fi
     done < "$SUBNET_WATCH_LIST" 2>/dev/null || true
+
+    # Recovery for quiet IPs (D3): hot IPs were handled by update_score.
+    reputation_sweep
 
     unset CONN_COUNT SUBNET_COUNT
 done

@@ -43,7 +43,7 @@ reapply_throttles() {
 throttle_ip() {
     local ip="$1"
     is_exempt "$ip" && return 0
-    grep -qF "$ip " "$THROTTLE_LIST" 2>/dev/null && return 0
+    state_has_ip "$THROTTLE_LIST" "$ip" && return 0
     # BUG-024: never record state for a throttle that does not exist.
     # In autoban-only mode there are no tc classes at all - say so.
     if ! tc_class_exists 1:30; then
@@ -74,9 +74,9 @@ hard_throttle_ip() {
     # Drop any earlier throttle entry for this IP so the tc filter list stays
     # consistent and no stale prio is left behind (its filter would still match).
     local _OLD
-    _OLD=$(grep -F "$ip " "$THROTTLE_LIST" 2>/dev/null | awk '{print $2}' | head -1 || true)
+    _OLD=$(state_get_field "$THROTTLE_LIST" "$ip" 2)
     [ -n "$_OLD" ] && tc filter del dev "$IF" parent 1: prio "$_OLD" 2>/dev/null || true
-    sed -i "/^$ip /d" "$THROTTLE_LIST" 2>/dev/null || true
+    state_del_ip "$THROTTLE_LIST" "$ip"
     # Pick the strongest class that actually exists (BUG-024: state is
     # written only after the filter lands).
     local FLOW=""
@@ -107,7 +107,7 @@ ban_ip() {
         return 1
     fi
     is_exempt "$ip" && return 0
-    grep -qF "$ip " "$BANNED_LIST" 2>/dev/null && return 0
+    state_has_ip "$BANNED_LIST" "$ip" && return 0
     local UNBAN_TIME
     UNBAN_TIME=$(date -d "+${BAN_HOURS} hours" '+%H:%M:%S' 2>/dev/null || \
                  date -v "+${BAN_HOURS}H" '+%H:%M:%S' 2>/dev/null || echo "N/A")
@@ -118,9 +118,9 @@ ban_ip() {
     # EVERY filter including the Cloudflare + server-own whitelist, which would
     # throttle CF traffic. We remove the one filter recorded for this IP.
     local _PRIO
-    _PRIO=$(grep -F "$ip " "$THROTTLE_LIST" 2>/dev/null | awk '{print $2}' | head -1 || true)
+    _PRIO=$(state_get_field "$THROTTLE_LIST" "$ip" 2)
     [ -n "$_PRIO" ] && tc filter del dev "$IF" parent 1: prio "$_PRIO" 2>/dev/null || true
-    sed -i "/^$ip /d" "$THROTTLE_LIST" 2>/dev/null || true
+    state_del_ip "$THROTTLE_LIST" "$ip"
     log " BANNED: $ip | unban: $UNBAN_TIME"
 }
 
