@@ -31,5 +31,10 @@ has "$F" 'fail2ban-client -t'
 has "$F" 'systemctl is-active --quiet fail2ban'
 has "$F" 'service is NOT running after apply'
 
-echo "field fixes (T-1/T-2): $pass passed, $fail failed"
+# T-3: legacy-C retry for GCC >= 14 (3proxy 0.9.4 is pre-C23)
+I=src/modules/3proxy/40-install.sh
+has "$I" 'Wno-error=implicit-function-declaration'
+has "$I" 'legacy-C compatibility flags'
+
+echo "field fixes (T-1/T-2/T-3): $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

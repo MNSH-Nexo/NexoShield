@@ -59,6 +59,28 @@ log/stats readers resolve the newest `access.log*`.
 - Sampler: SYN-RECV is now counted per-IP separately (`SYN_COUNT`) so
   scoring can see half-open floods.
 
+## Round 2 — same day, AWS (Ubuntu 26.04, GCC 15.2, 1 GB RAM)
+
+The fixed build (a8e02e2) was installed on a fresh AWS Ubuntu 26.04
+instance. New results:
+
+- **fail2ban came up clean with zero manual remediation** — all
+  applicable jails active on first boot of the fixed code, and
+  http-flood correctly stayed disabled (no web-server logs on the
+  box), exactly as the T-1 fix intends.
+- **T-3 (High) — 3proxy source build broken on GCC ≥ 14.** Ubuntu
+  26.04 ships GCC 15.2 (C23 by default); 3proxy 0.9.4 is pre-C23 C and
+  the plain `make -f Makefile.Linux` fails, so the whole proxy install
+  aborted. (The pinned SHA-256 check passed — the tarball is fine;
+  only the compile was broken.) **Fix:** the installer retries once
+  with legacy-C compatibility flags
+  (`-std=gnu17 -Wno-error=implicit-function-declaration -Wno-error=implicit-int
+  -Wno-error=incompatible-pointer-types -Wno-error=return-mismatch`),
+  and the retry was **verified live on the same box**: clean compile,
+  service active, SOCKS5 listening on :1080.
+- Also confirmed: `T3PROXY_SHA256` is filled and enforced (download
+  verification ran before the compile step).
+
 ## Not yet verified live ⚠️
 
 The controlled attack battery (connection flood with ground-truth
