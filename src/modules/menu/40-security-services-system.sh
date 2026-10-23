@@ -3,11 +3,8 @@
 menu_security() {
     while true; do
         ui_title "Security"
-        echo -e "  ${C}1.${NC} Blocked IPs (all)       ${C}2.${NC} Block IP"
-        echo -e "  ${C}3.${NC} Unblock IP              ${C}4.${NC} iptables rules"
-        echo -e "  ${C}5.${NC} SSH brute force          ${C}6.${NC} Auto-ban status"
-        echo -e "  ${C}0.${NC} Back"; echo ""
-        echo -e "  ${DIM}──────────────────────────────────────────────────${NC}"
+        ui_options "1|Blocked IPs (all)" "2|Block IP" "3|Unblock IP" \
+            "4|iptables rules" "5|SSH brute force" "6|Auto-ban status" "0|Back"
         ui_input CH "  Enter number: "
         case "$CH" in
              1) clear 2>/dev/null || true
@@ -15,15 +12,22 @@ menu_security() {
                fail2ban-client status 2>/dev/null | grep "Jail list" | \
                    sed 's/.*://g' | tr ',' '\n' | while read -r j; do
                    j=$(echo "$j" | tr -d ' '); [ -z "$j" ] && continue
+                   # U-3: the count is the "Currently banned:" total.
+                   # The old parse took the last number on the
+                   # "Banned IP list:" line - the last octet of the
+                   # last banned IP, not a count at all.
                    BCOUNT=$(fail2ban-client status "$j" 2>/dev/null | \
-                       grep "Banned IP" | grep -oP '\d+$' || echo 0)
+                       grep -oP 'Currently banned:\s*\K\d+' || echo 0)
                    [ "${BCOUNT:-0}" -gt 0 ] && echo -e "  ${Y}$j${NC}: $BCOUNT IPs"
                done
                echo ""
-               echo -e "  ${C}iptables DROP rules:${NC}"
-               iptables -L INPUT -n 2>/dev/null | grep DROP | \
-                   grep -oP '\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}' | \
-                   while read -r ip; do echo -e "  ${R}$ip${NC}"; done | head -30
+               echo -e "  ${C}auto-ban bans (state):${NC}"
+               if [ -s "$NX_STATE_DIR/banned.list" ]; then
+                   awk '{print $1}' "$NX_STATE_DIR/banned.list" | head -30 | \
+                       while read -r ip; do echo -e "  ${R}$ip${NC}"; done
+               else
+                   echo -e "  ${DIM}(none)${NC}"
+               fi
                press_enter ;;
             2) echo -e "  ${C}Block IP${NC}"; echo ""
                ui_input BIP "  Enter IP or CIDR to block (e.g. 1.2.3.4 or 1.2.3.0/24): "
@@ -44,30 +48,28 @@ menu_security() {
                press_enter ;;
             3) echo -e "  ${C}Unblock IP${NC}"; echo ""
                ui_input UIP "  Enter IP to unblock: "
-               [ -n "$UIP" ] && {
-                   iptables -D INPUT -s "$UIP" -j DROP 2>/dev/null && ok "iptables: unblocked" || true
-                   # Remove from auto-ban if running
-                   [ -f /opt/proxy-manager/auto-ban.sh ] && {
-                       # Remove ONLY this IP's throttle filter (never 'parent 1:'
-                       # bare — that deletes every filter incl. the CF whitelist).
-                       local _IFP _PRIO
-                       _IFP=$(ip route show default | awk '/default/{print $5}' | head -1)
-                       _PRIO=$(grep -F "$UIP " /tmp/autoban_throttle 2>/dev/null | \
-                               awk '{print $2}' | head -1 || true)
-                       [ -n "$_PRIO" ] && tc filter del dev "$_IFP" parent 1: prio "$_PRIO" 2>/dev/null || true
-                       sed -i "/^$UIP /d" /tmp/autoban_throttle 2>/dev/null || true
-                   }
-                   fail2ban-client status 2>/dev/null | grep "Jail list" | \
-                       sed 's/.*://;s/,/\n/g' | tr -d ' ' | while read -r j; do
-                       [ -z "$j" ] && continue
-                       fail2ban-client set "$j" unbanip "$UIP" 2>/dev/null && \
-                           ok "fail2ban $j: unblocked" || true
-                   done
-               }
+               if [ -n "$UIP" ]; then
+                   # U-2: the shared engine-grade unban (exact tagged
+                   # deletes + state edits + throttle cleanup +
+                   # fail2ban). The old inline copy deleted a rule
+                   # spec the daemon never creates and never touched
+                   # banned.list, so the IP was re-banned on the
+                   # daemon's next reconcile.
+                   nx_unban_ip "$UIP"
+                   ok "$UIP unblocked (all layers)"
+               else
+                   warn "No IP entered"
+               fi
                press_enter ;;
             4) iptables -L INPUT -n -v --line-numbers 2>/dev/null | head -40; press_enter ;;
-            5) grep 'Failed password\|Invalid user' /var/log/auth.log 2>/dev/null | \
-               grep -oP 'from \K[\d.]+' | sort | uniq -c | sort -rn | head -15 | \
+            5) # Journal fallback (T-1 class): auth.log may not exist
+               # on journal-only images.
+               if [ -s /var/log/auth.log ]; then
+                   grep 'Failed password\|Invalid user' /var/log/auth.log 2>/dev/null
+               else
+                   journalctl -u ssh -u sshd --no-pager -n 1000 2>/dev/null | \
+                       grep 'Failed password\|Invalid user'
+               fi | grep -oP 'from \K[\d.]+' | sort | uniq -c | sort -rn | head -15 | \
                awk '{printf "  %-8s %s\n", $1, $2}'
                press_enter ;;
             6) # Auto-ban status
@@ -94,7 +96,10 @@ menu_services() {
         # Build list dynamically each time (user may install/remove)
         SERVICES=()
         for S in "${ALL_POSSIBLE[@]}"; do
-            systemctl list-unit-files "${S}.service" >/dev/null 2>&1 && SERVICES+=("$S") || true
+            # U-5: bare list-unit-files exits 0 even with zero matches,
+            # so every candidate used to be listed as installed.
+            systemctl list-unit-files --no-legend "${S}.service" 2>/dev/null | \
+                grep -q . && SERVICES+=("$S") || true
         done
         # Always show 3proxy and auto-ban even if not installed yet
         for S in 3proxy auto-ban; do
@@ -143,10 +148,8 @@ menu_services() {
 menu_system() {
     while true; do
         ui_title "System"
-        echo -e "  ${C}1.${NC} Server info    ${C}2.${NC} Update"
-        echo -e "  ${C}3.${NC} Clean logs     ${C}4.${NC} Reboot"
-        echo -e "  ${C}5.${NC} Backup config  ${C}0.${NC} Back"; echo ""
-        echo -e "  ${DIM}──────────────────────────────────────────────────${NC}"
+        ui_options "1|Server info" "2|Update" "3|Clean logs" "4|Reboot" \
+            "5|Backup config" "0|Back"
         ui_input CH "  Enter number: "
         case "$CH" in
              1) clear 2>/dev/null || true
@@ -160,8 +163,7 @@ menu_system() {
                printf "  ${DIM}%-20s${NC} %s\n" "All IPs:" "$(ip -4 addr show 2>/dev/null | grep 'inet ' | grep -v '127\.' | awk '{print $2}' | tr '\n' ' ')"
                press_enter ;;
             2) echo ""
-               ui_input _UC "  Update system packages? (y/N): "
-               if [[ "$_UC" == "y" || "$_UC" == "Y" ]]; then
+               if ui_confirm "Update system packages?"; then
                    # BUG-044: the old && / || chain ran yum on Debian
                    # boxes when apt failed and printed "Update complete"
                    # either way. Branch properly, dnf first on RHEL.
@@ -190,8 +192,7 @@ menu_system() {
                ok "Freed: $(awk -v b="${BEFORE:-0}" -v a="${AFTER:-0}" 'BEGIN{printf "%.1f", (b-a)/1024}') MB"
                press_enter ;;
             4) echo ""
-               ui_input _RBC "  Reboot server now? (y/N): "
-               if [[ "$_RBC" == "y" || "$_RBC" == "Y" ]]; then
+               if ui_confirm "Reboot server now?"; then
                    ok "Rebooting in 5 seconds..."
                    sleep 5 && reboot
                else

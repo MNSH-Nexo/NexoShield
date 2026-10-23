@@ -25,10 +25,44 @@ dashboard, and the main views gained scriptable CLI equivalents.
 - **CLI parity**: `proxy-menu.sh --status` (plain-text health view),
   `--bans` (active bans with since/expires), `--version`, `--help`.
 - **U-1 (bug found during the redesign):** the Suspicious IPs screen
-  read throttled IPs from `/tmp/autoban_throttle` — a path nothing in
-  the product writes, so the section was permanently empty — and
-  scraped `iptables -L` for bans. It now reads the state files, the
-  product's source of truth.
+  scraped `iptables -L` for bans, matching on rule comments — which
+  never appear in `-L` output, so the section could never show
+  anything. It now reads `banned.list`, the source of truth.
+
+## Section audit addendum (same release)
+
+A follow-up line-by-line audit of every menu section found and
+fixed a family of stale-state bugs (full register in the commit):
+
+- **U-2** — Security → Unblock IP deleted a rule spec the daemon
+  never creates and never edited `banned.list`, so "unblocked" IPs
+  were re-banned at the next reconcile. All unban flows now share
+  one engine-grade `nx_unban_ip` in the framework.
+- **U-3** — Security → Blocked IPs showed, as a jail's ban "count",
+  the last octet of the last banned IP. It now parses fail2ban's
+  `Currently banned:` total; the auto-ban half lists state, not an
+  `iptables -L` scrape.
+- **U-5** — the Services screen listed every candidate as installed:
+  bare `systemctl list-unit-files` exits 0 even with zero matches.
+- **U-6** — SSH brute-force view reads the journal when auth.log is
+  absent (journal-only images).
+- **U-7** — Monitoring → Traffic top IPs read a log file that never
+  exists (daily rotation, T-2) *and* counted field 5 (%R, the server
+  side) instead of field 4 (%C, the client). Both fixed.
+- **U-9** — the live dashboard's "active threats" had the same
+  dead `-L` comment scrape as U-1; it reads state files now.
+- **U-10** — the log viewer's 3proxy entry resolves the dated log.
+- **U-11 (the audit's most valuable find)** — the daemon's throttle
+  state lives in `/tmp/autoban_throttle`, while the generated
+  `tc-setup.sh` has always restored throttles after reboot from
+  `/etc/antiddos/throttled.list` — a file *nothing ever wrote*. The
+  restore path was dead and every reboot silently dropped all
+  throttles. The daemon now mirrors its throttle state to the
+  persistent file each cycle and restores from it at startup;
+  displays read the live file with the mirror as fallback.
+  (An early draft of this redesign misread the situation and pointed
+  two displays at the mirror as if it were the live file; the audit
+  caught and corrected that before release.)
 
 ## Deliberately unchanged
 

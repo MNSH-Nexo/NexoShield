@@ -15,9 +15,14 @@ has "$M/60-autoban-main.sh" '--flush-autobans'
 has "$A" 'flush_autobans()'
 has "$A" "nx_delete_matching INPUT '--comment \"auto-ban\"'"
 hasnt "$M/60-autoban-main.sh" 'grep -q \x27"auto-ban"\x27'
-# BUG-038: exact unban deletes + exact state edit, both programs
+# BUG-038: exact unban deletes + exact state edit, both programs.
+# Since v3.7 the menu side lives in the shared nx_unban_ip (U-2);
+# the guard follows it there and checks both screens delegate.
 has "$A" 'awk -v x="$UIP"'
-has "$M/50-antiddos-menu.sh" 'awk -v x="$UIP"'
+has "$M/05-ui.sh" 'awk -v x="$_ip"'
+has "$M/05-ui.sh" 'nx_unban_ip()'
+has "$M/50-antiddos-menu.sh" 'nx_unban_ip "$UIP"'
+has "$M/40-security-services-system.sh" 'nx_unban_ip "$UIP"'
 hasnt "$A" 'sed -i "/${UIP}/d"'
 hasnt "$M/50-antiddos-menu.sh" 'sed -i "/$UIP/d"'
 # BUG-041: cnt() helper exists and the double-zero pattern is gone

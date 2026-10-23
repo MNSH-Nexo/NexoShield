@@ -15,6 +15,52 @@
 # NX_SCORE_FILE); production defaults are the real paths.
 NX_STATE_DIR="${NX_STATE_DIR:-/etc/antiddos}"
 NX_SCORE_FILE="${NX_SCORE_FILE:-/var/lib/antiddos/scores/reputation.dat}"
+# The daemon's LIVE throttle state is /tmp/autoban_throttle; the
+# persistent mirror (U-11) is /etc/antiddos/throttled.list. Displays
+# read the live file, falling back to the mirror right after a
+# reboot before the daemon has restored its state.
+NX_THROTTLE_LIST="${NX_THROTTLE_LIST:-/tmp/autoban_throttle}"
+NX_THROTTLE_MIRROR="${NX_THROTTLE_MIRROR:-/etc/antiddos/throttled.list}"
+nx_throttle_file() {
+    if [ -f "$NX_THROTTLE_LIST" ]; then echo "$NX_THROTTLE_LIST";
+    elif [ -f "$NX_THROTTLE_MIRROR" ]; then echo "$NX_THROTTLE_MIRROR"; fi
+}
+
+# nx_unban_ip <ip> - the ONE unban path (U-2). The Security screen's
+# old inline version deleted an untagged rule spec the daemon never
+# creates, edited the dead /tmp mirror by hand and never touched
+# banned.list - so the "unbanned" IP was re-banned at the next
+# daemon reconcile. Exact tagged deletes, exact state edits,
+# throttle-filter cleanup, fail2ban unban - shared by every screen.
+nx_unban_ip() {
+    local _ip="$1" _tf _prio _if _j
+    case "$_ip" in
+        *:*)
+            ip6tables -D INPUT -s "$_ip" -m comment --comment "auto-ban" -j DROP 2>/dev/null || true ;;
+        *)
+            iptables -D INPUT -s "$_ip" -m comment --comment "auto-ban" -j DROP 2>/dev/null || \
+            iptables -D INPUT -s "$_ip" -m comment --comment "subnet-ban" -j DROP 2>/dev/null || \
+            iptables -D INPUT -s "$_ip" -j DROP 2>/dev/null || true ;;
+    esac
+    for _tf in "$NX_THROTTLE_LIST" "$NX_THROTTLE_MIRROR"; do
+        [ -f "$_tf" ] || continue
+        _prio=$(awk -v x="$_ip" '$1==x{print $2}' "$_tf" 2>/dev/null | head -1)
+        if [ -n "$_prio" ]; then
+            _if=$(ip route show default 2>/dev/null | awk '/default/{print $5}' | head -1)
+            [ -n "$_if" ] && tc filter del dev "$_if" parent 1: prio "$_prio" 2>/dev/null || true
+        fi
+        awk -v x="$_ip" '$1!=x' "$_tf" > "$_tf.nxtmp" 2>/dev/null && mv "$_tf.nxtmp" "$_tf"
+    done
+    if [ -f "$NX_STATE_DIR/banned.list" ]; then
+        awk -v x="$_ip" '$1!=x' "$NX_STATE_DIR/banned.list" > "$NX_STATE_DIR/banned.list.nxtmp" 2>/dev/null && \
+            mv "$NX_STATE_DIR/banned.list.nxtmp" "$NX_STATE_DIR/banned.list"
+    fi
+    fail2ban-client status 2>/dev/null | grep "Jail list" | \
+        sed 's/.*://;s/,/\n/g' | tr -d ' ' | while read -r _j; do
+        [ -z "$_j" ] && continue
+        fail2ban-client set "$_j" unbanip "$_ip" 2>/dev/null || true
+    done
+}
 
 ui_input() {
     local _var="$1" _prompt="$2" _val=""
@@ -66,7 +112,7 @@ press_enter() {
 ui_home_panel() {
     local _nb _nt _nw
     _nb=$(cnt . "$NX_STATE_DIR/banned.list")
-    _nt=$(cnt . "$NX_STATE_DIR/throttled.list")
+    _nt=$(cnt . "$(nx_throttle_file)")
     _nw=$(cnt . "$NX_STATE_DIR/whitelist.list")
     echo -e "  ${BOLD}Overview${NC}"
     echo -e "  ${DIM}Banned now:${NC} ${W}${_nb}${NC}    ${DIM}Throttled:${NC} ${W}${_nt}${NC}    ${DIM}Whitelist entries:${NC} ${W}${_nw}${NC}"
@@ -95,7 +141,7 @@ nx_status_plain() {
     echo "fail2ban:  $(systemctl is-active fail2ban 2>/dev/null || echo unknown)"
     [ -f "$NX_STATE_DIR/state.conf" ] && echo "antiddos:  installed" || echo "antiddos:  not installed"
     echo "banned:    $(cnt . "$NX_STATE_DIR/banned.list")"
-    echo "throttled: $(cnt . "$NX_STATE_DIR/throttled.list")"
+    echo "throttled: $(cnt . "$(nx_throttle_file)")"
 }
 
 nx_bans_plain() {

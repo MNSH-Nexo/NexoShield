@@ -71,14 +71,14 @@ _proxy_suspicious() {
     echo -e "  ${DIM}These are actual attackers auto-ban has blocked or throttled,"${NC}
     echo -e "  ${DIM}not your normal heavy users.${NC}"; sep2
 
-    # U-1 (UI redesign): state files are the source of truth. The old
-    # code scraped iptables -L for bans and read throttles from
-    # /tmp/autoban_throttle - a path nothing in the product writes,
-    # so the throttled section was permanently empty.
+    # State files are the source of truth: bans from banned.list
+    # (the old iptables -L scrape could never match - rule comments
+    # do not appear in -L output), throttles from the daemon's live
+    # state file (mirror fallback after a reboot).
     local _banned=""
     _banned=$(awk '{print $1}' "$NX_STATE_DIR/banned.list" 2>/dev/null | head -20)
     local _throttled=""
-    _throttled=$(awk '{print $1}' "$NX_STATE_DIR/throttled.list" 2>/dev/null | head -10)
+    _throttled=$(awk '{print $1}' "$(nx_throttle_file)" 2>/dev/null | head -10)
 
     local _empty=1
     if [ -n "$_banned" ]; then

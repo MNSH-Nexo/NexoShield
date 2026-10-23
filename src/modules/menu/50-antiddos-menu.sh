@@ -6,7 +6,7 @@ menu_antiddos() {
 
         # Status at a glance
         if [ -f /etc/antiddos/state.conf ]; then
-            echo -e "  Status  : ${G}✓ Installed & Active${NC}"
+            echo -e "  Status  : ${G}✓ Installed${NC}"
         else
             echo -e "  Status  : ${Y}○ Not installed${NC}"
             echo -e "  ${DIM}  → Choose option 1 to protect this server${NC}"
@@ -23,7 +23,7 @@ menu_antiddos() {
         if [ -f /etc/antiddos/state.conf ]; then
             [ -f /etc/sysctl.d/98-antiddos-hardening.conf ] && \
                 echo -e "  ${G}✓${NC} Kernel hardening" || echo -e "  ${DIM}○ Kernel hardening${NC}"
-            iptables -L INPUT -n 2>/dev/null | grep -qE 'cf_whitelist|hashlimit|syn_flood|SYNPROXY' && \
+            iptables -S INPUT 2>/dev/null | grep -qE 'cf_whitelist|hashlimit|syn_flood|SYNPROXY' && \
                 echo -e "  ${G}✓${NC} iptables rules" || echo -e "  ${DIM}○ iptables rules${NC}"
             [ -f /etc/fail2ban/jail.d/antiddos.conf ] && \
                 echo -e "  ${G}✓${NC} fail2ban" || echo -e "  ${DIM}○ fail2ban${NC}"
@@ -48,27 +48,15 @@ menu_antiddos() {
             2) bash "$ANTIDDOS_SCRIPT" --status < /dev/tty; press_enter ;;
             3) echo -e "  ${C}Unban IP${NC}"; echo ""
                ui_input UIP "  Enter IP to unban (removes from iptables + fail2ban): "
-               [ -n "$UIP" ] && {
-                   # Exact deletes (BUG-038): match the tagged specs the
-                   # daemon creates; state edit by exact field 1 (the
-                   # old substring sed also removed 11.2.3.4's entry
-                   # when unbanning 1.2.3.4).
-                   iptables -D INPUT -s "$UIP" -m comment --comment "auto-ban" -j DROP 2>/dev/null || \
-                   iptables -D INPUT -s "$UIP" -m comment --comment "subnet-ban" -j DROP 2>/dev/null || \
-                   iptables -D INPUT -s "$UIP" -j DROP 2>/dev/null || true
-                   ok "iptables: unblocked"
-                   if [ -f /etc/antiddos/banned.list ]; then
-                       awk -v x="$UIP" '$1!=x' /etc/antiddos/banned.list > /etc/antiddos/banned.list.tmp 2>/dev/null && \
-                           mv /etc/antiddos/banned.list.tmp /etc/antiddos/banned.list
-                   fi
-                   fail2ban-client status 2>/dev/null | grep "Jail list" | \
-                       sed 's/.*://;s/,/\n/g' | tr -d ' ' | while read -r j; do
-                       [ -z "$j" ] && continue
-                       fail2ban-client set "$j" unbanip "$UIP" 2>/dev/null && \
-                           ok "fail2ban $j: unblocked" || true
-                   done
+               if [ -n "$UIP" ]; then
+                   # The shared engine-grade unban (U-2): exact tagged
+                   # deletes (BUG-038), exact state edits, throttle
+                   # cleanup, fail2ban - one implementation everywhere.
+                   nx_unban_ip "$UIP"
                    ok "$UIP unblocked (all layers)"
-               } || warn "No IP entered"
+               else
+                   warn "No IP entered"
+               fi
                press_enter ;;
             4) _autoban_control ;;
             5) echo ""

@@ -99,17 +99,14 @@ _monitor_dashboard() {
             SYNPROXY_HIT="${SYNPROXY_HIT//[^0-9]/}"; SYNPROXY_HIT="${SYNPROXY_HIT:-0}"
         fi
 
-        # ── Currently blocked attackers (REAL: from iptables DROP rules that
-        #    auto-ban/subnet-ban actually inserted; never the server's own IP) ──
+        # ── Currently blocked / throttled attackers ──────────
+        # From the daemon's state files (U-9): the old code grepped
+        # iptables -L output for rule comments - comments never
+        # appear in -L listings, so this section was always empty.
         local CUR_BANNED
-        CUR_BANNED=$(iptables -L INPUT -n 2>/dev/null | \
-            grep -E 'auto-ban|subnet-ban' | \
-            grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]+)?' | \
-            grep -v '^0\.0\.0\.0' | sort -u | head -6)
-
-        # ── Currently throttled (reputation-suspected, pre-ban) ──
+        CUR_BANNED=$(awk '{print $1}' "$NX_STATE_DIR/banned.list" 2>/dev/null | sort -u | head -6)
         local CUR_THROTTLED
-        CUR_THROTTLED=$(awk '{print $1}' /tmp/autoban_throttle 2>/dev/null | \
+        CUR_THROTTLED=$(awk '{print $1}' "$(nx_throttle_file)" 2>/dev/null | \
             grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -4)
 
         # ── Recently banned IPs (last 8 from log) ───────────
@@ -119,8 +116,9 @@ _monitor_dashboard() {
 
         # ── Currently throttled ─────────────────────────────
         local THROTTLED=0
-        if [ -f /tmp/autoban_throttle ]; then
-            THROTTLED=$(wc -l < /tmp/autoban_throttle 2>/dev/null || echo 0)
+        local _TF; _TF=$(nx_throttle_file)
+        if [ -n "$_TF" ]; then
+            THROTTLED=$(wc -l < "$_TF" 2>/dev/null || echo 0)
             THROTTLED="${THROTTLED//[^0-9]/}"; THROTTLED="${THROTTLED:-0}"
         fi
 
@@ -230,7 +228,8 @@ _monitor_logs() {
         echo -e "  ${DIM}──────────────────────────────────────────────────${NC}"
         ui_input CH "  Enter number: "
         case "$CH" in
-            1) less +G /var/log/3proxy/access.log 2>/dev/null || \
+            1) # T-2: 3proxy writes dated logs (access.log.YYYY.MM.DD)
+               less +G "$(ls -t /var/log/3proxy/access.log* 2>/dev/null | head -1)" 2>/dev/null || \
                journalctl -u 3proxy --no-pager -n 50 ;;
             2) journalctl -u fail2ban --no-pager -n 50 2>/dev/null ;;
             3) less +G /var/log/auth.log 2>/dev/null ;;

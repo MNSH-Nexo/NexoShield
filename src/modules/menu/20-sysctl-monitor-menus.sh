@@ -11,12 +11,9 @@ menu_sysctl() {
         fi
         echo -e "  BBR     : ${G}$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo '?')${NC} + $(sysctl -n net.core.default_qdisc 2>/dev/null || echo '?')"
         echo -e "  Keepalive: $(sysctl -n net.ipv4.tcp_keepalive_time 2>/dev/null || echo '?')s  ${DIM}(30s = optimal for proxy)${NC}"
-        echo ""; sep2
-        echo -e "  ${G}1.${NC} Install / Optimize   ${DIM}(analyze + apply)${NC}"
-        echo -e "  ${C}2.${NC} Rollback              ${DIM}(restore previous settings)${NC}"
-        echo -e "  ${C}3.${NC} Current values"
-        echo -e "  ${C}0.${NC} Back"; echo ""
-        echo -e "  ${DIM}──────────────────────────────────────────────────${NC}"
+        echo ""
+        ui_options "1|Install / Optimize (analyze + apply)" \
+            "2|Rollback (restore previous settings)" "3|Current values" "0|Back"
         ui_input CH "  Enter number: "
         case "$CH" in
             1) bash "$SYSCTL_SCRIPT" --install < /dev/tty; press_enter ;;
@@ -31,11 +28,8 @@ menu_sysctl() {
 menu_monitor() {
     while true; do
         ui_title "Monitoring"
-        echo -e "  ${C}1.${NC} Live Threat Monitor  ${C}2.${NC} Connections"
-        echo -e "  ${C}3.${NC} CPU & RAM            ${C}4.${NC} Disk"
-        echo -e "  ${C}5.${NC} Logs                 ${C}6.${NC} Auto-ban log"
-        echo -e "  ${C}7.${NC} Traffic top IPs      ${C}0.${NC} Back"; echo ""
-        echo -e "  ${DIM}──────────────────────────────────────────────────${NC}"
+        ui_options "1|Live Threat Monitor" "2|Connections" "3|CPU & RAM" \
+            "4|Disk" "5|Logs" "6|Auto-ban log" "7|Traffic top IPs" "0|Back"
         ui_input CH "  Enter number: "
         case "$CH" in
             1) _monitor_dashboard ;;
@@ -47,10 +41,16 @@ menu_monitor() {
             6) [ -f /var/log/auto-ban.log ] && \
                    tail -50 /var/log/auto-ban.log || warn "auto-ban not running"
                press_enter ;;
-            7) # Top IPs from 3proxy log
-               [ -f /var/log/3proxy/access.log ] && {
+            7) # Top IPs from the 3proxy log. U-7: the log is the
+               # daily-rotated access.log.YYYY.MM.DD (T-2), and the
+               # client is field 4 (%C:%c) of the log format, not $5
+               # (that is %R, the server side) - both were wrong, so
+               # this screen always said "No log found" or counted
+               # the server's own addresses.
+               _ALOG=$(ls -t /var/log/3proxy/access.log* 2>/dev/null | head -1)
+               [ -n "$_ALOG" ] && {
                    echo -e "  ${C}Top 20 source IPs:${NC}"; sep2
-                   awk '{print $5}' /var/log/3proxy/access.log 2>/dev/null | \
+                   awk '{print $4}' "$_ALOG" 2>/dev/null | cut -d: -f1 | \
                        grep -oP '^\d+\.\d+\.\d+\.\d+' | sort | uniq -c | \
                        sort -rn | head -20 | awk '{printf "  %-8s %s\n", $1, $2}'
                } || warn "No log found"

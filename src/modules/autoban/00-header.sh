@@ -17,6 +17,14 @@ LOG="/var/log/auto-ban.log"
 BANNED_LIST="/etc/antiddos/banned.list"
 WATCH_LIST="/tmp/autoban_watch"
 THROTTLE_LIST="/tmp/autoban_throttle"
+# U-11: persistent mirror of the throttle state. The live file sits
+# in /tmp (fast, volatile); the generated tc-setup.sh has always
+# re-applied throttles from /etc/antiddos/throttled.list after a
+# reboot - but nothing ever WROTE that file, so the restore path was
+# dead and every reboot silently dropped all throttles. The daemon
+# now mirrors tmp -> etc once per cycle and restores etc -> tmp at
+# startup when the tmp file is gone.
+THROTTLE_MIRROR="/etc/antiddos/throttled.list"
 # User whitelist — IPs/CIDRs exempt from ALL anti-DDoS limits.
 # Managed by the user via the menu (never auto-modified). One per line.
 # Lines starting with # are comments. Server's own IPs + CF IPs are always

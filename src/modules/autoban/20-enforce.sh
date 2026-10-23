@@ -47,6 +47,22 @@ reapply_throttles() {
         esac
     done < "$THROTTLE_LIST"
 }
+# U-11: keep the persistent mirror in sync with the live tmp state,
+# and restore from it after a reboot (tmp is wiped; the mirror and
+# tc-setup.sh's re-apply both read /etc/antiddos/throttled.list).
+mirror_throttle_state() {
+    [ -f "$THROTTLE_LIST" ] || return 0
+    cmp -s "$THROTTLE_LIST" "$THROTTLE_MIRROR" 2>/dev/null && return 0
+    cp "$THROTTLE_LIST" "$THROTTLE_MIRROR.tmp.$$" 2>/dev/null && \
+        mv "$THROTTLE_MIRROR.tmp.$$" "$THROTTLE_MIRROR" 2>/dev/null || true
+}
+restore_throttle_state() {
+    if [ ! -f "$THROTTLE_LIST" ] && [ -s "$THROTTLE_MIRROR" ]; then
+        cp "$THROTTLE_MIRROR" "$THROTTLE_LIST" 2>/dev/null || true
+        log " STATE: throttle list restored from persistent mirror"
+    fi
+}
+
 throttle_ip() {
     local ip="$1"
     is_exempt "$ip" && return 0

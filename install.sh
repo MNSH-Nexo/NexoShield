@@ -2567,6 +2567,52 @@ draw_header() {
 # NX_SCORE_FILE); production defaults are the real paths.
 NX_STATE_DIR="${NX_STATE_DIR:-/etc/antiddos}"
 NX_SCORE_FILE="${NX_SCORE_FILE:-/var/lib/antiddos/scores/reputation.dat}"
+# The daemon's LIVE throttle state is /tmp/autoban_throttle; the
+# persistent mirror (U-11) is /etc/antiddos/throttled.list. Displays
+# read the live file, falling back to the mirror right after a
+# reboot before the daemon has restored its state.
+NX_THROTTLE_LIST="${NX_THROTTLE_LIST:-/tmp/autoban_throttle}"
+NX_THROTTLE_MIRROR="${NX_THROTTLE_MIRROR:-/etc/antiddos/throttled.list}"
+nx_throttle_file() {
+    if [ -f "$NX_THROTTLE_LIST" ]; then echo "$NX_THROTTLE_LIST";
+    elif [ -f "$NX_THROTTLE_MIRROR" ]; then echo "$NX_THROTTLE_MIRROR"; fi
+}
+
+# nx_unban_ip <ip> - the ONE unban path (U-2). The Security screen's
+# old inline version deleted an untagged rule spec the daemon never
+# creates, edited the dead /tmp mirror by hand and never touched
+# banned.list - so the "unbanned" IP was re-banned at the next
+# daemon reconcile. Exact tagged deletes, exact state edits,
+# throttle-filter cleanup, fail2ban unban - shared by every screen.
+nx_unban_ip() {
+    local _ip="$1" _tf _prio _if _j
+    case "$_ip" in
+        *:*)
+            ip6tables -D INPUT -s "$_ip" -m comment --comment "auto-ban" -j DROP 2>/dev/null || true ;;
+        *)
+            iptables -D INPUT -s "$_ip" -m comment --comment "auto-ban" -j DROP 2>/dev/null || \
+            iptables -D INPUT -s "$_ip" -m comment --comment "subnet-ban" -j DROP 2>/dev/null || \
+            iptables -D INPUT -s "$_ip" -j DROP 2>/dev/null || true ;;
+    esac
+    for _tf in "$NX_THROTTLE_LIST" "$NX_THROTTLE_MIRROR"; do
+        [ -f "$_tf" ] || continue
+        _prio=$(awk -v x="$_ip" '$1==x{print $2}' "$_tf" 2>/dev/null | head -1)
+        if [ -n "$_prio" ]; then
+            _if=$(ip route show default 2>/dev/null | awk '/default/{print $5}' | head -1)
+            [ -n "$_if" ] && tc filter del dev "$_if" parent 1: prio "$_prio" 2>/dev/null || true
+        fi
+        awk -v x="$_ip" '$1!=x' "$_tf" > "$_tf.nxtmp" 2>/dev/null && mv "$_tf.nxtmp" "$_tf"
+    done
+    if [ -f "$NX_STATE_DIR/banned.list" ]; then
+        awk -v x="$_ip" '$1!=x' "$NX_STATE_DIR/banned.list" > "$NX_STATE_DIR/banned.list.nxtmp" 2>/dev/null && \
+            mv "$NX_STATE_DIR/banned.list.nxtmp" "$NX_STATE_DIR/banned.list"
+    fi
+    fail2ban-client status 2>/dev/null | grep "Jail list" | \
+        sed 's/.*://;s/,/\n/g' | tr -d ' ' | while read -r _j; do
+        [ -z "$_j" ] && continue
+        fail2ban-client set "$_j" unbanip "$_ip" 2>/dev/null || true
+    done
+}
 
 ui_input() {
     local _var="$1" _prompt="$2" _val=""
@@ -2618,7 +2664,7 @@ press_enter() {
 ui_home_panel() {
     local _nb _nt _nw
     _nb=$(cnt . "$NX_STATE_DIR/banned.list")
-    _nt=$(cnt . "$NX_STATE_DIR/throttled.list")
+    _nt=$(cnt . "$(nx_throttle_file)")
     _nw=$(cnt . "$NX_STATE_DIR/whitelist.list")
     echo -e "  ${BOLD}Overview${NC}"
     echo -e "  ${DIM}Banned now:${NC} ${W}${_nb}${NC}    ${DIM}Throttled:${NC} ${W}${_nt}${NC}    ${DIM}Whitelist entries:${NC} ${W}${_nw}${NC}"
@@ -2647,7 +2693,7 @@ nx_status_plain() {
     echo "fail2ban:  $(systemctl is-active fail2ban 2>/dev/null || echo unknown)"
     [ -f "$NX_STATE_DIR/state.conf" ] && echo "antiddos:  installed" || echo "antiddos:  not installed"
     echo "banned:    $(cnt . "$NX_STATE_DIR/banned.list")"
-    echo "throttled: $(cnt . "$NX_STATE_DIR/throttled.list")"
+    echo "throttled: $(cnt . "$(nx_throttle_file)")"
 }
 
 nx_bans_plain() {
@@ -2730,14 +2776,14 @@ _proxy_suspicious() {
     echo -e "  ${DIM}These are actual attackers auto-ban has blocked or throttled,"${NC}
     echo -e "  ${DIM}not your normal heavy users.${NC}"; sep2
 
-    # U-1 (UI redesign): state files are the source of truth. The old
-    # code scraped iptables -L for bans and read throttles from
-    # /tmp/autoban_throttle - a path nothing in the product writes,
-    # so the throttled section was permanently empty.
+    # State files are the source of truth: bans from banned.list
+    # (the old iptables -L scrape could never match - rule comments
+    # do not appear in -L output), throttles from the daemon's live
+    # state file (mirror fallback after a reboot).
     local _banned=""
     _banned=$(awk '{print $1}' "$NX_STATE_DIR/banned.list" 2>/dev/null | head -20)
     local _throttled=""
-    _throttled=$(awk '{print $1}' "$NX_STATE_DIR/throttled.list" 2>/dev/null | head -10)
+    _throttled=$(awk '{print $1}' "$(nx_throttle_file)" 2>/dev/null | head -10)
 
     local _empty=1
     if [ -n "$_banned" ]; then
@@ -2789,12 +2835,9 @@ menu_sysctl() {
         fi
         echo -e "  BBR     : ${G}$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo '?')${NC} + $(sysctl -n net.core.default_qdisc 2>/dev/null || echo '?')"
         echo -e "  Keepalive: $(sysctl -n net.ipv4.tcp_keepalive_time 2>/dev/null || echo '?')s  ${DIM}(30s = optimal for proxy)${NC}"
-        echo ""; sep2
-        echo -e "  ${G}1.${NC} Install / Optimize   ${DIM}(analyze + apply)${NC}"
-        echo -e "  ${C}2.${NC} Rollback              ${DIM}(restore previous settings)${NC}"
-        echo -e "  ${C}3.${NC} Current values"
-        echo -e "  ${C}0.${NC} Back"; echo ""
-        echo -e "  ${DIM}──────────────────────────────────────────────────${NC}"
+        echo ""
+        ui_options "1|Install / Optimize (analyze + apply)" \
+            "2|Rollback (restore previous settings)" "3|Current values" "0|Back"
         ui_input CH "  Enter number: "
         case "$CH" in
             1) bash "$SYSCTL_SCRIPT" --install < /dev/tty; press_enter ;;
@@ -2809,11 +2852,8 @@ menu_sysctl() {
 menu_monitor() {
     while true; do
         ui_title "Monitoring"
-        echo -e "  ${C}1.${NC} Live Threat Monitor  ${C}2.${NC} Connections"
-        echo -e "  ${C}3.${NC} CPU & RAM            ${C}4.${NC} Disk"
-        echo -e "  ${C}5.${NC} Logs                 ${C}6.${NC} Auto-ban log"
-        echo -e "  ${C}7.${NC} Traffic top IPs      ${C}0.${NC} Back"; echo ""
-        echo -e "  ${DIM}──────────────────────────────────────────────────${NC}"
+        ui_options "1|Live Threat Monitor" "2|Connections" "3|CPU & RAM" \
+            "4|Disk" "5|Logs" "6|Auto-ban log" "7|Traffic top IPs" "0|Back"
         ui_input CH "  Enter number: "
         case "$CH" in
             1) _monitor_dashboard ;;
@@ -2825,10 +2865,16 @@ menu_monitor() {
             6) [ -f /var/log/auto-ban.log ] && \
                    tail -50 /var/log/auto-ban.log || warn "auto-ban not running"
                press_enter ;;
-            7) # Top IPs from 3proxy log
-               [ -f /var/log/3proxy/access.log ] && {
+            7) # Top IPs from the 3proxy log. U-7: the log is the
+               # daily-rotated access.log.YYYY.MM.DD (T-2), and the
+               # client is field 4 (%C:%c) of the log format, not $5
+               # (that is %R, the server side) - both were wrong, so
+               # this screen always said "No log found" or counted
+               # the server's own addresses.
+               _ALOG=$(ls -t /var/log/3proxy/access.log* 2>/dev/null | head -1)
+               [ -n "$_ALOG" ] && {
                    echo -e "  ${C}Top 20 source IPs:${NC}"; sep2
-                   awk '{print $5}' /var/log/3proxy/access.log 2>/dev/null | \
+                   awk '{print $4}' "$_ALOG" 2>/dev/null | cut -d: -f1 | \
                        grep -oP '^\d+\.\d+\.\d+\.\d+' | sort | uniq -c | \
                        sort -rn | head -20 | awk '{printf "  %-8s %s\n", $1, $2}'
                } || warn "No log found"
@@ -2937,17 +2983,14 @@ _monitor_dashboard() {
             SYNPROXY_HIT="${SYNPROXY_HIT//[^0-9]/}"; SYNPROXY_HIT="${SYNPROXY_HIT:-0}"
         fi
 
-        # ── Currently blocked attackers (REAL: from iptables DROP rules that
-        #    auto-ban/subnet-ban actually inserted; never the server's own IP) ──
+        # ── Currently blocked / throttled attackers ──────────
+        # From the daemon's state files (U-9): the old code grepped
+        # iptables -L output for rule comments - comments never
+        # appear in -L listings, so this section was always empty.
         local CUR_BANNED
-        CUR_BANNED=$(iptables -L INPUT -n 2>/dev/null | \
-            grep -E 'auto-ban|subnet-ban' | \
-            grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]+)?' | \
-            grep -v '^0\.0\.0\.0' | sort -u | head -6)
-
-        # ── Currently throttled (reputation-suspected, pre-ban) ──
+        CUR_BANNED=$(awk '{print $1}' "$NX_STATE_DIR/banned.list" 2>/dev/null | sort -u | head -6)
         local CUR_THROTTLED
-        CUR_THROTTLED=$(awk '{print $1}' /tmp/autoban_throttle 2>/dev/null | \
+        CUR_THROTTLED=$(awk '{print $1}' "$(nx_throttle_file)" 2>/dev/null | \
             grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -4)
 
         # ── Recently banned IPs (last 8 from log) ───────────
@@ -2957,8 +3000,9 @@ _monitor_dashboard() {
 
         # ── Currently throttled ─────────────────────────────
         local THROTTLED=0
-        if [ -f /tmp/autoban_throttle ]; then
-            THROTTLED=$(wc -l < /tmp/autoban_throttle 2>/dev/null || echo 0)
+        local _TF; _TF=$(nx_throttle_file)
+        if [ -n "$_TF" ]; then
+            THROTTLED=$(wc -l < "$_TF" 2>/dev/null || echo 0)
             THROTTLED="${THROTTLED//[^0-9]/}"; THROTTLED="${THROTTLED:-0}"
         fi
 
@@ -3068,7 +3112,8 @@ _monitor_logs() {
         echo -e "  ${DIM}──────────────────────────────────────────────────${NC}"
         ui_input CH "  Enter number: "
         case "$CH" in
-            1) less +G /var/log/3proxy/access.log 2>/dev/null || \
+            1) # T-2: 3proxy writes dated logs (access.log.YYYY.MM.DD)
+               less +G "$(ls -t /var/log/3proxy/access.log* 2>/dev/null | head -1)" 2>/dev/null || \
                journalctl -u 3proxy --no-pager -n 50 ;;
             2) journalctl -u fail2ban --no-pager -n 50 2>/dev/null ;;
             3) less +G /var/log/auth.log 2>/dev/null ;;
@@ -3084,11 +3129,8 @@ _monitor_logs() {
 menu_security() {
     while true; do
         ui_title "Security"
-        echo -e "  ${C}1.${NC} Blocked IPs (all)       ${C}2.${NC} Block IP"
-        echo -e "  ${C}3.${NC} Unblock IP              ${C}4.${NC} iptables rules"
-        echo -e "  ${C}5.${NC} SSH brute force          ${C}6.${NC} Auto-ban status"
-        echo -e "  ${C}0.${NC} Back"; echo ""
-        echo -e "  ${DIM}──────────────────────────────────────────────────${NC}"
+        ui_options "1|Blocked IPs (all)" "2|Block IP" "3|Unblock IP" \
+            "4|iptables rules" "5|SSH brute force" "6|Auto-ban status" "0|Back"
         ui_input CH "  Enter number: "
         case "$CH" in
              1) clear 2>/dev/null || true
@@ -3096,15 +3138,22 @@ menu_security() {
                fail2ban-client status 2>/dev/null | grep "Jail list" | \
                    sed 's/.*://g' | tr ',' '\n' | while read -r j; do
                    j=$(echo "$j" | tr -d ' '); [ -z "$j" ] && continue
+                   # U-3: the count is the "Currently banned:" total.
+                   # The old parse took the last number on the
+                   # "Banned IP list:" line - the last octet of the
+                   # last banned IP, not a count at all.
                    BCOUNT=$(fail2ban-client status "$j" 2>/dev/null | \
-                       grep "Banned IP" | grep -oP '\d+$' || echo 0)
+                       grep -oP 'Currently banned:\s*\K\d+' || echo 0)
                    [ "${BCOUNT:-0}" -gt 0 ] && echo -e "  ${Y}$j${NC}: $BCOUNT IPs"
                done
                echo ""
-               echo -e "  ${C}iptables DROP rules:${NC}"
-               iptables -L INPUT -n 2>/dev/null | grep DROP | \
-                   grep -oP '\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}' | \
-                   while read -r ip; do echo -e "  ${R}$ip${NC}"; done | head -30
+               echo -e "  ${C}auto-ban bans (state):${NC}"
+               if [ -s "$NX_STATE_DIR/banned.list" ]; then
+                   awk '{print $1}' "$NX_STATE_DIR/banned.list" | head -30 | \
+                       while read -r ip; do echo -e "  ${R}$ip${NC}"; done
+               else
+                   echo -e "  ${DIM}(none)${NC}"
+               fi
                press_enter ;;
             2) echo -e "  ${C}Block IP${NC}"; echo ""
                ui_input BIP "  Enter IP or CIDR to block (e.g. 1.2.3.4 or 1.2.3.0/24): "
@@ -3125,30 +3174,28 @@ menu_security() {
                press_enter ;;
             3) echo -e "  ${C}Unblock IP${NC}"; echo ""
                ui_input UIP "  Enter IP to unblock: "
-               [ -n "$UIP" ] && {
-                   iptables -D INPUT -s "$UIP" -j DROP 2>/dev/null && ok "iptables: unblocked" || true
-                   # Remove from auto-ban if running
-                   [ -f /opt/proxy-manager/auto-ban.sh ] && {
-                       # Remove ONLY this IP's throttle filter (never 'parent 1:'
-                       # bare — that deletes every filter incl. the CF whitelist).
-                       local _IFP _PRIO
-                       _IFP=$(ip route show default | awk '/default/{print $5}' | head -1)
-                       _PRIO=$(grep -F "$UIP " /tmp/autoban_throttle 2>/dev/null | \
-                               awk '{print $2}' | head -1 || true)
-                       [ -n "$_PRIO" ] && tc filter del dev "$_IFP" parent 1: prio "$_PRIO" 2>/dev/null || true
-                       sed -i "/^$UIP /d" /tmp/autoban_throttle 2>/dev/null || true
-                   }
-                   fail2ban-client status 2>/dev/null | grep "Jail list" | \
-                       sed 's/.*://;s/,/\n/g' | tr -d ' ' | while read -r j; do
-                       [ -z "$j" ] && continue
-                       fail2ban-client set "$j" unbanip "$UIP" 2>/dev/null && \
-                           ok "fail2ban $j: unblocked" || true
-                   done
-               }
+               if [ -n "$UIP" ]; then
+                   # U-2: the shared engine-grade unban (exact tagged
+                   # deletes + state edits + throttle cleanup +
+                   # fail2ban). The old inline copy deleted a rule
+                   # spec the daemon never creates and never touched
+                   # banned.list, so the IP was re-banned on the
+                   # daemon's next reconcile.
+                   nx_unban_ip "$UIP"
+                   ok "$UIP unblocked (all layers)"
+               else
+                   warn "No IP entered"
+               fi
                press_enter ;;
             4) iptables -L INPUT -n -v --line-numbers 2>/dev/null | head -40; press_enter ;;
-            5) grep 'Failed password\|Invalid user' /var/log/auth.log 2>/dev/null | \
-               grep -oP 'from \K[\d.]+' | sort | uniq -c | sort -rn | head -15 | \
+            5) # Journal fallback (T-1 class): auth.log may not exist
+               # on journal-only images.
+               if [ -s /var/log/auth.log ]; then
+                   grep 'Failed password\|Invalid user' /var/log/auth.log 2>/dev/null
+               else
+                   journalctl -u ssh -u sshd --no-pager -n 1000 2>/dev/null | \
+                       grep 'Failed password\|Invalid user'
+               fi | grep -oP 'from \K[\d.]+' | sort | uniq -c | sort -rn | head -15 | \
                awk '{printf "  %-8s %s\n", $1, $2}'
                press_enter ;;
             6) # Auto-ban status
@@ -3175,7 +3222,10 @@ menu_services() {
         # Build list dynamically each time (user may install/remove)
         SERVICES=()
         for S in "${ALL_POSSIBLE[@]}"; do
-            systemctl list-unit-files "${S}.service" >/dev/null 2>&1 && SERVICES+=("$S") || true
+            # U-5: bare list-unit-files exits 0 even with zero matches,
+            # so every candidate used to be listed as installed.
+            systemctl list-unit-files --no-legend "${S}.service" 2>/dev/null | \
+                grep -q . && SERVICES+=("$S") || true
         done
         # Always show 3proxy and auto-ban even if not installed yet
         for S in 3proxy auto-ban; do
@@ -3224,10 +3274,8 @@ menu_services() {
 menu_system() {
     while true; do
         ui_title "System"
-        echo -e "  ${C}1.${NC} Server info    ${C}2.${NC} Update"
-        echo -e "  ${C}3.${NC} Clean logs     ${C}4.${NC} Reboot"
-        echo -e "  ${C}5.${NC} Backup config  ${C}0.${NC} Back"; echo ""
-        echo -e "  ${DIM}──────────────────────────────────────────────────${NC}"
+        ui_options "1|Server info" "2|Update" "3|Clean logs" "4|Reboot" \
+            "5|Backup config" "0|Back"
         ui_input CH "  Enter number: "
         case "$CH" in
              1) clear 2>/dev/null || true
@@ -3241,8 +3289,7 @@ menu_system() {
                printf "  ${DIM}%-20s${NC} %s\n" "All IPs:" "$(ip -4 addr show 2>/dev/null | grep 'inet ' | grep -v '127\.' | awk '{print $2}' | tr '\n' ' ')"
                press_enter ;;
             2) echo ""
-               ui_input _UC "  Update system packages? (y/N): "
-               if [[ "$_UC" == "y" || "$_UC" == "Y" ]]; then
+               if ui_confirm "Update system packages?"; then
                    # BUG-044: the old && / || chain ran yum on Debian
                    # boxes when apt failed and printed "Update complete"
                    # either way. Branch properly, dnf first on RHEL.
@@ -3271,8 +3318,7 @@ menu_system() {
                ok "Freed: $(awk -v b="${BEFORE:-0}" -v a="${AFTER:-0}" 'BEGIN{printf "%.1f", (b-a)/1024}') MB"
                press_enter ;;
             4) echo ""
-               ui_input _RBC "  Reboot server now? (y/N): "
-               if [[ "$_RBC" == "y" || "$_RBC" == "Y" ]]; then
+               if ui_confirm "Reboot server now?"; then
                    ok "Rebooting in 5 seconds..."
                    sleep 5 && reboot
                else
@@ -3308,7 +3354,7 @@ menu_antiddos() {
 
         # Status at a glance
         if [ -f /etc/antiddos/state.conf ]; then
-            echo -e "  Status  : ${G}✓ Installed & Active${NC}"
+            echo -e "  Status  : ${G}✓ Installed${NC}"
         else
             echo -e "  Status  : ${Y}○ Not installed${NC}"
             echo -e "  ${DIM}  → Choose option 1 to protect this server${NC}"
@@ -3325,7 +3371,7 @@ menu_antiddos() {
         if [ -f /etc/antiddos/state.conf ]; then
             [ -f /etc/sysctl.d/98-antiddos-hardening.conf ] && \
                 echo -e "  ${G}✓${NC} Kernel hardening" || echo -e "  ${DIM}○ Kernel hardening${NC}"
-            iptables -L INPUT -n 2>/dev/null | grep -qE 'cf_whitelist|hashlimit|syn_flood|SYNPROXY' && \
+            iptables -S INPUT 2>/dev/null | grep -qE 'cf_whitelist|hashlimit|syn_flood|SYNPROXY' && \
                 echo -e "  ${G}✓${NC} iptables rules" || echo -e "  ${DIM}○ iptables rules${NC}"
             [ -f /etc/fail2ban/jail.d/antiddos.conf ] && \
                 echo -e "  ${G}✓${NC} fail2ban" || echo -e "  ${DIM}○ fail2ban${NC}"
@@ -3350,27 +3396,15 @@ menu_antiddos() {
             2) bash "$ANTIDDOS_SCRIPT" --status < /dev/tty; press_enter ;;
             3) echo -e "  ${C}Unban IP${NC}"; echo ""
                ui_input UIP "  Enter IP to unban (removes from iptables + fail2ban): "
-               [ -n "$UIP" ] && {
-                   # Exact deletes (BUG-038): match the tagged specs the
-                   # daemon creates; state edit by exact field 1 (the
-                   # old substring sed also removed 11.2.3.4's entry
-                   # when unbanning 1.2.3.4).
-                   iptables -D INPUT -s "$UIP" -m comment --comment "auto-ban" -j DROP 2>/dev/null || \
-                   iptables -D INPUT -s "$UIP" -m comment --comment "subnet-ban" -j DROP 2>/dev/null || \
-                   iptables -D INPUT -s "$UIP" -j DROP 2>/dev/null || true
-                   ok "iptables: unblocked"
-                   if [ -f /etc/antiddos/banned.list ]; then
-                       awk -v x="$UIP" '$1!=x' /etc/antiddos/banned.list > /etc/antiddos/banned.list.tmp 2>/dev/null && \
-                           mv /etc/antiddos/banned.list.tmp /etc/antiddos/banned.list
-                   fi
-                   fail2ban-client status 2>/dev/null | grep "Jail list" | \
-                       sed 's/.*://;s/,/\n/g' | tr -d ' ' | while read -r j; do
-                       [ -z "$j" ] && continue
-                       fail2ban-client set "$j" unbanip "$UIP" 2>/dev/null && \
-                           ok "fail2ban $j: unblocked" || true
-                   done
+               if [ -n "$UIP" ]; then
+                   # The shared engine-grade unban (U-2): exact tagged
+                   # deletes (BUG-038), exact state edits, throttle
+                   # cleanup, fail2ban - one implementation everywhere.
+                   nx_unban_ip "$UIP"
                    ok "$UIP unblocked (all layers)"
-               } || warn "No IP entered"
+               else
+                   warn "No IP entered"
+               fi
                press_enter ;;
             4) _autoban_control ;;
             5) echo ""
@@ -4546,6 +4580,14 @@ LOG="/var/log/auto-ban.log"
 BANNED_LIST="/etc/antiddos/banned.list"
 WATCH_LIST="/tmp/autoban_watch"
 THROTTLE_LIST="/tmp/autoban_throttle"
+# U-11: persistent mirror of the throttle state. The live file sits
+# in /tmp (fast, volatile); the generated tc-setup.sh has always
+# re-applied throttles from /etc/antiddos/throttled.list after a
+# reboot - but nothing ever WROTE that file, so the restore path was
+# dead and every reboot silently dropped all throttles. The daemon
+# now mirrors tmp -> etc once per cycle and restores etc -> tmp at
+# startup when the tmp file is gone.
+THROTTLE_MIRROR="/etc/antiddos/throttled.list"
 # User whitelist — IPs/CIDRs exempt from ALL anti-DDoS limits.
 # Managed by the user via the menu (never auto-modified). One per line.
 # Lines starting with # are comments. Server's own IPs + CF IPs are always
@@ -4939,6 +4981,22 @@ reapply_throttles() {
         esac
     done < "$THROTTLE_LIST"
 }
+# U-11: keep the persistent mirror in sync with the live tmp state,
+# and restore from it after a reboot (tmp is wiped; the mirror and
+# tc-setup.sh's re-apply both read /etc/antiddos/throttled.list).
+mirror_throttle_state() {
+    [ -f "$THROTTLE_LIST" ] || return 0
+    cmp -s "$THROTTLE_LIST" "$THROTTLE_MIRROR" 2>/dev/null && return 0
+    cp "$THROTTLE_LIST" "$THROTTLE_MIRROR.tmp.$$" 2>/dev/null && \
+        mv "$THROTTLE_MIRROR.tmp.$$" "$THROTTLE_MIRROR" 2>/dev/null || true
+}
+restore_throttle_state() {
+    if [ ! -f "$THROTTLE_LIST" ] && [ -s "$THROTTLE_MIRROR" ]; then
+        cp "$THROTTLE_MIRROR" "$THROTTLE_LIST" 2>/dev/null || true
+        log " STATE: throttle list restored from persistent mirror"
+    fi
+}
+
 throttle_ip() {
     local ip="$1"
     is_exempt "$ip" && return 0
@@ -5502,6 +5560,9 @@ score_init
 
 # Restore throttle filters recorded before a restart/reboot (the qdisc
 # may have been rebuilt without them - see reapply_throttles, BUG-022).
+# After a reboot /tmp is empty: pull the state back from the mirror
+# first (U-11), or reapply has nothing to work with.
+restore_throttle_state
 reapply_throttles
 
 # Re-apply recorded bans to the kernel (BUG-004) and expire the stale
@@ -5511,6 +5572,9 @@ reconcile_bans
 CYCLE=0
 while true; do
     CYCLE=$((CYCLE + 1))
+
+    # Keep the persistent throttle mirror current (U-11).
+    mirror_throttle_state
 
     # Every ~5 min: unban expired IPs and subnets
     [ $((CYCLE % 75)) -eq 0 ] && unban_expired && unban_subnet_expired

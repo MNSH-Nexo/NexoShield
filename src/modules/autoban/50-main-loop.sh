@@ -100,6 +100,9 @@ score_init
 
 # Restore throttle filters recorded before a restart/reboot (the qdisc
 # may have been rebuilt without them - see reapply_throttles, BUG-022).
+# After a reboot /tmp is empty: pull the state back from the mirror
+# first (U-11), or reapply has nothing to work with.
+restore_throttle_state
 reapply_throttles
 
 # Re-apply recorded bans to the kernel (BUG-004) and expire the stale
@@ -109,6 +112,9 @@ reconcile_bans
 CYCLE=0
 while true; do
     CYCLE=$((CYCLE + 1))
+
+    # Keep the persistent throttle mirror current (U-11).
+    mirror_throttle_state
 
     # Every ~5 min: unban expired IPs and subnets
     [ $((CYCLE % 75)) -eq 0 ] && unban_expired && unban_subnet_expired
