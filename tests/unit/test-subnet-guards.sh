@@ -18,6 +18,8 @@ for fn in ip_to_int ip_in_cidr subnet_overlaps_cf; do
     extract_fn src/modules/autoban/10-ip-utils.sh "$fn" "$TMP/fns.sh" || { echo "FAIL extract $fn"; exit 1; }
 done
 extract_fn src/modules/autoban/40-subnet.sh ban_subnet "$TMP/fns.sh" || { echo "FAIL extract ban_subnet"; exit 1; }
+extract_fn src/modules/autoban/20-enforce.sh nx_ban_apply "$TMP/fns.sh" || { echo "FAIL extract nx_ban_apply"; exit 1; }
+NX_BAN_BACKEND=iptables
 
 CF_RANGES=()
 SELF_IPS=("192.0.2.1")

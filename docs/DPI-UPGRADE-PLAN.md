@@ -6,7 +6,7 @@ Evidence base: `research_notes/ddos-detection-scoring-research-20261023-2221/rep
 Design rule inherited from the research verdict: the interpretable score
 stays the actuator; no opaque model ever bans. ML is offline-only.
 
-## Phase 1 — policy & enforcement (bash, current architecture)
+## Phase 1 — policy & enforcement (bash, current architecture) — DONE in v3.8.0
 
 ### 1a. Tunable scoring config (closes the standing "hardcoded constants" debt)
 `/etc/antiddos/scoring.conf`, `key=value`, installed with documented

@@ -18,7 +18,9 @@ load_reputation() {
     REP_PROB_UNTIL=0
     REP_FRAC=0
     REP_RATE=0
-    local line prev prob frac rate
+    REP_STRIKES=0
+    REP_LAST_BAN=0
+    local line prev prob frac rate strikes lastban
     line=$(awk -v x="$ip" '$1==x' "$SCORE_FILE" 2>/dev/null | tail -1 || true)
     [ -z "$line" ] && return 0
     REP_SCORE=$(echo "$line" | awk '{print $2}')
@@ -27,12 +29,16 @@ load_reputation() {
     prob=$(echo "$line" | awk '{print $5}')
     frac=$(echo "$line" | awk '{print $6}')
     rate=$(echo "$line" | awk '{print $7}')
+    strikes=$(echo "$line" | awk '{print $8}')
+    lastban=$(echo "$line" | awk '{print $9}')
     REP_SCORE="${REP_SCORE:-100}"; REP_SCORE="${REP_SCORE//[^0-9]/}"; REP_SCORE="${REP_SCORE:-100}"
     REP_PREV_CNT="${prev:-0}"; REP_PREV_CNT="${REP_PREV_CNT//[^0-9]/}"; REP_PREV_CNT="${REP_PREV_CNT:-0}"
     REP_TS="${REP_TS:-0}"; REP_TS="${REP_TS//[^0-9]/}"; REP_TS="${REP_TS:-0}"
     REP_PROB_UNTIL="${prob:-0}"; REP_PROB_UNTIL="${REP_PROB_UNTIL//[^0-9]/}"; REP_PROB_UNTIL="${REP_PROB_UNTIL:-0}"
     REP_FRAC="${frac:-0}"; [[ "$REP_FRAC" =~ ^-?[0-9]+$ ]] || REP_FRAC=0
     REP_RATE="${rate:-0}"; REP_RATE="${REP_RATE//[^0-9]/}"; REP_RATE="${REP_RATE:-0}"
+    REP_STRIKES="${strikes:-0}"; REP_STRIKES="${REP_STRIKES//[^0-9]/}"; REP_STRIKES="${REP_STRIKES:-0}"
+    REP_LAST_BAN="${lastban:-0}"; REP_LAST_BAN="${REP_LAST_BAN//[^0-9]/}"; REP_LAST_BAN="${REP_LAST_BAN:-0}"
     [ "$REP_SCORE" -gt 100 ] && REP_SCORE=100
     [ "$REP_SCORE" -lt 0 ] && REP_SCORE=0
 }
@@ -42,7 +48,7 @@ load_reputation() {
 save_reputation() {
     local ip="$1"
     awk -v x="$ip" '$1!=x' "$SCORE_FILE" > "$SCORE_FILE.tmp.$$" 2>/dev/null || true
-    echo "$ip $REP_SCORE $REP_PREV_CNT $(date +%s) ${REP_PROB_UNTIL:-0} ${REP_FRAC:-0} ${REP_RATE:-0}" >> "$SCORE_FILE.tmp.$$"
+    echo "$ip $REP_SCORE $REP_PREV_CNT $(date +%s) ${REP_PROB_UNTIL:-0} ${REP_FRAC:-0} ${REP_RATE:-0} ${REP_STRIKES:-0} ${REP_LAST_BAN:-0}" >> "$SCORE_FILE.tmp.$$"
     mv "$SCORE_FILE.tmp.$$" "$SCORE_FILE" 2>/dev/null || true
 }
 
@@ -56,14 +62,44 @@ clear_reputation() {
 # path: a served ban ends in PROBATION (score PROBATION_SCORE + window),
 # never in a stale low score and never wiped to a fresh 100.
 rep_on_ban() {
-    local ip="$1" now
+    local ip="$1" now dur
     now=$(date +%s)
     load_reputation "$ip"
     REP_SCORE="$PROBATION_SCORE"
     REP_FRAC=0
     REP_RATE=0
-    REP_PROB_UNTIL=$(( now + BAN_HOURS * 3600 + PROBATION_SECONDS ))
+    # Phase 1c: probation starts when the ACTUAL ban (progressive
+    # duration recorded in the state file) ends, not a flat BAN_HOURS.
+    dur=$(state_get_field "$BANNED_LIST" "$ip" 3)
+    dur="${dur//[^0-9]/}"; [ -n "$dur" ] && [ "$dur" -gt 0 ] || dur=$((BAN_HOURS * 3600))
+    REP_PROB_UNTIL=$(( now + dur + PROBATION_SECONDS ))
+    # Strike bookkeeping: a ban older than 7 days stops counting.
+    if [ "$REP_LAST_BAN" -gt 0 ] && [ $(( now - REP_LAST_BAN )) -gt 604800 ]; then
+        REP_STRIKES=0
+    fi
+    REP_STRIKES=$(( REP_STRIKES + 1 ))
+    REP_LAST_BAN=$now
     save_reputation "$ip"
+}
+
+# rep_ban_duration_secs <ip> - progressive ban length (Phase 1c):
+# ban_base_minutes doubling per strike, capped at ban_max_minutes.
+# Reads the reputation record directly (never disturbs REP_* state).
+rep_ban_duration_secs() {
+    local ip="$1" now strikes=0 lastban=0 mins i
+    now=$(date +%s)
+    if [ -f "$SCORE_FILE" ]; then
+        strikes=$(awk -v x="$ip" '$1==x{print $8}' "$SCORE_FILE" 2>/dev/null | tail -1)
+        lastban=$(awk -v x="$ip" '$1==x{print $9}' "$SCORE_FILE" 2>/dev/null | tail -1)
+    fi
+    strikes="${strikes//[^0-9]/}"; strikes="${strikes:-0}"
+    lastban="${lastban//[^0-9]/}"; lastban="${lastban:-0}"
+    if [ "$lastban" -gt 0 ] && [ $(( now - lastban )) -gt 604800 ]; then strikes=0; fi
+    [ "$strikes" -gt 10 ] && strikes=10
+    mins=${BAN_BASE_MINUTES:-30}
+    for (( i=0; i<strikes; i++ )); do mins=$(( mins * 2 )); done
+    [ "$mins" -gt "${BAN_MAX_MINUTES:-10080}" ] && mins=${BAN_MAX_MINUTES:-10080}
+    echo $(( mins * 60 ))
 }
 
 rep_on_unban() {
@@ -94,18 +130,20 @@ reputation_sweep() {
     now=$(date +%s)
     local tmp="$SCORE_FILE.sweep.$$"
     : > "$tmp"
-    while read -r ip score prev ts prob frac rate; do
+    while read -r ip score prev ts prob frac rate strikes lastban; do
         [ -z "$ip" ] && continue
         score="${score//[^0-9]/}"; score="${score:-100}"
         ts="${ts//[^0-9]/}"; ts="${ts:-0}"
         prob="${prob//[^0-9]/}"; prob="${prob:-0}"
         [[ "${frac:-}" =~ ^-?[0-9]+$ ]] || frac=0
         rate="${rate//[^0-9]/}"; rate="${rate:-0}"
+        strikes="${strikes//[^0-9]/}"; strikes="${strikes:-0}"
+        lastban="${lastban//[^0-9]/}"; lastban="${lastban:-0}"
         if state_has_ip "$BANNED_LIST" "$ip"; then
-            echo "$ip $score $prev $ts $prob $frac $rate" >> "$tmp"; continue
+            echo "$ip $score $prev $ts $prob $frac $rate $strikes $lastban" >> "$tmp"; continue
         fi
         if [ "${CONN_COUNT[$ip]:-0}" -ge "$CONN_THRESHOLD" ]; then
-            echo "$ip $score $prev $ts $prob $frac $rate" >> "$tmp"; continue
+            echo "$ip $score $prev $ts $prob $frac $rate $strikes $lastban" >> "$tmp"; continue
         fi
         if [ "$score" -ge 100 ] && [ "$prob" -le "$now" ] && [ $(( now - ts )) -gt 86400 ]; then
             continue  # prune fully-recovered stale entries
@@ -123,9 +161,9 @@ reputation_sweep() {
             apply=$(( acc / 100 ))
             frac=$(( acc - apply * 100 ))
             ns=$(( score + apply )); [ "$ns" -gt 100 ] && ns=100
-            echo "$ip $ns $prev $now $prob $frac $rate" >> "$tmp"
+            echo "$ip $ns $prev $now $prob $frac $rate $strikes $lastban" >> "$tmp"
         else
-            echo "$ip $score $prev $ts $prob $frac $rate" >> "$tmp"
+            echo "$ip $score $prev $ts $prob $frac $rate $strikes $lastban" >> "$tmp"
         fi
     done < "$SCORE_FILE"
     mv "$tmp" "$SCORE_FILE" 2>/dev/null || true
@@ -175,13 +213,16 @@ update_score() {
     read -r CHURN SUST SYNP RS <<< "$(awk \
         -v cur="$cur" -v prev="$REP_PREV_CNT" -v syn="$syn" \
         -v dt="$dt" -v rate_prev="${REP_RATE:-0}" -v thr="$CONN_THRESHOLD" \
+        -v ca="${CHURN_ALLOW:-2}" -v cw="${CHURN_WEIGHT:-1.2}" -v ccap="${CHURN_CAP:-30}" \
+        -v sdiv="${SUST_DIV:-40}" -v scap="${SUST_CAP:-20}" \
+        -v smin="${SYN_MIN:-20}" -v srat="${SYN_RATIO:-0.5}" -v sw="${SYN_WEIGHT:-40}" -v sycap="${SYN_CAP:-15}" \
         'BEGIN{
             r = (prev > 0) ? ((cur >= prev) ? (cur - prev) / dt : 0) : cur / dt;
             rs = 0.5 * r + 0.5 * (rate_prev / 100);
-            churn = (rs <= 2) ? 0 : (rs - 2) * 1.2; if (churn > 30) churn = 30;
-            ex = cur - thr; sust = (ex <= 0) ? 0 : ex / 40; if (sust > 20) sust = 20;
+            churn = (rs <= ca) ? 0 : (rs - ca) * cw; if (churn > ccap) churn = ccap;
+            ex = cur - thr; sust = (ex <= 0) ? 0 : ex / sdiv; if (sust > scap) sust = scap;
             synp = 0;
-            if (syn >= 20 && cur > 0) { ratio = syn / cur; if (ratio > 0.5) { synp = (ratio - 0.5) * 40; if (synp > 15) synp = 15; } }
+            if (syn >= smin && cur > 0) { ratio = syn / cur; if (ratio > srat) { synp = (ratio - srat) * sw; if (synp > sycap) synp = sycap; } }
             printf "%.2f %.2f %.2f %.2f", churn, sust, synp, rs;
         }')"
     REP_RATE=$(awk -v rs="$RS" 'BEGIN{ printf "%d", rs * 100 + 0.5 }')
@@ -217,10 +258,21 @@ update_score() {
     # ── Enforce band (graduated, only escalate) ──
     if [ "$REP_SCORE" -lt "$SCORE_BAN" ]; then
         if ! state_has_ip "$BANNED_LIST" "$ip"; then
-            log " REP-BAN: $ip | score $REP_SCORE (below $SCORE_BAN) -> ban ${BAN_HOURS}h"
-            nx_throttle "$ip"
-            nx_ban "$ip"
-            rep_on_ban "$ip"
+            # Stress gate (Phase 1d, F5 pattern): on a host that is NOT
+            # under stress, a first offence in the shallow ban band is
+            # a throttle, not a ban — anomalies alone do not prove the
+            # host needs relief. Deep scores (<10) and repeat offenders
+            # (strikes > 0) always ban.
+            if [ "${STRESS_GATE:-1}" = "1" ] && [ "$REP_SCORE" -ge 10 ] \
+               && [ "${REP_STRIKES:-0}" -eq 0 ] && ! nx_host_stressed; then
+                nx_hard_throttle "$ip"
+                log " GATE: $ip | score $REP_SCORE - ban deferred (host not stressed) -> hard throttle"
+            else
+                log " REP-BAN: $ip | score $REP_SCORE (below $SCORE_BAN) -> ban (progressive)"
+                nx_throttle "$ip"
+                nx_ban "$ip"
+                rep_on_ban "$ip"
+            fi
         fi
     elif [ "$REP_SCORE" -lt "$SCORE_HARD" ]; then
         nx_hard_throttle "$ip"

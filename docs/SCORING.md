@@ -1,4 +1,21 @@
-# NexoShield reputation scoring — model v2
+# NexoShield reputation scoring — model v2 (v2.1 in 3.8.0)
+
+> **Phase 1 addendum (DPI upgrade, 2026-10-24).** The v2 mathematics
+> below are unchanged; what changed is everything around them:
+> **(1a)** every constant in this document is now tunable in
+> `/etc/antiddos/scoring.conf` (defaults identical; the daemon re-reads
+> on mtime). **(1b)** bans are enforced through nftables timed sets
+> (`inet nexoshield`, exempt set checked inside the drop chain) when
+> nft is available, with the iptables path as fallback — state files
+> remain the source of truth. **(1c)** ban duration is progressive:
+> `ban_base_minutes` (30) doubling per strike recorded in reputation
+> fields 8/9, capped at `ban_max_minutes` (7 d), strikes expiring
+> after 7 clean days; subnet bans need >= `subnet_min_offenders` (5)
+> distinct over-gate IPs and last `subnet_ban_minutes` (60).
+> **(1d)** a stress gate guards the ban band: a first offence landing
+> at score 10-19 on a host that is NOT stressed (load, backlog
+> overflows, conntrack pressure) is hard-throttled instead of banned;
+> deep scores, repeat offenders and stressed hosts ban as before.
 
 The auto-ban daemon scores every non-exempt IP from 100 down. Bands:
 `<80` suspect (watch), `<60` throttle 100 Mbps, `<40` hard throttle

@@ -12,6 +12,7 @@ unban_expired() {
         if [ "$NOW" -gt "$EXPIRE" ]; then
             # Skip subnet bans — handled by unban_subnet_expired
             [[ "$ip" == *"/"* ]] && NEWLIST="${NEWLIST}${ip} ${ts} ${duration}\n" && continue
+            nx_ban_remove_fw "$ip"
             [[ "$ip" == *":"* ]] && ip6tables -D INPUT -s "$ip" -m comment --comment "auto-ban" -j DROP 2>/dev/null || true
             iptables -D INPUT -s "$ip" -m comment --comment "auto-ban" -j DROP \
                 2>/dev/null || true
@@ -41,17 +42,17 @@ reconcile_bans() {
         ts="${ts//[^0-9]/}"; ts="${ts:-0}"
         duration="${duration//[^0-9]/}"; duration="${duration:-14400}"
         [ $(( ts + duration )) -le "$now" ] && continue
+        # Phase 1b: re-apply through the active backend with the
+        # REMAINING duration (nft elements lost their timeouts in a
+        # reboot; iptables rules are simply absent).
         case "$ip" in
-            *:*) ip6tables -C INPUT -s "$ip" -m comment --comment "auto-ban" -j DROP 2>/dev/null || ip6tables -I INPUT -s "$ip" -m comment --comment "auto-ban" -j DROP 2>/dev/null || true ;;
-            */*) iptables -C INPUT -s "$ip" -m comment --comment "subnet-ban" -j DROP 2>/dev/null || \
-                 iptables -I INPUT -s "$ip" -m comment --comment "subnet-ban" -j DROP 2>/dev/null || true ;;
-            *)   iptables -C INPUT -s "$ip" -m comment --comment "auto-ban" -j DROP 2>/dev/null || \
-                 iptables -I INPUT -s "$ip" -m comment --comment "auto-ban" -j DROP 2>/dev/null || true ;;
+            */*) nx_ban_apply "$ip" $(( ts + duration - now )) "subnet-ban" ;;
+            *)   nx_ban_apply "$ip" $(( ts + duration - now )) "auto-ban" ;;
         esac
     done < "$BANNED_LIST"
     unban_expired
     unban_subnet_expired
-    log " RECONCILE: unexpired bans re-applied to iptables from state"
+    log " RECONCILE: unexpired bans re-applied via $NX_BAN_BACKEND backend from state"
 }
 
 # FR-2 watchdog (D2): if a DROP rule or throttle entry ever targets one
@@ -98,6 +99,9 @@ log " Smart throttle+ban started (conn_threshold:${CONN_THRESHOLD} ban_threshold
 
 score_init
 
+# Phase 1b: pick the ban backend before reconcile projects state into it.
+nx_resolve_ban_backend
+
 # Restore throttle filters recorded before a restart/reboot (the qdisc
 # may have been rebuilt without them - see reapply_throttles, BUG-022).
 # After a reboot /tmp is empty: pull the state back from the mirror
@@ -111,6 +115,8 @@ reconcile_bans
 
 CYCLE=0
 while true; do
+    nx_maybe_reload_scoring_config
+    nx_update_stress
     CYCLE=$((CYCLE + 1))
 
     # Keep the persistent throttle mirror current (U-11).
@@ -266,7 +272,7 @@ while true; do
     # ── Subnet /24 botnet detection ──────────────────────────
     # Aggregate connections by /24 subnet to detect distributed botnets
     # where each attacker IP stays under the per-IP threshold.
-    declare -A SUBNET_COUNT
+    declare -A SUBNET_COUNT SUBNET_OFFENDERS
     for ip in "${!CONN_COUNT[@]}"; do
         # BUG-011: exempt traffic (CF/self/whitelist) never counts toward
         # a subnet ban - it used to inflate the totals.
@@ -275,6 +281,12 @@ while true; do
         subnet=$(echo "$ip" | grep -oP '^\d+\.\d+\.\d+')
         [ -z "$subnet" ] && continue
         SUBNET_COUNT["$subnet"]=$(( ${SUBNET_COUNT[$subnet]:-0} + ${CONN_COUNT[$ip]:-0} ))
+        # Phase 1c guardrail: count DISTINCT member IPs that are each
+        # individually over the per-IP gate. A /24 whose total comes
+        # from one heavy member (or a CGNAT pool of normal users) is
+        # not a botnet signature.
+        [ "${CONN_COUNT[$ip]:-0}" -ge "$CONN_THRESHOLD" ] && \
+            SUBNET_OFFENDERS["$subnet"]=$(( ${SUBNET_OFFENDERS[$subnet]:-0} + 1 ))
     done
 
     for subnet in "${!SUBNET_COUNT[@]}"; do
@@ -282,12 +294,16 @@ while true; do
         [ "$total" -lt "$SUBNET_THRESHOLD" ] && continue
         # Skip if a CF range overlaps this /24 (real overlap test)
         subnet_overlaps_cf "$subnet" && continue
-        # Already banned as subnet?
-        iptables -C INPUT -s "${subnet}.0/24" -m comment --comment "subnet-ban" \
-            -j DROP 2>/dev/null && continue
+        # Already banned as subnet? (state, Phase 1b)
+        state_has_ip "$BANNED_LIST" "${subnet}.0/24" && continue
 
         if [ "$total" -ge "$SUBNET_BAN_THRESHOLD" ]; then
-            ban_subnet "$subnet"
+            if [ "${SUBNET_OFFENDERS[$subnet]:-0}" -ge "$SUBNET_MIN_OFFENDERS" ]; then
+                ban_subnet "$subnet"
+            elif ! state_has_ip "$SUBNET_WATCH_LIST" "$subnet"; then
+                echo "$subnet $(date +%s)" >> "$SUBNET_WATCH_LIST"
+                log " SUBNET GUARD: ${subnet}.0/24 | $total conns but only ${SUBNET_OFFENDERS[$subnet]:-0} distinct offenders (< $SUBNET_MIN_OFFENDERS) - not banning (shared-egress guardrail)"
+            fi
         else
             # Watch mode: log first sighting
             if ! state_has_ip "$SUBNET_WATCH_LIST" "$subnet"; then
@@ -302,7 +318,8 @@ while true; do
                 # for OBSERVE_SECONDS used to ban a /24 the design says
                 # to merely watch - the effective trigger was 400/45s,
                 # not the documented 1000.
-                if [ "$SELAPSED" -ge "$OBSERVE_SECONDS" ] && [ "$total" -ge "$SUBNET_BAN_THRESHOLD" ]; then
+                if [ "$SELAPSED" -ge "$OBSERVE_SECONDS" ] && [ "$total" -ge "$SUBNET_BAN_THRESHOLD" ] \
+                   && [ "${SUBNET_OFFENDERS[$subnet]:-0}" -ge "$SUBNET_MIN_OFFENDERS" ]; then
                     log " SUBNET HIGH: ${subnet}.0/24 | ${total} conns for ${SELAPSED}s → banning"
                     ban_subnet "$subnet"
                     state_del_ip "$SUBNET_WATCH_LIST" "$subnet"

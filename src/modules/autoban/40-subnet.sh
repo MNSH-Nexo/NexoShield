@@ -37,15 +37,16 @@ ban_subnet() {
             fi
         done < "$WHITELIST_FILE"
     fi
-    # Already banned?
-    iptables -C INPUT -s "$cidr" -m comment --comment "subnet-ban" -j DROP 2>/dev/null && return 0
-    # Record state only for a rule that actually landed (BUG-024 rule).
-    if ! iptables -I INPUT -s "$cidr" -m comment --comment "subnet-ban" -j DROP 2>/dev/null; then
-        log " SUBNET BAN FAILED: $cidr - iptables refused the rule; state NOT recorded"
+    # Already banned? (state is the source of truth, Phase 1b)
+    state_has_ip "$BANNED_LIST" "$cidr" && return 0
+    # Phase 1c: subnet bans are short (guardrail vs shared-egress
+    # collateral) and ride the same backend as single-IP bans.
+    if ! nx_ban_apply "$cidr" $((${SUBNET_BAN_MINUTES:-60} * 60)) "subnet-ban"; then
+        log " SUBNET BAN FAILED: $cidr - backend refused; state NOT recorded"
         return 1
     fi
-    echo "$cidr $(date +%s) $((BAN_HOURS * 3600))" >> "$BANNED_LIST"
-    log " SUBNET BAN: $cidr | botnet distributed attack detected | unban: ${BAN_HOURS}h"
+    echo "$cidr $(date +%s) $((${SUBNET_BAN_MINUTES:-60} * 60))" >> "$BANNED_LIST"
+    log " SUBNET BAN: $cidr | botnet distributed attack detected | unban: ${SUBNET_BAN_MINUTES:-60}min"
 }
 
 unban_subnet_expired() {
@@ -60,6 +61,7 @@ unban_subnet_expired() {
         duration="${duration//[^0-9]/}"; duration="${duration:-14400}"
         local EXPIRE=$(( ts + duration ))
         if [ "$NOW" -gt "$EXPIRE" ]; then
+            nx_ban_remove_fw "$ip"
             iptables -D INPUT -s "$ip" -m comment --comment "subnet-ban" -j DROP 2>/dev/null || true
             log " SUBNET UNBANNED: $ip (expired)"
         else

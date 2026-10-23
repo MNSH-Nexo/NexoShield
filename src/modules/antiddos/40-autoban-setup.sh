@@ -3,6 +3,11 @@
 setup_autoban() {
     info "Setting up smart throttle+ban..."
 
+    # Phase 1a: install the default scoring config (never overwrites
+    # an admin-edited one). The daemon works without it (defaults),
+    # but shipping it documents every tunable in place.
+    nx_ensure_scoring_config || true
+
     # Require tcpdump
     if ! command -v tcpdump >/dev/null 2>&1; then
         if command -v apt-get >/dev/null 2>&1; then

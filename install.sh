@@ -3,7 +3,7 @@ exec bash <(tr -d '\r' < "$0" | tail -n +3) "$@"
 #!/bin/bash
 # ── GENERATED FILE ─ built by tools/build.py from src/ ─ do not edit directly; edit the sources and rebuild ──
 # ============================================================
-#  Proxy Manager - Auto Installer  v3.7.1
+#  Proxy Manager - Auto Installer  v3.8.0
 #  One file, one command, everything ready
 #
 #  Install:
@@ -28,7 +28,7 @@ exec bash <(tr -d '\r' < "$0" | tail -n +3) "$@"
 # ============================================================
 set -euo pipefail
 
-VERSION="3.7.1"
+VERSION="3.8.0"
 INSTALL_DIR="/opt/proxy-manager"
 BIN_LINK="/usr/local/bin/proxy"
 LOG="/var/log/proxy-manager-install.log"
@@ -2003,7 +2003,7 @@ TARGET_FILE="/etc/sysctl.d/99-vpn-optimized.conf"
 SNAPSHOT_DIR="/var/lib/vpn-sysctl-snapshots"
 LOG_FILE="/var/log/vpn-sysctl-optimizer.log"
 LOCK_FILE="/var/run/vpn-sysctl.lock"
-SCRIPT_VERSION="3.7.1"
+SCRIPT_VERSION="3.8.0"
 
 [ "$EUID" -ne 0 ] && echo -e "${RED}Root required${NC}" && exit 1
 
@@ -2594,7 +2594,7 @@ cat > "$INSTALL_DIR/.proxy-menu.sh.nxnew" << 'MENU_SCRIPT'
 # SC2094 - atomic state writes via tmp-file + rename, which the
 # checker flags as same-file pipelines. Both classes were audited
 # site-by-site during the fix waves (docs/FIX-PLAN.md).
-VERSION="3.7.1"
+VERSION="3.8.0"
 INSTALL_DIR="/opt/proxy-manager"
 _BSRC="${BASH_SOURCE[0]:-}"
 if [ -n "$_BSRC" ] && [ "$_BSRC" != "/dev/stdin" ] && [[ "$_BSRC" != /dev/fd/* ]]; then
@@ -2715,6 +2715,14 @@ nx_throttle_file() {
 # throttle-filter cleanup, fail2ban unban - shared by every screen.
 nx_unban_ip() {
     local _ip="$1" _tf _prio _if _j
+    # Phase 1b: if the daemon's nft backend holds this ban, remove the
+    # set element too (the iptables deletes below stay as belt-and-braces).
+    if command -v nft >/dev/null 2>&1; then
+        case "$_ip" in
+            *:*) nft delete element inet nexoshield ban6 "{ $_ip }" >/dev/null 2>&1 || true ;;
+            *)   nft delete element inet nexoshield ban4 "{ $_ip }" >/dev/null 2>&1 || true ;;
+        esac
+    fi
     case "$_ip" in
         *:*)
             ip6tables -D INPUT -s "$_ip" -m comment --comment "auto-ban" -j DROP 2>/dev/null || true ;;
@@ -3699,7 +3707,7 @@ cat > "$INSTALL_DIR/.antiddos.sh.nxnew" << 'ANTIDDOS_SCRIPT'
 # checker flags as same-file pipelines. Both classes were audited
 # site-by-site during the fix waves (docs/FIX-PLAN.md).
 # ============================================================
-#  Anti-DDoS Protection Manager v3.7.1
+#  Anti-DDoS Protection Manager v3.8.0
 #
 #  Layers:
 #    1. Kernel (sysctl hardening + tight conntrack timeouts)
@@ -3723,7 +3731,7 @@ set -euo pipefail
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 CYAN='\033[0;36m'; WHITE='\033[1;37m'; DIM='\033[2m'; BOLD='\033[1m'; NC='\033[0m'
 
-SCRIPT_VERSION="3.7.1"
+SCRIPT_VERSION="3.8.0"
 LOG_FILE="/var/log/antiddos.log"
 STATE_FILE="/etc/antiddos/state.conf"
 BANNED_LIST="/etc/antiddos/banned.list"
@@ -3920,6 +3928,118 @@ list_self_ips_all() {
           grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' "$NX_PUBLIC_IPS_FILE" 2>/dev/null
       fi
     } | sort -u | grep -v '^$'
+}
+NX_CONFIG_FILE="${NX_CONFIG_FILE:-/etc/antiddos/scoring.conf}"
+
+declare -A _NX_CFG_CACHE=() _NX_CFG_WARNED=()
+_NX_CFG_MTIME=""
+_NX_CFG_CHECKED=0
+
+_nx_cfg_stat() {
+    stat -c %Y "$NX_CONFIG_FILE" 2>/dev/null || echo "absent"
+}
+
+# Reload the cache when the file changed (cheap: one stat per second).
+_nx_cfg_refresh() {
+    local now=$EPOCHSECONDS m
+    [ $((now - _NX_CFG_CHECKED)) -lt 1 ] && return 0
+    _NX_CFG_CHECKED=$now
+    m="$(_nx_cfg_stat)"
+    if [ "$m" != "$_NX_CFG_MTIME" ]; then
+        _NX_CFG_MTIME="$m"
+        _NX_CFG_CACHE=()
+    fi
+}
+
+_nx_cfg_warn() {
+    [ -n "${_NX_CFG_WARNED[$1]:-}" ] && return 0
+    _NX_CFG_WARNED[$1]=1
+    if declare -F log >/dev/null 2>&1; then
+        log " CONFIG: ignoring invalid value for '$1' in $NX_CONFIG_FILE (using default)"
+    else
+        echo "CONFIG: ignoring invalid value for '$1' in $NX_CONFIG_FILE (using default)" >&2
+    fi
+}
+
+nx_cfg() {
+    local key="$1" def="$2" raw=""
+    _nx_cfg_refresh
+    if [ -n "${_NX_CFG_CACHE[$key]+set}" ]; then
+        printf '%s' "${_NX_CFG_CACHE[$key]}"
+        return 0
+    fi
+    if [ -f "$NX_CONFIG_FILE" ]; then
+        raw=$(grep -E "^[[:space:]]*${key}[[:space:]]*=" "$NX_CONFIG_FILE" 2>/dev/null \
+              | tail -n 1 | cut -d= -f2- | tr -d ' \t\r"')
+    fi
+    if [ -n "$raw" ]; then
+        if [[ "$raw" =~ ^-?[0-9]+([.][0-9]+)?$ ]]; then
+            _NX_CFG_CACHE[$key]="$raw"
+            printf '%s' "$raw"
+            return 0
+        fi
+        _nx_cfg_warn "$key"
+    fi
+    _NX_CFG_CACHE[$key]="$def"
+    printf '%s' "$def"
+}
+
+# Write the default config at install time. NEVER overwrites an existing
+# file — admin edits are sacred. Every key is documented inline.
+nx_ensure_scoring_config() {
+    local f="${NX_CONFIG_FILE:-/etc/antiddos/scoring.conf}"
+    [ -f "$f" ] && return 0
+    mkdir -p "$(dirname "$f")" 2>/dev/null || return 1
+    cat > "$f" <<'EOF'
+# NexoShield scoring configuration — every value is optional.
+# Delete a line (or this whole file) to return that knob to its default.
+# Changes take effect within seconds; the daemon re-reads on mtime.
+# All values must be numeric. Invalid values are ignored with a warning.
+
+# ── Score bands (0-100 reputation) ──
+score_ban=20            # below: ban (progressive duration)
+score_hard=40           # below: hard throttle 50 Mbps
+score_throttle=60       # below: throttle 100 Mbps
+score_suspect=80        # below: watch only
+
+# ── Score movement (points per minute) ──
+score_recover_per_min=6
+probation_recover_per_min=10
+score_drop_cap_per_min=45
+probation_score=50
+probation_seconds=1800
+
+# ── Term weights ──
+churn_allow_per_sec=2   # free new-connection rate before churn applies
+churn_weight=1.2        # points/min per conn/s above the allowance
+churn_cap=30
+sust_divisor=40         # connections over threshold per point/min
+sust_cap=20
+syn_min=20              # min half-open conns before the SYN term arms
+syn_ratio=0.5           # half-open share that starts costing points
+syn_weight=40
+syn_cap=15
+
+# ── Gates ──
+conn_threshold=120      # active conns from one IP = start watching
+ban_conn_threshold=300  # active conns = instant throttle+ban
+observe_seconds=45      # watch window before throttle (legit spikes)
+
+# ── Bans ──
+ban_base_minutes=30     # first ban; doubles per repeat offence
+ban_max_minutes=10080   # cap (7 days)
+ban_hours_fallback=4    # legacy flat duration for non-progressive paths
+
+# ── Subnet (/24) ──
+subnet_threshold=400        # total conns = start watching
+subnet_ban_threshold=1000     # total conns = block (with guardrails)
+subnet_min_offenders=5        # distinct IPs that must be over the gate
+subnet_ban_minutes=60
+
+# ── Stress gate (Phase 1d) ──
+stress_gate=1           # 1: score bans need host stress (or score < 10)
+EOF
+    chmod 644 "$f" 2>/dev/null || true
 }
 
 # Detect environment
@@ -4821,6 +4941,11 @@ update_f2b_ignoreip() {
 setup_autoban() {
     info "Setting up smart throttle+ban..."
 
+    # Phase 1a: install the default scoring config (never overwrites
+    # an admin-edited one). The daemon works without it (defaults),
+    # but shipping it documents every tunable in place.
+    nx_ensure_scoring_config || true
+
     # Require tcpdump
     if ! command -v tcpdump >/dev/null 2>&1; then
         if command -v apt-get >/dev/null 2>&1; then
@@ -4866,23 +4991,135 @@ WHITELIST_FILE="/etc/antiddos/whitelist.list"
 # and survives service restarts.
 SCORE_DIR="/var/lib/antiddos/scores"
 SCORE_FILE="$SCORE_DIR/reputation.dat"
+# Tunable scoring config (Phase 1a): every constant below can be
+# overridden in /etc/antiddos/scoring.conf; defaults are the historical
+# values, so a missing file changes nothing.
+NX_CONFIG_FILE="${NX_CONFIG_FILE:-/etc/antiddos/scoring.conf}"
+
+declare -A _NX_CFG_CACHE=() _NX_CFG_WARNED=()
+_NX_CFG_MTIME=""
+_NX_CFG_CHECKED=0
+
+_nx_cfg_stat() {
+    stat -c %Y "$NX_CONFIG_FILE" 2>/dev/null || echo "absent"
+}
+
+# Reload the cache when the file changed (cheap: one stat per second).
+_nx_cfg_refresh() {
+    local now=$EPOCHSECONDS m
+    [ $((now - _NX_CFG_CHECKED)) -lt 1 ] && return 0
+    _NX_CFG_CHECKED=$now
+    m="$(_nx_cfg_stat)"
+    if [ "$m" != "$_NX_CFG_MTIME" ]; then
+        _NX_CFG_MTIME="$m"
+        _NX_CFG_CACHE=()
+    fi
+}
+
+_nx_cfg_warn() {
+    [ -n "${_NX_CFG_WARNED[$1]:-}" ] && return 0
+    _NX_CFG_WARNED[$1]=1
+    if declare -F log >/dev/null 2>&1; then
+        log " CONFIG: ignoring invalid value for '$1' in $NX_CONFIG_FILE (using default)"
+    else
+        echo "CONFIG: ignoring invalid value for '$1' in $NX_CONFIG_FILE (using default)" >&2
+    fi
+}
+
+nx_cfg() {
+    local key="$1" def="$2" raw=""
+    _nx_cfg_refresh
+    if [ -n "${_NX_CFG_CACHE[$key]+set}" ]; then
+        printf '%s' "${_NX_CFG_CACHE[$key]}"
+        return 0
+    fi
+    if [ -f "$NX_CONFIG_FILE" ]; then
+        raw=$(grep -E "^[[:space:]]*${key}[[:space:]]*=" "$NX_CONFIG_FILE" 2>/dev/null \
+              | tail -n 1 | cut -d= -f2- | tr -d ' \t\r"')
+    fi
+    if [ -n "$raw" ]; then
+        if [[ "$raw" =~ ^-?[0-9]+([.][0-9]+)?$ ]]; then
+            _NX_CFG_CACHE[$key]="$raw"
+            printf '%s' "$raw"
+            return 0
+        fi
+        _nx_cfg_warn "$key"
+    fi
+    _NX_CFG_CACHE[$key]="$def"
+    printf '%s' "$def"
+}
+
+# Write the default config at install time. NEVER overwrites an existing
+# file — admin edits are sacred. Every key is documented inline.
+nx_ensure_scoring_config() {
+    local f="${NX_CONFIG_FILE:-/etc/antiddos/scoring.conf}"
+    [ -f "$f" ] && return 0
+    mkdir -p "$(dirname "$f")" 2>/dev/null || return 1
+    cat > "$f" <<'EOF'
+# NexoShield scoring configuration — every value is optional.
+# Delete a line (or this whole file) to return that knob to its default.
+# Changes take effect within seconds; the daemon re-reads on mtime.
+# All values must be numeric. Invalid values are ignored with a warning.
+
+# ── Score bands (0-100 reputation) ──
+score_ban=20            # below: ban (progressive duration)
+score_hard=40           # below: hard throttle 50 Mbps
+score_throttle=60       # below: throttle 100 Mbps
+score_suspect=80        # below: watch only
+
+# ── Score movement (points per minute) ──
+score_recover_per_min=6
+probation_recover_per_min=10
+score_drop_cap_per_min=45
+probation_score=50
+probation_seconds=1800
+
+# ── Term weights ──
+churn_allow_per_sec=2   # free new-connection rate before churn applies
+churn_weight=1.2        # points/min per conn/s above the allowance
+churn_cap=30
+sust_divisor=40         # connections over threshold per point/min
+sust_cap=20
+syn_min=20              # min half-open conns before the SYN term arms
+syn_ratio=0.5           # half-open share that starts costing points
+syn_weight=40
+syn_cap=15
+
+# ── Gates ──
+conn_threshold=120      # active conns from one IP = start watching
+ban_conn_threshold=300  # active conns = instant throttle+ban
+observe_seconds=45      # watch window before throttle (legit spikes)
+
+# ── Bans ──
+ban_base_minutes=30     # first ban; doubles per repeat offence
+ban_max_minutes=10080   # cap (7 days)
+ban_hours_fallback=4    # legacy flat duration for non-progressive paths
+
+# ── Subnet (/24) ──
+subnet_threshold=400        # total conns = start watching
+subnet_ban_threshold=1000     # total conns = block (with guardrails)
+subnet_min_offenders=5        # distinct IPs that must be over the gate
+subnet_ban_minutes=60
+
+# ── Stress gate (Phase 1d) ──
+stress_gate=1           # 1: score bans need host stress (or score < 10)
+EOF
+    chmod 644 "$f" 2>/dev/null || true
+}
+
 # Bands (see research: adaptive/graduated enforcement beats one-shot ban):
 #  100-80 NORMAL    no action (only watched if above CONN_THRESHOLD)
 #   79-60 SUSPECT   watch only, no penalty
 #   59-40 THROTTLED move to class 1:30 (100Mbps)
 #   39-20 HARD      move to class 1:40 (50Mbps)
 #   <20  BANNED     ban_ip (4h)
-SCORE_BAN=20
-SCORE_HARD=40
-SCORE_THROTTLE=60
-SCORE_SUSPECT=80
+# (values assigned by nx_load_scoring_config below)
 # Scoring model v2 (docs/SCORING.md): every score movement is rated in
 # points per MINUTE and scaled by the real elapsed time of the sample,
 # so an IP's fate depends on its behaviour - never on daemon loop speed.
 # Fractional points accumulate in the score file instead of rounding
 # away each cycle.
-SCORE_RECOVER_PER_MIN=6
-SCORE_DROP_CAP_PER_MIN=45
+# (recover/drop-cap assigned by nx_load_scoring_config below)
 # Probation (D3, FR-3): EVERY ban - reputation, classic or instant - ends
 # in the same defined state: the IP returns at PROBATION_SCORE with a
 # probation window. During probation, recovery is faster (10/min) but
@@ -4890,9 +5127,7 @@ SCORE_DROP_CAP_PER_MIN=45
 # reach the ban band again, so one minor spike cannot re-ban (the old
 # behaviour: score stayed wherever the ban path left it, often <20, so
 # the smallest trigger re-banned instantly - a de-facto permanent ban).
-PROBATION_SCORE=50
-PROBATION_SECONDS=1800
-PROBATION_RECOVER_PER_MIN=10
+# (probation values assigned by nx_load_scoring_config below)
 # When connections are counted we snapshot the previous sample to derive the
 # new-connection rate (attacker signature) without per-packet overhead.
 
@@ -4904,11 +5139,9 @@ PROBATION_RECOVER_PER_MIN=10
 # Set CONN_THRESHOLD well above ANY legitimate user so normal speed is never
 # limited, but far below a flood. OBSERVE allows brief legit spikes (a download
 # manager burst) to pass untouched before any action.
-CONN_THRESHOLD=120    # active connections from one IP = start watching (safe margin)
-BAN_CONN_THRESHOLD=300  # active connections from one IP = immediate throttle+ban
-OBSERVE_SECONDS=45    # seconds to watch before throttle (tolerates legit spikes)
 THROTTLE_MBPS=100    # throttle bandwidth in Mbps (must match tc class 1:30 = 100mbit)
-BAN_HOURS=4          # hours to ban after throttle
+# CONN_THRESHOLD / BAN_CONN_THRESHOLD / OBSERVE_SECONDS / BAN_HOURS are
+# assigned by nx_load_scoring_config below (defaults 120 / 300 / 45 / 4).
 # Sample cadence. 2s (was 4s): churn rate is already normalized per-second, so
 # scoring bands are unchanged, but short <4s bursts from a 120+ conn IP are now
 # caught instead of being averaged out. Recovery of well-behaved IPs is also 2x
@@ -4925,10 +5158,50 @@ SAMPLE_INTERVAL=2    # seconds per measurement
 # Normal ISP: ~5-10 users behind NAT/CGNAT, each ~20 conns = ~200 total.
 # A very heavy CGNAT node (many legit users) could reach ~400.
 # Botnet with 50 IPs × 100+ conns = 5000 → way above threshold.
-SUBNET_THRESHOLD=400       # total conns from /24 = start watching subnet
-SUBNET_BAN_THRESHOLD=1000  # total conns from /24 = block subnet
+# SUBNET_THRESHOLD / SUBNET_BAN_THRESHOLD assigned below (defaults 400 / 1000).
 SUBNET_WATCH_LIST="/tmp/autoban_subnet_watch"
 touch "$SUBNET_WATCH_LIST" 2>/dev/null || true
+
+# ── Scoring config loader (Phase 1a) ─────────────────────────────
+# Every scoring knob resolves through nx_cfg: config file wins, the
+# literal default (the historical constant) is the fallback.
+_NX_CFG_LOADED_MTIME=""
+nx_load_scoring_config() {
+    SCORE_BAN=$(nx_cfg score_ban 20)
+    SCORE_HARD=$(nx_cfg score_hard 40)
+    SCORE_THROTTLE=$(nx_cfg score_throttle 60)
+    SCORE_SUSPECT=$(nx_cfg score_suspect 80)
+    SCORE_RECOVER_PER_MIN=$(nx_cfg score_recover_per_min 6)
+    SCORE_DROP_CAP_PER_MIN=$(nx_cfg score_drop_cap_per_min 45)
+    PROBATION_SCORE=$(nx_cfg probation_score 50)
+    PROBATION_SECONDS=$(nx_cfg probation_seconds 1800)
+    PROBATION_RECOVER_PER_MIN=$(nx_cfg probation_recover_per_min 10)
+    CHURN_ALLOW=$(nx_cfg churn_allow_per_sec 2)
+    CHURN_WEIGHT=$(nx_cfg churn_weight 1.2)
+    CHURN_CAP=$(nx_cfg churn_cap 30)
+    SUST_DIV=$(nx_cfg sust_divisor 40)
+    SUST_CAP=$(nx_cfg sust_cap 20)
+    SYN_MIN=$(nx_cfg syn_min 20)
+    SYN_RATIO=$(nx_cfg syn_ratio 0.5)
+    SYN_WEIGHT=$(nx_cfg syn_weight 40)
+    SYN_CAP=$(nx_cfg syn_cap 15)
+    CONN_THRESHOLD=$(nx_cfg conn_threshold 120)
+    BAN_CONN_THRESHOLD=$(nx_cfg ban_conn_threshold 300)
+    OBSERVE_SECONDS=$(nx_cfg observe_seconds 45)
+    BAN_HOURS=$(nx_cfg ban_hours_fallback 4)
+    BAN_BASE_MINUTES=$(nx_cfg ban_base_minutes 30)
+    BAN_MAX_MINUTES=$(nx_cfg ban_max_minutes 10080)
+    SUBNET_THRESHOLD=$(nx_cfg subnet_threshold 400)
+    SUBNET_BAN_THRESHOLD=$(nx_cfg subnet_ban_threshold 1000)
+    SUBNET_MIN_OFFENDERS=$(nx_cfg subnet_min_offenders 5)
+    SUBNET_BAN_MINUTES=$(nx_cfg subnet_ban_minutes 60)
+    STRESS_GATE=$(nx_cfg stress_gate 1)
+    _NX_CFG_LOADED_MTIME="$(_nx_cfg_stat)"
+}
+nx_maybe_reload_scoring_config() {
+    [ "$(_nx_cfg_stat)" != "$_NX_CFG_LOADED_MTIME" ] && nx_load_scoring_config
+}
+nx_load_scoring_config
 
 # Detect main interface
 IF=$(ip route show default 2>/dev/null | awk '/default/{print $5}' | head -1)
@@ -5479,6 +5752,158 @@ hard_throttle_ip() {
     fi
 }
 
+# ── Ban backend (Phase 1b): nftables timed sets ──────────────────
+# State files stay the source of truth; the kernel side is a projection.
+# With the nft backend, bans live in ONE inet table whose sets give
+# ~O(1) lookup (vs one iptables rule per ban, scanned per packet) and
+# the kernel itself expires elements (timeout = ban duration). The
+# chain checks the EXEMPT set before the ban set: defence in depth
+# behind the ban-choke guards, so FR-1/FR-2 hold even inside the
+# drop path. Backend resolves ONCE at daemon startup (nx_resolve_ban_
+# backend); until then, and whenever nft is unusable, the historical
+# iptables path applies — a stock install can never get worse.
+NX_BAN_BACKEND="${NX_BAN_BACKEND:-iptables}"
+
+nx_nft_ensure() {
+    nft list table inet nexoshield >/dev/null 2>&1 && return 0
+    nft -f - >/dev/null 2>&1 <<'NXNFT'
+table inet nexoshield {
+    set ban4 { type ipv4_addr; flags interval, timeout; }
+    set ban6 { type ipv6_addr; flags interval, timeout; }
+    set exempt4 { type ipv4_addr; flags interval; }
+    set exempt6 { type ipv6_addr; flags interval; }
+    chain input {
+        type filter hook input priority -10; policy accept;
+        ip saddr @exempt4 accept
+        ip6 saddr @exempt6 accept
+        ip saddr @ban4 drop
+        ip6 saddr @ban6 drop
+      }
+    }
+NXNFT
+}
+
+nx_resolve_ban_backend() {
+    if command -v nft >/dev/null 2>&1 && nx_nft_ensure; then
+        NX_BAN_BACKEND=nft
+        nx_nft_sync_exempt
+    else
+        NX_BAN_BACKEND=iptables
+    fi
+    log " BAN BACKEND: $NX_BAN_BACKEND"
+}
+
+# Project the exemption universe into the nft exempt sets: self IPs
+# (arrays + snapshots + discovered public IPs), the admin whitelist,
+# and the Cloudflare ranges — the same sources is_exempt* consult.
+nx_nft_sync_exempt() {
+    [ "$NX_BAN_BACKEND" = "nft" ] || return 0
+    local v4="" v6="" e
+    for e in "${SELF_IPS[@]}"; do [ -n "$e" ] && v4="${v4}${e}, "; done
+    for e in "${SELF6_IPS[@]}"; do [ -n "$e" ] && v6="${v6}${e}, "; done
+    for e in "${CF_RANGES[@]}"; do v4="${v4}${e}, "; done
+    for e in "${CF6_RANGES[@]}"; do v6="${v6}${e}, "; done
+    if [ -f "$WHITELIST_FILE" ]; then
+        while IFS= read -r e; do
+            e="${e%%#*}"; e="${e// /}"
+            [ -z "$e" ] && continue
+            case "$e" in *:*) v6="${v6}${e}, " ;; *) v4="${v4}${e}, " ;; esac
+        done < "$WHITELIST_FILE"
+    fi
+    local snap
+    for snap in /etc/antiddos/self-ips.list /etc/antiddos/public-ips.list; do
+        [ -f "$snap" ] || continue
+        while IFS= read -r e; do
+            [ -z "$e" ] && continue
+            case "$e" in *:*) v6="${v6}${e}, " ;; *) v4="${v4}${e}, " ;; esac
+        done < "$snap"
+    done
+    nft flush set inet nexoshield exempt4 2>/dev/null || true
+    nft flush set inet nexoshield exempt6 2>/dev/null || true
+    [ -n "$v4" ] && nft add element inet nexoshield exempt4 "{ ${v4%, } }" 2>/dev/null || true
+    [ -n "$v6" ] && nft add element inet nexoshield exempt6 "{ ${v6%, } }" 2>/dev/null || true
+}
+
+# nx_ban_apply <ip|cidr> <duration-sec> [comment] — enforce one ban in
+# the kernel via the active backend. Legacy fallback on any nft error.
+nx_ban_apply() {
+    local ip="$1" dur="$2" comment="${3:-auto-ban}" set
+    if [ "$NX_BAN_BACKEND" = "nft" ]; then
+        case "$ip" in *:*) set=ban6 ;; *) set=ban4 ;; esac
+        nft delete element inet nexoshield "$set" "{ $ip }" >/dev/null 2>&1 || true
+        if nft add element inet nexoshield "$set" "{ $ip timeout ${dur}s }" >/dev/null 2>&1; then
+            return 0
+        fi
+        log " NFT BAN FAILED for $ip - falling back to iptables"
+    fi
+    case "$ip" in
+        *:*) ip6tables -C INPUT -s "$ip" -m comment --comment "$comment" -j DROP 2>/dev/null || \
+             ip6tables -I INPUT -s "$ip" -m comment --comment "$comment" -j DROP 2>/dev/null ;;
+        *)   iptables -C INPUT -s "$ip" -m comment --comment "$comment" -j DROP 2>/dev/null || \
+             iptables -I INPUT -s "$ip" -m comment --comment "$comment" -j DROP 2>/dev/null ;;
+    esac
+}
+
+# nx_ban_remove_fw <ip|cidr> — kernel-side removal for the nft backend
+# (legacy iptables deletes stay at the call sites as belt-and-braces).
+nx_ban_remove_fw() {
+    [ "$NX_BAN_BACKEND" = "nft" ] || return 0
+    local set
+    case "$1" in *:*) set=ban6 ;; *) set=ban4 ;; esac
+    nft delete element inet nexoshield "$set" "{ $1 }" >/dev/null 2>&1 || true
+}
+
+# ── Host stress (Phase 1d) ────────────────────────────────────────
+# nx_update_stress runs once per cycle: it watches the kernel counters
+# that stay truthful under syncookies (RFC 4987) — ListenOverflows —
+# plus conntrack pressure. nx_host_stressed is the gate's oracle.
+NX_STRESSED_UNTIL=0
+_NX_OVF_PREV=""
+_NX_SYNCOOK_PREV=""
+_NX_SYNCOOK_LAST_LOG=0
+nx_update_stress() {
+    local now ovf scook
+    now=$(date +%s)
+    read -r ovf scook <<< "$(awk '
+        /^TcpExt:/ { if (!h) { for (i=2;i<=NF;i++) { if ($i=="ListenOverflows") co=i; if ($i=="SyncookiesSent") cs=i } h=1; next }
+                     print $(co), $(cs); exit }' /proc/net/netstat 2>/dev/null)"
+    ovf="${ovf//[^0-9]/}"; scook="${scook//[^0-9]/}"
+    if [ -n "$ovf" ]; then
+        if [ -n "$_NX_OVF_PREV" ] && [ "$ovf" -gt "$_NX_OVF_PREV" ]; then
+            NX_STRESSED_UNTIL=$(( now + 60 ))
+        fi
+        _NX_OVF_PREV="$ovf"
+    fi
+    if [ -n "$scook" ]; then
+        if [ -n "$_NX_SYNCOOK_PREV" ] && [ "$scook" -gt "$_NX_SYNCOOK_PREV" ] \
+           && [ $(( now - _NX_SYNCOOK_LAST_LOG )) -ge 60 ]; then
+            log " SYNPRESSURE: syncookies engaged (+$(( scook - _NX_SYNCOOK_PREV )) since last check) - SYN-RECV state is being absorbed by the kernel"
+            _NX_SYNCOOK_LAST_LOG=$now
+        fi
+        _NX_SYNCOOK_PREV="$scook"
+    fi
+}
+nx_host_stressed() {
+    local now; now=$(date +%s)
+    [ "$now" -lt "$NX_STRESSED_UNTIL" ] && return 0
+    # Load pressure: load1 >= 0.9 * cores
+    local l1 nc
+    l1=$(awk '{print $1}' /proc/loadavg 2>/dev/null)
+    nc=$(nproc 2>/dev/null || echo 1)
+    if [ -n "$l1" ] && awk -v l="$l1" -v c="$nc" 'BEGIN{ exit !(l >= 0.9*c) }'; then
+        return 0
+    fi
+    # Conntrack pressure: usage >= 80% of the table
+    local cc cm
+    cc=$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null)
+    cm=$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null)
+    cc="${cc//[^0-9]/}"; cm="${cm//[^0-9]/}"
+    if [ -n "$cc" ] && [ -n "$cm" ] && [ "$cm" -gt 0 ] && [ $(( cc * 100 / cm )) -ge 80 ]; then
+        return 0
+    fi
+    return 1
+}
+
 ban_ip() {
     local ip="$1"
     # FR-2 choke-point guard: ban_ip is the funnel for EVERY ban path
@@ -5490,11 +5915,12 @@ ban_ip() {
     fi
     is_exempt "$ip" && return 0
     state_has_ip "$BANNED_LIST" "$ip" && return 0
+    # Phase 1c: progressive duration (explicit $2 wins - manual paths).
+    local DUR="${2:-$(rep_ban_duration_secs "$ip")}"
     local UNBAN_TIME
-    UNBAN_TIME=$(date -d "+${BAN_HOURS} hours" '+%H:%M:%S' 2>/dev/null || \
-                 date -v "+${BAN_HOURS}H" '+%H:%M:%S' 2>/dev/null || echo "N/A")
-    iptables -I INPUT -s "$ip" -m comment --comment "auto-ban" -j DROP 2>/dev/null || true
-    echo "$ip $(date +%s) $((BAN_HOURS * 3600))" >> "$BANNED_LIST"
+    UNBAN_TIME=$(date -d "+${DUR} seconds" '+%H:%M:%S' 2>/dev/null || echo "N/A")
+    nx_ban_apply "$ip" "$DUR" "auto-ban"
+    echo "$ip $(date +%s) $DUR" >> "$BANNED_LIST"
     # Remove ONLY this IP's throttle/hard-throttle tc filter.
     # NOTE: never run 'tc filter del dev "$IF" parent 1:' here — that deletes
     # EVERY filter including the Cloudflare + server-own whitelist, which would
@@ -5551,7 +5977,7 @@ throttle_ip6() { _throttle6 "$1" soft; }
 hard_throttle_ip6() { _throttle6 "$1" hard; }
 
 ban_ip6() {
-    local ip="$1" _s6
+    local ip="$1" _s6 DUR="${2:-$(rep_ban_duration_secs "$1")}"
     is_exempt6 "$ip" && return 0
     # Self-IP choke guard (FR-2): refuse, always, no exceptions.
     for _s6 in "${SELF6_IPS[@]}"; do
@@ -5565,10 +5991,9 @@ ban_ip6() {
     _PRIO=$(state_get_field "$THROTTLE_LIST" "$ip" 2)
     [ -n "$_PRIO" ] && tc filter del dev "$IF" parent 1: protocol ip6 prio "$_PRIO" 2>/dev/null || true
     state_del_ip "$THROTTLE_LIST" "$ip"
-    ip6tables -C INPUT -s "$ip" -m comment --comment "auto-ban" -j DROP 2>/dev/null || \
-        ip6tables -I INPUT -s "$ip" -m comment --comment "auto-ban" -j DROP 2>/dev/null || true
-    echo "$ip $(date +%s) $((BAN_HOURS * 3600))" >> "$BANNED_LIST"
-    log " BANNED (v6): $ip for ${BAN_HOURS}h"
+    nx_ban_apply "$ip" "$DUR" "auto-ban"
+    echo "$ip $(date +%s) $DUR" >> "$BANNED_LIST"
+    log " BANNED (v6): $ip for $((DUR / 60))min (progressive)"
 }
 score_init() {
     mkdir -p "$SCORE_DIR" 2>/dev/null || true
@@ -5588,7 +6013,9 @@ load_reputation() {
     REP_PROB_UNTIL=0
     REP_FRAC=0
     REP_RATE=0
-    local line prev prob frac rate
+    REP_STRIKES=0
+    REP_LAST_BAN=0
+    local line prev prob frac rate strikes lastban
     line=$(awk -v x="$ip" '$1==x' "$SCORE_FILE" 2>/dev/null | tail -1 || true)
     [ -z "$line" ] && return 0
     REP_SCORE=$(echo "$line" | awk '{print $2}')
@@ -5597,12 +6024,16 @@ load_reputation() {
     prob=$(echo "$line" | awk '{print $5}')
     frac=$(echo "$line" | awk '{print $6}')
     rate=$(echo "$line" | awk '{print $7}')
+    strikes=$(echo "$line" | awk '{print $8}')
+    lastban=$(echo "$line" | awk '{print $9}')
     REP_SCORE="${REP_SCORE:-100}"; REP_SCORE="${REP_SCORE//[^0-9]/}"; REP_SCORE="${REP_SCORE:-100}"
     REP_PREV_CNT="${prev:-0}"; REP_PREV_CNT="${REP_PREV_CNT//[^0-9]/}"; REP_PREV_CNT="${REP_PREV_CNT:-0}"
     REP_TS="${REP_TS:-0}"; REP_TS="${REP_TS//[^0-9]/}"; REP_TS="${REP_TS:-0}"
     REP_PROB_UNTIL="${prob:-0}"; REP_PROB_UNTIL="${REP_PROB_UNTIL//[^0-9]/}"; REP_PROB_UNTIL="${REP_PROB_UNTIL:-0}"
     REP_FRAC="${frac:-0}"; [[ "$REP_FRAC" =~ ^-?[0-9]+$ ]] || REP_FRAC=0
     REP_RATE="${rate:-0}"; REP_RATE="${REP_RATE//[^0-9]/}"; REP_RATE="${REP_RATE:-0}"
+    REP_STRIKES="${strikes:-0}"; REP_STRIKES="${REP_STRIKES//[^0-9]/}"; REP_STRIKES="${REP_STRIKES:-0}"
+    REP_LAST_BAN="${lastban:-0}"; REP_LAST_BAN="${REP_LAST_BAN//[^0-9]/}"; REP_LAST_BAN="${REP_LAST_BAN:-0}"
     [ "$REP_SCORE" -gt 100 ] && REP_SCORE=100
     [ "$REP_SCORE" -lt 0 ] && REP_SCORE=0
 }
@@ -5612,7 +6043,7 @@ load_reputation() {
 save_reputation() {
     local ip="$1"
     awk -v x="$ip" '$1!=x' "$SCORE_FILE" > "$SCORE_FILE.tmp.$$" 2>/dev/null || true
-    echo "$ip $REP_SCORE $REP_PREV_CNT $(date +%s) ${REP_PROB_UNTIL:-0} ${REP_FRAC:-0} ${REP_RATE:-0}" >> "$SCORE_FILE.tmp.$$"
+    echo "$ip $REP_SCORE $REP_PREV_CNT $(date +%s) ${REP_PROB_UNTIL:-0} ${REP_FRAC:-0} ${REP_RATE:-0} ${REP_STRIKES:-0} ${REP_LAST_BAN:-0}" >> "$SCORE_FILE.tmp.$$"
     mv "$SCORE_FILE.tmp.$$" "$SCORE_FILE" 2>/dev/null || true
 }
 
@@ -5626,14 +6057,44 @@ clear_reputation() {
 # path: a served ban ends in PROBATION (score PROBATION_SCORE + window),
 # never in a stale low score and never wiped to a fresh 100.
 rep_on_ban() {
-    local ip="$1" now
+    local ip="$1" now dur
     now=$(date +%s)
     load_reputation "$ip"
     REP_SCORE="$PROBATION_SCORE"
     REP_FRAC=0
     REP_RATE=0
-    REP_PROB_UNTIL=$(( now + BAN_HOURS * 3600 + PROBATION_SECONDS ))
+    # Phase 1c: probation starts when the ACTUAL ban (progressive
+    # duration recorded in the state file) ends, not a flat BAN_HOURS.
+    dur=$(state_get_field "$BANNED_LIST" "$ip" 3)
+    dur="${dur//[^0-9]/}"; [ -n "$dur" ] && [ "$dur" -gt 0 ] || dur=$((BAN_HOURS * 3600))
+    REP_PROB_UNTIL=$(( now + dur + PROBATION_SECONDS ))
+    # Strike bookkeeping: a ban older than 7 days stops counting.
+    if [ "$REP_LAST_BAN" -gt 0 ] && [ $(( now - REP_LAST_BAN )) -gt 604800 ]; then
+        REP_STRIKES=0
+    fi
+    REP_STRIKES=$(( REP_STRIKES + 1 ))
+    REP_LAST_BAN=$now
     save_reputation "$ip"
+}
+
+# rep_ban_duration_secs <ip> - progressive ban length (Phase 1c):
+# ban_base_minutes doubling per strike, capped at ban_max_minutes.
+# Reads the reputation record directly (never disturbs REP_* state).
+rep_ban_duration_secs() {
+    local ip="$1" now strikes=0 lastban=0 mins i
+    now=$(date +%s)
+    if [ -f "$SCORE_FILE" ]; then
+        strikes=$(awk -v x="$ip" '$1==x{print $8}' "$SCORE_FILE" 2>/dev/null | tail -1)
+        lastban=$(awk -v x="$ip" '$1==x{print $9}' "$SCORE_FILE" 2>/dev/null | tail -1)
+    fi
+    strikes="${strikes//[^0-9]/}"; strikes="${strikes:-0}"
+    lastban="${lastban//[^0-9]/}"; lastban="${lastban:-0}"
+    if [ "$lastban" -gt 0 ] && [ $(( now - lastban )) -gt 604800 ]; then strikes=0; fi
+    [ "$strikes" -gt 10 ] && strikes=10
+    mins=${BAN_BASE_MINUTES:-30}
+    for (( i=0; i<strikes; i++ )); do mins=$(( mins * 2 )); done
+    [ "$mins" -gt "${BAN_MAX_MINUTES:-10080}" ] && mins=${BAN_MAX_MINUTES:-10080}
+    echo $(( mins * 60 ))
 }
 
 rep_on_unban() {
@@ -5664,18 +6125,20 @@ reputation_sweep() {
     now=$(date +%s)
     local tmp="$SCORE_FILE.sweep.$$"
     : > "$tmp"
-    while read -r ip score prev ts prob frac rate; do
+    while read -r ip score prev ts prob frac rate strikes lastban; do
         [ -z "$ip" ] && continue
         score="${score//[^0-9]/}"; score="${score:-100}"
         ts="${ts//[^0-9]/}"; ts="${ts:-0}"
         prob="${prob//[^0-9]/}"; prob="${prob:-0}"
         [[ "${frac:-}" =~ ^-?[0-9]+$ ]] || frac=0
         rate="${rate//[^0-9]/}"; rate="${rate:-0}"
+        strikes="${strikes//[^0-9]/}"; strikes="${strikes:-0}"
+        lastban="${lastban//[^0-9]/}"; lastban="${lastban:-0}"
         if state_has_ip "$BANNED_LIST" "$ip"; then
-            echo "$ip $score $prev $ts $prob $frac $rate" >> "$tmp"; continue
+            echo "$ip $score $prev $ts $prob $frac $rate $strikes $lastban" >> "$tmp"; continue
         fi
         if [ "${CONN_COUNT[$ip]:-0}" -ge "$CONN_THRESHOLD" ]; then
-            echo "$ip $score $prev $ts $prob $frac $rate" >> "$tmp"; continue
+            echo "$ip $score $prev $ts $prob $frac $rate $strikes $lastban" >> "$tmp"; continue
         fi
         if [ "$score" -ge 100 ] && [ "$prob" -le "$now" ] && [ $(( now - ts )) -gt 86400 ]; then
             continue  # prune fully-recovered stale entries
@@ -5693,9 +6156,9 @@ reputation_sweep() {
             apply=$(( acc / 100 ))
             frac=$(( acc - apply * 100 ))
             ns=$(( score + apply )); [ "$ns" -gt 100 ] && ns=100
-            echo "$ip $ns $prev $now $prob $frac $rate" >> "$tmp"
+            echo "$ip $ns $prev $now $prob $frac $rate $strikes $lastban" >> "$tmp"
         else
-            echo "$ip $score $prev $ts $prob $frac $rate" >> "$tmp"
+            echo "$ip $score $prev $ts $prob $frac $rate $strikes $lastban" >> "$tmp"
         fi
     done < "$SCORE_FILE"
     mv "$tmp" "$SCORE_FILE" 2>/dev/null || true
@@ -5745,13 +6208,16 @@ update_score() {
     read -r CHURN SUST SYNP RS <<< "$(awk \
         -v cur="$cur" -v prev="$REP_PREV_CNT" -v syn="$syn" \
         -v dt="$dt" -v rate_prev="${REP_RATE:-0}" -v thr="$CONN_THRESHOLD" \
+        -v ca="${CHURN_ALLOW:-2}" -v cw="${CHURN_WEIGHT:-1.2}" -v ccap="${CHURN_CAP:-30}" \
+        -v sdiv="${SUST_DIV:-40}" -v scap="${SUST_CAP:-20}" \
+        -v smin="${SYN_MIN:-20}" -v srat="${SYN_RATIO:-0.5}" -v sw="${SYN_WEIGHT:-40}" -v sycap="${SYN_CAP:-15}" \
         'BEGIN{
             r = (prev > 0) ? ((cur >= prev) ? (cur - prev) / dt : 0) : cur / dt;
             rs = 0.5 * r + 0.5 * (rate_prev / 100);
-            churn = (rs <= 2) ? 0 : (rs - 2) * 1.2; if (churn > 30) churn = 30;
-            ex = cur - thr; sust = (ex <= 0) ? 0 : ex / 40; if (sust > 20) sust = 20;
+            churn = (rs <= ca) ? 0 : (rs - ca) * cw; if (churn > ccap) churn = ccap;
+            ex = cur - thr; sust = (ex <= 0) ? 0 : ex / sdiv; if (sust > scap) sust = scap;
             synp = 0;
-            if (syn >= 20 && cur > 0) { ratio = syn / cur; if (ratio > 0.5) { synp = (ratio - 0.5) * 40; if (synp > 15) synp = 15; } }
+            if (syn >= smin && cur > 0) { ratio = syn / cur; if (ratio > srat) { synp = (ratio - srat) * sw; if (synp > sycap) synp = sycap; } }
             printf "%.2f %.2f %.2f %.2f", churn, sust, synp, rs;
         }')"
     REP_RATE=$(awk -v rs="$RS" 'BEGIN{ printf "%d", rs * 100 + 0.5 }')
@@ -5787,10 +6253,21 @@ update_score() {
     # ── Enforce band (graduated, only escalate) ──
     if [ "$REP_SCORE" -lt "$SCORE_BAN" ]; then
         if ! state_has_ip "$BANNED_LIST" "$ip"; then
-            log " REP-BAN: $ip | score $REP_SCORE (below $SCORE_BAN) -> ban ${BAN_HOURS}h"
-            nx_throttle "$ip"
-            nx_ban "$ip"
-            rep_on_ban "$ip"
+            # Stress gate (Phase 1d, F5 pattern): on a host that is NOT
+            # under stress, a first offence in the shallow ban band is
+            # a throttle, not a ban — anomalies alone do not prove the
+            # host needs relief. Deep scores (<10) and repeat offenders
+            # (strikes > 0) always ban.
+            if [ "${STRESS_GATE:-1}" = "1" ] && [ "$REP_SCORE" -ge 10 ] \
+               && [ "${REP_STRIKES:-0}" -eq 0 ] && ! nx_host_stressed; then
+                nx_hard_throttle "$ip"
+                log " GATE: $ip | score $REP_SCORE - ban deferred (host not stressed) -> hard throttle"
+            else
+                log " REP-BAN: $ip | score $REP_SCORE (below $SCORE_BAN) -> ban (progressive)"
+                nx_throttle "$ip"
+                nx_ban "$ip"
+                rep_on_ban "$ip"
+            fi
         fi
     elif [ "$REP_SCORE" -lt "$SCORE_HARD" ]; then
         nx_hard_throttle "$ip"
@@ -5845,15 +6322,16 @@ ban_subnet() {
             fi
         done < "$WHITELIST_FILE"
     fi
-    # Already banned?
-    iptables -C INPUT -s "$cidr" -m comment --comment "subnet-ban" -j DROP 2>/dev/null && return 0
-    # Record state only for a rule that actually landed (BUG-024 rule).
-    if ! iptables -I INPUT -s "$cidr" -m comment --comment "subnet-ban" -j DROP 2>/dev/null; then
-        log " SUBNET BAN FAILED: $cidr - iptables refused the rule; state NOT recorded"
+    # Already banned? (state is the source of truth, Phase 1b)
+    state_has_ip "$BANNED_LIST" "$cidr" && return 0
+    # Phase 1c: subnet bans are short (guardrail vs shared-egress
+    # collateral) and ride the same backend as single-IP bans.
+    if ! nx_ban_apply "$cidr" $((${SUBNET_BAN_MINUTES:-60} * 60)) "subnet-ban"; then
+        log " SUBNET BAN FAILED: $cidr - backend refused; state NOT recorded"
         return 1
     fi
-    echo "$cidr $(date +%s) $((BAN_HOURS * 3600))" >> "$BANNED_LIST"
-    log " SUBNET BAN: $cidr | botnet distributed attack detected | unban: ${BAN_HOURS}h"
+    echo "$cidr $(date +%s) $((${SUBNET_BAN_MINUTES:-60} * 60))" >> "$BANNED_LIST"
+    log " SUBNET BAN: $cidr | botnet distributed attack detected | unban: ${SUBNET_BAN_MINUTES:-60}min"
 }
 
 unban_subnet_expired() {
@@ -5868,6 +6346,7 @@ unban_subnet_expired() {
         duration="${duration//[^0-9]/}"; duration="${duration:-14400}"
         local EXPIRE=$(( ts + duration ))
         if [ "$NOW" -gt "$EXPIRE" ]; then
+            nx_ban_remove_fw "$ip"
             iptables -D INPUT -s "$ip" -m comment --comment "subnet-ban" -j DROP 2>/dev/null || true
             log " SUBNET UNBANNED: $ip (expired)"
         else
@@ -5890,6 +6369,7 @@ unban_expired() {
         if [ "$NOW" -gt "$EXPIRE" ]; then
             # Skip subnet bans — handled by unban_subnet_expired
             [[ "$ip" == *"/"* ]] && NEWLIST="${NEWLIST}${ip} ${ts} ${duration}\n" && continue
+            nx_ban_remove_fw "$ip"
             [[ "$ip" == *":"* ]] && ip6tables -D INPUT -s "$ip" -m comment --comment "auto-ban" -j DROP 2>/dev/null || true
             iptables -D INPUT -s "$ip" -m comment --comment "auto-ban" -j DROP \
                 2>/dev/null || true
@@ -5919,17 +6399,17 @@ reconcile_bans() {
         ts="${ts//[^0-9]/}"; ts="${ts:-0}"
         duration="${duration//[^0-9]/}"; duration="${duration:-14400}"
         [ $(( ts + duration )) -le "$now" ] && continue
+        # Phase 1b: re-apply through the active backend with the
+        # REMAINING duration (nft elements lost their timeouts in a
+        # reboot; iptables rules are simply absent).
         case "$ip" in
-            *:*) ip6tables -C INPUT -s "$ip" -m comment --comment "auto-ban" -j DROP 2>/dev/null || ip6tables -I INPUT -s "$ip" -m comment --comment "auto-ban" -j DROP 2>/dev/null || true ;;
-            */*) iptables -C INPUT -s "$ip" -m comment --comment "subnet-ban" -j DROP 2>/dev/null || \
-                 iptables -I INPUT -s "$ip" -m comment --comment "subnet-ban" -j DROP 2>/dev/null || true ;;
-            *)   iptables -C INPUT -s "$ip" -m comment --comment "auto-ban" -j DROP 2>/dev/null || \
-                 iptables -I INPUT -s "$ip" -m comment --comment "auto-ban" -j DROP 2>/dev/null || true ;;
+            */*) nx_ban_apply "$ip" $(( ts + duration - now )) "subnet-ban" ;;
+            *)   nx_ban_apply "$ip" $(( ts + duration - now )) "auto-ban" ;;
         esac
     done < "$BANNED_LIST"
     unban_expired
     unban_subnet_expired
-    log " RECONCILE: unexpired bans re-applied to iptables from state"
+    log " RECONCILE: unexpired bans re-applied via $NX_BAN_BACKEND backend from state"
 }
 
 # FR-2 watchdog (D2): if a DROP rule or throttle entry ever targets one
@@ -5976,6 +6456,9 @@ log " Smart throttle+ban started (conn_threshold:${CONN_THRESHOLD} ban_threshold
 
 score_init
 
+# Phase 1b: pick the ban backend before reconcile projects state into it.
+nx_resolve_ban_backend
+
 # Restore throttle filters recorded before a restart/reboot (the qdisc
 # may have been rebuilt without them - see reapply_throttles, BUG-022).
 # After a reboot /tmp is empty: pull the state back from the mirror
@@ -5989,6 +6472,8 @@ reconcile_bans
 
 CYCLE=0
 while true; do
+    nx_maybe_reload_scoring_config
+    nx_update_stress
     CYCLE=$((CYCLE + 1))
 
     # Keep the persistent throttle mirror current (U-11).
@@ -6144,7 +6629,7 @@ while true; do
     # ── Subnet /24 botnet detection ──────────────────────────
     # Aggregate connections by /24 subnet to detect distributed botnets
     # where each attacker IP stays under the per-IP threshold.
-    declare -A SUBNET_COUNT
+    declare -A SUBNET_COUNT SUBNET_OFFENDERS
     for ip in "${!CONN_COUNT[@]}"; do
         # BUG-011: exempt traffic (CF/self/whitelist) never counts toward
         # a subnet ban - it used to inflate the totals.
@@ -6153,6 +6638,12 @@ while true; do
         subnet=$(echo "$ip" | grep -oP '^\d+\.\d+\.\d+')
         [ -z "$subnet" ] && continue
         SUBNET_COUNT["$subnet"]=$(( ${SUBNET_COUNT[$subnet]:-0} + ${CONN_COUNT[$ip]:-0} ))
+        # Phase 1c guardrail: count DISTINCT member IPs that are each
+        # individually over the per-IP gate. A /24 whose total comes
+        # from one heavy member (or a CGNAT pool of normal users) is
+        # not a botnet signature.
+        [ "${CONN_COUNT[$ip]:-0}" -ge "$CONN_THRESHOLD" ] && \
+            SUBNET_OFFENDERS["$subnet"]=$(( ${SUBNET_OFFENDERS[$subnet]:-0} + 1 ))
     done
 
     for subnet in "${!SUBNET_COUNT[@]}"; do
@@ -6160,12 +6651,16 @@ while true; do
         [ "$total" -lt "$SUBNET_THRESHOLD" ] && continue
         # Skip if a CF range overlaps this /24 (real overlap test)
         subnet_overlaps_cf "$subnet" && continue
-        # Already banned as subnet?
-        iptables -C INPUT -s "${subnet}.0/24" -m comment --comment "subnet-ban" \
-            -j DROP 2>/dev/null && continue
+        # Already banned as subnet? (state, Phase 1b)
+        state_has_ip "$BANNED_LIST" "${subnet}.0/24" && continue
 
         if [ "$total" -ge "$SUBNET_BAN_THRESHOLD" ]; then
-            ban_subnet "$subnet"
+            if [ "${SUBNET_OFFENDERS[$subnet]:-0}" -ge "$SUBNET_MIN_OFFENDERS" ]; then
+                ban_subnet "$subnet"
+            elif ! state_has_ip "$SUBNET_WATCH_LIST" "$subnet"; then
+                echo "$subnet $(date +%s)" >> "$SUBNET_WATCH_LIST"
+                log " SUBNET GUARD: ${subnet}.0/24 | $total conns but only ${SUBNET_OFFENDERS[$subnet]:-0} distinct offenders (< $SUBNET_MIN_OFFENDERS) - not banning (shared-egress guardrail)"
+            fi
         else
             # Watch mode: log first sighting
             if ! state_has_ip "$SUBNET_WATCH_LIST" "$subnet"; then
@@ -6180,7 +6675,8 @@ while true; do
                 # for OBSERVE_SECONDS used to ban a /24 the design says
                 # to merely watch - the effective trigger was 400/45s,
                 # not the documented 1000.
-                if [ "$SELAPSED" -ge "$OBSERVE_SECONDS" ] && [ "$total" -ge "$SUBNET_BAN_THRESHOLD" ]; then
+                if [ "$SELAPSED" -ge "$OBSERVE_SECONDS" ] && [ "$total" -ge "$SUBNET_BAN_THRESHOLD" ] \
+                   && [ "${SUBNET_OFFENDERS[$subnet]:-0}" -ge "$SUBNET_MIN_OFFENDERS" ]; then
                     log " SUBNET HIGH: ${subnet}.0/24 | ${total} conns for ${SELAPSED}s → banning"
                     ban_subnet "$subnet"
                     state_del_ip "$SUBNET_WATCH_LIST" "$subnet"

@@ -77,5 +77,6 @@ sep()     { echo -e "${CYAN}═════════════════�
 # Get all server's own public IPs (auto-whitelist)
 # @include lib/server-ips.sh
 # @include lib/self-ips.sh
+# @include lib/config.sh
 
 # Detect environment

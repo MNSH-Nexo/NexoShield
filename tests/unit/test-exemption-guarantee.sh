@@ -19,10 +19,11 @@ extract_fn src/modules/autoban/00-header.sh ip_int "$TMP/fns.sh" || { echo "FAIL
 for fn in ip_to_int ip_in_cidr ip6_in_cidr is_cf_ip is_cf6_ip is_self_ip is_user_whitelisted is_exempt is_exempt6 is_exempt_any subnet_overlaps_cf state_has_ip state_get_field state_del_ip nx_ban nx_throttle nx_hard_throttle refresh_self_ips; do
     extract_fn src/modules/autoban/10-ip-utils.sh "$fn" "$TMP/fns.sh" || { echo "FAIL extract $fn"; exit 1; }
 done
-for fn in next_tc_prio tc_class_exists throttle_ip hard_throttle_ip ban_ip _throttle6 throttle_ip6 hard_throttle_ip6 ban_ip6; do
+for fn in next_tc_prio tc_class_exists throttle_ip hard_throttle_ip ban_ip _throttle6 throttle_ip6 hard_throttle_ip6 ban_ip6 nx_ban_apply nx_ban_remove_fw; do
     extract_fn src/modules/autoban/20-enforce.sh "$fn" "$TMP/fns.sh" || { echo "FAIL extract $fn"; exit 1; }
 done
 extract_fn src/modules/autoban/40-subnet.sh ban_subnet "$TMP/fns.sh" || { echo "FAIL extract ban_subnet"; exit 1; }
+extract_fn src/modules/autoban/30-reputation.sh rep_ban_duration_secs "$TMP/fns.sh" || { echo "FAIL extract rep_ban_duration_secs"; exit 1; }
 
 # ── fixtures ──
 CF_RANGES=("173.245.48.0/20" "103.21.244.0/22")
@@ -34,6 +35,8 @@ printf '%s\n' "198.51.100.7" "198.51.101.0/24" "2001:db8:beef::99" "2001:db8:caf
 BANNED_LIST="$TMP/banned.list"; THROTTLE_LIST="$TMP/throttled.list"; WATCH_LIST="$TMP/watch.list"
 : > "$BANNED_LIST"; : > "$THROTTLE_LIST"; : > "$WATCH_LIST"
 IF="eth0"; BAN_HOURS=4; OBSERVE_SECONDS=45
+BAN_BASE_MINUTES=30; BAN_MAX_MINUTES=10080; SUBNET_BAN_MINUTES=60; NX_BAN_BACKEND=iptables
+SCORE_FILE="$TMP/reputation.dat"; : > "$SCORE_FILE"
 CALLS="$TMP/calls.log"; : > "$CALLS"
 log() { :; }
 iptables()  { echo "iptables $*" >> "$CALLS"; [ "$1" = "-C" ] && return 1; return 0; }

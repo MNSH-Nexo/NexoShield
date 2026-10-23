@@ -34,6 +34,14 @@ nx_throttle_file() {
 # throttle-filter cleanup, fail2ban unban - shared by every screen.
 nx_unban_ip() {
     local _ip="$1" _tf _prio _if _j
+    # Phase 1b: if the daemon's nft backend holds this ban, remove the
+    # set element too (the iptables deletes below stay as belt-and-braces).
+    if command -v nft >/dev/null 2>&1; then
+        case "$_ip" in
+            *:*) nft delete element inet nexoshield ban6 "{ $_ip }" >/dev/null 2>&1 || true ;;
+            *)   nft delete element inet nexoshield ban4 "{ $_ip }" >/dev/null 2>&1 || true ;;
+        esac
+    fi
     case "$_ip" in
         *:*)
             ip6tables -D INPUT -s "$_ip" -m comment --comment "auto-ban" -j DROP 2>/dev/null || true ;;
