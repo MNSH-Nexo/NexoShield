@@ -42,6 +42,15 @@ EXEMPT_FILE="/etc/antiddos/exempt.list"
 
 [ "$EUID" -ne 0 ] && echo -e "${RED}Root required${NC}" && exit 1
 
+
+# BUG-019: every iptables call in this script takes the xtables lock with
+# a 5s wait. The daemon, fail2ban and the menus mutate rules concurrently;
+# without -w a contended call fails with "Resource temporarily
+# unavailable" and the failure is usually swallowed by || true - rules
+# silently never landed. (iptables-save/-restore are separate binaries
+# and are not affected by this wrapper.)
+iptables() { command iptables -w 5 "$@"; }
+
 mkdir -p /etc/antiddos
 touch "$LOG_FILE" && chmod 600 "$LOG_FILE"
 touch "$BANNED_LIST" && chmod 600 "$BANNED_LIST"

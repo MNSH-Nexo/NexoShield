@@ -844,6 +844,14 @@ RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 CYAN='\033[0;36m'; NC='\033[0m'
 PROXY_BIN="/usr/local/bin/3proxy"
 PROXY_CONF="/etc/3proxy/3proxy.cfg"
+
+# BUG-019: every iptables call in this script takes the xtables lock with
+# a 5s wait. The daemon, fail2ban and the menus mutate rules concurrently;
+# without -w a contended call fails with "Resource temporarily
+# unavailable" and the failure is usually swallowed by || true - rules
+# silently never landed. (iptables-save/-restore are separate binaries
+# and are not affected by this wrapper.)
+iptables() { command iptables -w 5 "$@"; }
 PROXY_USERS="/etc/3proxy/users.cfg"
 PROXY_LOG_DIR="/var/log/3proxy"
 SERVICE_FILE="/etc/systemd/system/3proxy.service"
@@ -1067,17 +1075,29 @@ setup_iptables_for_port() {
         -m comment --comment "3proxy_stats_in" 2>/dev/null || true
     iptables -D OUTPUT -p tcp --sport "$PORT" \
         -m comment --comment "3proxy_stats_out" 2>/dev/null || true
-    # Remove old CF rules
+    # Remove old CF rules (BUG-013: the delete spec must mirror the
+    # create spec EXACTLY, including the comment match - without it the
+    # delete never matched and every reinstall duplicated all 753 rules)
     for CF in "${CF_RANGES[@]}"; do
         [[ "$CF" == *":"* ]] && continue
-        iptables -D INPUT -p tcp --dport "$PORT" -s "$CF" -j ACCEPT 2>/dev/null || true
+        iptables -D INPUT -p tcp --dport "$PORT" -s "$CF" \
+            -m comment --comment "3proxy_cf_allow" -j ACCEPT 2>/dev/null || true
     done
-    # Remove old rate-limit rules
-    iptables -D INPUT -p tcp --dport "$PORT" -m state --state NEW \
-        -m recent --name "3proxy_$PORT" --update --seconds 60 \
-        --hitcount $((MAX_CONN * 2)) -j DROP 2>/dev/null || true
-    iptables -D INPUT -p tcp --dport "$PORT" -m state --state NEW \
-        -m recent --name "3proxy_$PORT" --set 2>/dev/null || true
+    # Remove old self-IP rules (mirror of Step 2 - previously missing, so
+    # these duplicated on every reinstall too)
+    while IFS= read -r SIP; do
+        [ -z "$SIP" ] && continue
+        iptables -D INPUT -p tcp --dport "$PORT" -s "$SIP/32" \
+            -m comment --comment "3proxy_self_allow" -j ACCEPT 2>/dev/null || true
+    done < <(get_server_ips)
+    # Remove old rate-limit rules by enumeration (BUG-014: the hitcount
+    # depends on MAX_CONN at create time - *3 now, *2 in old versions -
+    # so a fixed spec delete can miss the real rule; the recent-rule name
+    # is the stable identifier)
+    local _rn
+    for _rn in $(iptables -S INPUT 2>/dev/null | grep -n "3proxy_$PORT" | cut -d: -f1 | sort -rn); do
+        iptables -D INPUT $((_rn - 1)) 2>/dev/null || true
+    done
     # Remove old user-whitelist rules (spec mirrors the create below)
     if [ -f /etc/antiddos/whitelist.list ]; then
         while IFS= read -r WIP; do
@@ -1473,23 +1493,34 @@ uninstall_proxy() {
     # ── Remove iptables rules ─────────────────────────────
     if [ -n "$PORT" ]; then
         echo -e "${YELLOW}Cleaning iptables rules for port $PORT...${NC}"
-        # CF-specific port rules
+        # CF-specific port rules (delete spec mirrors create, incl. the
+        # comment match - BUG-013)
         for CF in "${CF_RANGES[@]}"; do
             [[ "$CF" == *":"* ]] && continue
-            iptables -D INPUT -p tcp --dport "$PORT" -s "$CF" -j ACCEPT 2>/dev/null || true
+            iptables -D INPUT -p tcp --dport "$PORT" -s "$CF" \
+                -m comment --comment "3proxy_cf_allow" -j ACCEPT 2>/dev/null || true
         done
+        # User-whitelist rules for this port (Wave 1 create; remove here)
+        if [ -f /etc/antiddos/whitelist.list ]; then
+            while IFS= read -r WIP; do
+                WIP="${WIP%%#*}"; WIP="${WIP// /}"
+                [ -z "$WIP" ] && continue
+                iptables -D INPUT -p tcp --dport "$PORT" -s "$WIP" \
+                    -m comment --comment "3proxy_wl_allow" -j ACCEPT 2>/dev/null || true
+            done < /etc/antiddos/whitelist.list
+        fi
         # Self-IP rules for this port
         while IFS= read -r SIP; do
             [ -z "$SIP" ] && continue
             iptables -D INPUT -p tcp --dport "$PORT" -s "$SIP/32" \
                 -m comment --comment "3proxy_self_allow" -j ACCEPT 2>/dev/null || true
         done < <(get_server_ips)
-        # Rate-limit rules for this port
-        iptables -D INPUT -p tcp --dport "$PORT" -m state --state NEW \
-            -m recent --name "3proxy_${PORT}" --update \
-            --seconds 60 --hitcount 60 -j DROP 2>/dev/null || true
-        iptables -D INPUT -p tcp --dport "$PORT" -m state --state NEW \
-            -m recent --name "3proxy_${PORT}" --set 2>/dev/null || true
+        # Rate-limit rules for this port - by enumeration (BUG-014: the
+        # hitcount was MAX_CONN*3 at create, not a fixed 60)
+        local _rn
+        for _rn in $(iptables -S INPUT 2>/dev/null | grep -n "3proxy_${PORT}" | cut -d: -f1 | sort -rn); do
+            iptables -D INPUT $((_rn - 1)) 2>/dev/null || true
+        done
         # connlimit rule for this port
         iptables -D INPUT -p tcp --dport "$PORT" \
             -m connlimit --connlimit-above 30 --connlimit-mask 32 \
@@ -1506,8 +1537,6 @@ uninstall_proxy() {
             -m comment --comment "3proxy_stats_out" 2>/dev/null || true
         # Plain ACCEPT rule
         iptables -D INPUT -p tcp --dport "$PORT" -j ACCEPT 2>/dev/null || true
-        iptables -D INPUT -p tcp --dport "$PORT" \
-            -m comment --comment "3proxy_cf_allow" -j ACCEPT 2>/dev/null || true
         # UFW / firewalld
         command -v ufw >/dev/null 2>&1 && ufw delete allow "$PORT"/tcp 2>/dev/null || true
         command -v firewall-cmd >/dev/null 2>&1 && {
@@ -2277,6 +2306,14 @@ fi
 PROXY_SCRIPT="$SCRIPT_DIR/3proxy-socks5.sh"
 SYSCTL_SCRIPT="$SCRIPT_DIR/optimize-sysctl.sh"
 ANTIDDOS_SCRIPT="$SCRIPT_DIR/antiddos.sh"
+
+# BUG-019: every iptables call in this script takes the xtables lock with
+# a 5s wait. The daemon, fail2ban and the menus mutate rules concurrently;
+# without -w a contended call fails with "Resource temporarily
+# unavailable" and the failure is usually swallowed by || true - rules
+# silently never landed. (iptables-save/-restore are separate binaries
+# and are not affected by this wrapper.)
+iptables() { command iptables -w 5 "$@"; }
 LOG_FILE="/var/log/proxy-manager.log"
 
 R='\033[0;31m'; G='\033[0;32m'; Y='\033[1;33m'; C='\033[0;36m'
@@ -3270,6 +3307,15 @@ EXEMPT_FILE="/etc/antiddos/exempt.list"
 
 [ "$EUID" -ne 0 ] && echo -e "${RED}Root required${NC}" && exit 1
 
+
+# BUG-019: every iptables call in this script takes the xtables lock with
+# a 5s wait. The daemon, fail2ban and the menus mutate rules concurrently;
+# without -w a contended call fails with "Resource temporarily
+# unavailable" and the failure is usually swallowed by || true - rules
+# silently never landed. (iptables-save/-restore are separate binaries
+# and are not affected by this wrapper.)
+iptables() { command iptables -w 5 "$@"; }
+
 mkdir -p /etc/antiddos
 touch "$LOG_FILE" && chmod 600 "$LOG_FILE"
 touch "$BANNED_LIST" && chmod 600 "$BANNED_LIST"
@@ -3462,6 +3508,20 @@ EOF
 # LAYER 2: iptables rules
 # CRITICAL: CF IPs whitelisted BEFORE any rate-limit
 # ════════════════════════════════════════════════
+
+# nx_static_rules_filter: iptables-save output (stdin) -> the STATIC
+# ruleset (stdout). Transient enforcement state must never be baked into
+# boot persistence (BUG-012): auto-ban/subnet-ban DROP rules and fail2ban
+# chains are runtime state, rebuilt by their owners; persisting them made
+# expired bans immortal and resurrected removed rules after reboot.
+nx_static_rules_filter() {
+    grep -v -e '"auto-ban"' -e '"subnet-ban"' -e 'f2b-' -e 'fail2ban-' || true
+}
+
+# save_static_rules <file>: persist only the static ruleset.
+save_static_rules() {
+    iptables-save 2>/dev/null | nx_static_rules_filter > "$1" || true
+}
 apply_iptables() {
     info "Applying iptables rules..."
 
@@ -3471,6 +3531,20 @@ apply_iptables() {
         err "Cloudflare range list is empty/missing - refusing to apply iptables rules (CF would lose its exemption)"
         return 1
     fi
+
+    # BUG-063: purge rate rules from any previous run/tier first. The
+    # named hashlimit tables are ours by construction; re-applying with
+    # different thresholds otherwise APPENDS new rules next to the old
+    # ones (same --hashlimit-name), and the old rule - evaluated first -
+    # keeps deciding, so a raised limit silently never takes effect.
+    # Deletion is by rule number from `iptables -S` (spec deletion breaks
+    # on quoted arguments).
+    local _pn
+    for _pn in $(iptables -S INPUT 2>/dev/null | \
+            grep -nE 'hashlimit-name (syn_flood|udp_flood|icmp_flood|rst_flood|bw_per_ip|bw_per_ip_test|new_conn_rate|http_req_rate|udp_reflect_[0-9]+)|nx_connlimit' | \
+            cut -d: -f1 | sort -rn); do
+        iptables -D INPUT $((_pn - 1)) 2>/dev/null || true
+    done
 
     # Helper: add if not already present
     ipt_add() { iptables -C "$@" 2>/dev/null || iptables -A "$@"; }
@@ -3484,9 +3558,85 @@ apply_iptables() {
     ipt_ins FORWARD -m conntrack --ctstate INVALID -j DROP
     success "Invalid packet drop: ON"
 
-    # ── Step 2: Fast path for established ────────────
-    # Must come BEFORE rate-limit rules so existing CF connections never hit limits
+    # ── Step 2: ESTABLISHED fast path + the two rules that police it ──
+    # BUG-002 fix: the ESTABLISHED accept used to sit alone at the top, so
+    # the two rules that police ESTABLISHED traffic (bw_per_ip and
+    # http_req_rate, appended far below) were unreachable dead code - an
+    # established connection was accepted before ever reaching them.
+    # Insert order here is deliberate (ipt_ins stacks; last insert = top):
+    #   1) ESTABLISHED accept  -> ends up deepest of the three
+    #   2) bw_per_ip           -> above the accept, so it can police it
+    #   3) http_req_rate       -> above bw_per_ip
+    # The whitelist ACCEPTs (Steps 3-4c) are inserted AFTER this step and
+    # therefore land ABOVE all three: exempt traffic is never policed,
+    # exactly as before. Everything appended later stays below.
     ipt_ins INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+
+    # ── Step 2a: Per-IP bandwidth cap (polices ESTABLISHED) ──
+    # _proc_heavy sends 64MB+ per connection. Byte-mode hashlimit
+    # caps per-IP throughput on established flows.
+    # Try hashlimit byte-mode (kernel 4.1+), fallback to connlimit
+    local BW_APPLIED=0
+    if [ "$HASHLIMIT_OK" -eq 1 ]; then
+        # Test if byte-mode (mbit/s) is supported by this kernel
+        if iptables -A INPUT -p tcp \
+            -m hashlimit \
+            --hashlimit-above "${BW_PER_IP_MBIT}mbit/s" \
+            --hashlimit-burst "$((BW_PER_IP_MBIT * 2))mbit" \
+            --hashlimit-mode srcip \
+            --hashlimit-name bw_per_ip_test \
+            --hashlimit-htable-expire 5000 \
+            -j DROP 2>/dev/null; then
+            # Success — remove test rule, add the real one via ipt_ins
+            iptables -D INPUT -p tcp \
+                -m hashlimit \
+                --hashlimit-above "${BW_PER_IP_MBIT}mbit/s" \
+                --hashlimit-burst "$((BW_PER_IP_MBIT * 2))mbit" \
+                --hashlimit-mode srcip \
+                --hashlimit-name bw_per_ip_test \
+                --hashlimit-htable-expire 5000 \
+                -j DROP 2>/dev/null || true
+            ipt_ins INPUT -p tcp \
+                -m conntrack --ctstate ESTABLISHED,RELATED \
+                -m hashlimit \
+                --hashlimit-above "${BW_PER_IP_MBIT}mbit/s" \
+                --hashlimit-burst "$((BW_PER_IP_MBIT * 2))mbit" \
+                --hashlimit-mode srcip \
+                --hashlimit-name bw_per_ip \
+                --hashlimit-htable-expire 5000 \
+                -j DROP 2>/dev/null && BW_APPLIED=1
+            [ "$BW_APPLIED" -eq 1 ] && \
+                success "Per-IP bandwidth cap: ${BW_PER_IP_MBIT}Mbps max per non-CF IP"
+        fi
+    fi
+    if [ "$BW_APPLIED" -eq 0 ]; then
+        # Fallback: use connlimit — limit simultaneous connections per IP
+        # Each connection ~1-5 Mbps for proxy; 60 conns ≈ 60-300 Mbps cap
+        ipt_add INPUT -p tcp \
+            -m conntrack --ctstate NEW \
+            -m connlimit --connlimit-above 60 --connlimit-mask 32 \
+            -j DROP 2>/dev/null && \
+            success "Per-IP bandwidth cap: connlimit fallback (max 60 conns/IP — kernel too old for byte-mode)" || \
+            warn "Per-IP bandwidth cap: both byte-mode and connlimit fallback failed"
+    fi
+
+
+    # ── Step 2b: HTTP request rate (polices ESTABLISHED) ──
+    if [ "$HASHLIMIT_OK" -eq 1 ] && [ "$CONNTRACK_OK" -eq 1 ]; then
+            # ── HTTP request rate (packet rate on established TCP) ────
+            # _proc_http_burst sends hundreds of requests on keep-alive.
+            # hashlimit on all-TCP-packets (not just NEW) catches this.
+            ipt_ins INPUT -p tcp \
+                -m conntrack --ctstate ESTABLISHED \
+                -m hashlimit \
+                --hashlimit-above "$HTTP_REQ_RATE" \
+                --hashlimit-burst "$HTTP_REQ_BURST" \
+                --hashlimit-mode srcip \
+                --hashlimit-name http_req_rate \
+                --hashlimit-htable-expire 10000 \
+                -j DROP
+            success "HTTP burst rate: max $HTTP_REQ_RATE pkt/s per non-CF IP (heavy/http_burst defense)"
+    fi
 
     # ── Step 3: CF IPs → ACCEPT (NO limits ever) ─────
     # This is the MOST CRITICAL rule:
@@ -3653,7 +3803,7 @@ apply_iptables() {
             ss -tuln 2>/dev/null | grep -q ":${HTTP_PORT} " || continue
             ipt_add INPUT -p tcp --dport "$HTTP_PORT" \
                 -m connlimit --connlimit-above "$CONN_LIMIT_PER_IP" \
-                --connlimit-mask 32 \
+                --connlimit-mask 32 -m comment --comment "nx_connlimit" \
                 -j REJECT --reject-with tcp-reset
             success "HTTP Flood: connlimit :${HTTP_PORT} (max $CONN_LIMIT_PER_IP per non-CF IP)"
         done
@@ -3665,12 +3815,12 @@ apply_iptables() {
         # LOG before DROP so fail2ban conn-flood jail can read it from kern.log
         ipt_add INPUT -p tcp \
             -m connlimit --connlimit-above "$CONN_LIMIT_PER_IP" \
-            --connlimit-mask 32 \
+            --connlimit-mask 32 -m comment --comment "nx_connlimit" \
             -m limit --limit 10/min --limit-burst 20 \
             -j LOG --log-prefix "[CONNLIMIT DROP] " --log-level 4 2>/dev/null || true
         ipt_add INPUT -p tcp \
             -m connlimit --connlimit-above "$CONN_LIMIT_PER_IP" \
-            --connlimit-mask 32 \
+            --connlimit-mask 32 -m comment --comment "nx_connlimit" \
             -j REJECT --reject-with tcp-reset
         success "Slowloris/Hold/Heavy: global connlimit (max $CONN_LIMIT_PER_IP TCP per non-CF IP) + LOG→fail2ban"
 
@@ -3687,72 +3837,9 @@ apply_iptables() {
                 -j DROP
             success "New TCP conn rate: $NEW_CONN_RATE per non-CF IP"
 
-            # ── HTTP request rate (packet rate on established TCP) ────
-            # _proc_http_burst sends hundreds of requests on keep-alive.
-            # hashlimit on all-TCP-packets (not just NEW) catches this.
-            ipt_add INPUT -p tcp \
-                -m conntrack --ctstate ESTABLISHED \
-                -m hashlimit \
-                --hashlimit-above "$HTTP_REQ_RATE" \
-                --hashlimit-burst "$HTTP_REQ_BURST" \
-                --hashlimit-mode srcip \
-                --hashlimit-name http_req_rate \
-                --hashlimit-htable-expire 10000 \
-                -j DROP
-            success "HTTP burst rate: max $HTTP_REQ_RATE pkt/s per non-CF IP (heavy/http_burst defense)"
         fi
     else
         warn "connlimit unavailable - HTTP flood protection limited"
-    fi
-
-    # ── Step 8b: Per-IP bandwidth limit via tc ──────────
-    # _proc_heavy sends 64MB+ per connection. tc limits bandwidth before
-    # data reaches xray/kernel, preventing CPU spike from data processing.
-    # This adds an iptables MARK for non-CF IPs → tc filters pick it up.
-    # ── Step 8: Per-IP bandwidth cap ─────────────────────
-    # Try hashlimit byte-mode (kernel 4.1+), fallback to connlimit
-    local BW_APPLIED=0
-    if [ "$HASHLIMIT_OK" -eq 1 ]; then
-        # Test if byte-mode (mbit/s) is supported by this kernel
-        if iptables -A INPUT -p tcp \
-            -m hashlimit \
-            --hashlimit-above "${BW_PER_IP_MBIT}mbit/s" \
-            --hashlimit-burst "$((BW_PER_IP_MBIT * 2))mbit" \
-            --hashlimit-mode srcip \
-            --hashlimit-name bw_per_ip_test \
-            --hashlimit-htable-expire 5000 \
-            -j DROP 2>/dev/null; then
-            # Success — remove test rule, add via ipt_add (idempotent)
-            iptables -D INPUT -p tcp \
-                -m hashlimit \
-                --hashlimit-above "${BW_PER_IP_MBIT}mbit/s" \
-                --hashlimit-burst "$((BW_PER_IP_MBIT * 2))mbit" \
-                --hashlimit-mode srcip \
-                --hashlimit-name bw_per_ip_test \
-                --hashlimit-htable-expire 5000 \
-                -j DROP 2>/dev/null || true
-            ipt_add INPUT -p tcp \
-                -m conntrack --ctstate ESTABLISHED,RELATED \
-                -m hashlimit \
-                --hashlimit-above "${BW_PER_IP_MBIT}mbit/s" \
-                --hashlimit-burst "$((BW_PER_IP_MBIT * 2))mbit" \
-                --hashlimit-mode srcip \
-                --hashlimit-name bw_per_ip \
-                --hashlimit-htable-expire 5000 \
-                -j DROP 2>/dev/null && BW_APPLIED=1
-            [ "$BW_APPLIED" -eq 1 ] && \
-                success "Per-IP bandwidth cap: ${BW_PER_IP_MBIT}Mbps max per non-CF IP"
-        fi
-    fi
-    if [ "$BW_APPLIED" -eq 0 ]; then
-        # Fallback: use connlimit — limit simultaneous connections per IP
-        # Each connection ~1-5 Mbps for proxy; 60 conns ≈ 60-300 Mbps cap
-        ipt_add INPUT -p tcp \
-            -m conntrack --ctstate NEW \
-            -m connlimit --connlimit-above 60 --connlimit-mask 32 \
-            -j DROP 2>/dev/null && \
-            success "Per-IP bandwidth cap: connlimit fallback (max 60 conns/IP — kernel too old for byte-mode)" || \
-            warn "Per-IP bandwidth cap: both byte-mode and connlimit fallback failed"
     fi
 
     # ── Step 9: RST Flood ─────────────────────────────
@@ -3785,8 +3872,8 @@ apply_iptables() {
     ipt_add INPUT -f -j DROP
     success "Fragmented packets: dropped"
 
-    # Save rules
-    iptables-save > "$IPTABLES_SAVE_FILE" 2>/dev/null || true
+    # Save rules (static only - transient bans/f2b chains excluded, BUG-012)
+    save_static_rules "$IPTABLES_SAVE_FILE"
     chmod 600 "$IPTABLES_SAVE_FILE"
     success "iptables rules saved"
 }
@@ -4098,6 +4185,14 @@ SELF_IPS=()
 while IFS= read -r sip; do
     [ -n "$sip" ] && SELF_IPS+=("$sip")
 done < <(list_self_ips)
+
+# BUG-019: every iptables call in this script takes the xtables lock with
+# a 5s wait. The daemon, fail2ban and the menus mutate rules concurrently;
+# without -w a contended call fails with "Resource temporarily
+# unavailable" and the failure is usually swallowed by || true - rules
+# silently never landed. (iptables-save/-restore are separate binaries
+# and are not affected by this wrapper.)
+iptables() { command iptables -w 5 "$@"; }
 
 log() { echo "[$(date '+%H:%M:%S')] $*" | tee -a "$LOG"; }
 
@@ -4900,7 +4995,7 @@ setup_persistence() {
     if command -v apt-get >/dev/null 2>&1; then
         mkdir -p /etc/iptables
         DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iptables-persistent 2>/dev/null || true
-        iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+        save_static_rules /etc/iptables/rules.v4
     fi
 
     # Restore script
@@ -5028,28 +5123,64 @@ remove_rules() {
     fi
     [[ "$CONF_R" != "y" && "$CONF_R" != "Y" ]] && echo -e "  ${DIM}Cancelled.${NC}" && return
 
-    # Sysctl
+    # Sysctl (note: removing the file does not reset values already
+    # loaded into the running kernel - they reset at reboot)
     rm -f "$SYSCTL_FILE"
     sysctl --system >/dev/null 2>&1 || true
-    success "Kernel hardening: removed"
+    success "Kernel hardening: file removed (running values reset at reboot)"
 
-    # iptables — delete by content match (line numbers shift after each delete, so loop)
-    MATCH_PAT="hashlimit\|SYNPROXY\|connlimit\|cf_whitelist\|auto-ban\|self_whitelist\|user_whitelist\|syn_flood\|udp_flood\|icmp_flood\|rst_flood\|bw_per_ip\|new_conn_rate\|http_req_rate"
-    for TABLE in INPUT FORWARD; do
-        while iptables -L "$TABLE" -n 2>/dev/null | grep -qE "$MATCH_PAT"; do
-            RNUM=$(iptables -L "$TABLE" -n --line-numbers 2>/dev/null | \
-                  grep -E "$MATCH_PAT" | awk '{print $1}' | head -1 || true)
-            [ -z "$RNUM" ] && break
-            iptables -D "$TABLE" "$RNUM" 2>/dev/null || break
+    # iptables — delete by matching the `iptables -S` text (BUG-031).
+    # The old code matched `iptables -L` output, which never renders rule
+    # comments, so every comment-tagged rule (all 753 CF ACCEPTs, the
+    # whitelist, ...) silently survived a "full removal"; several
+    # untagged rules (loopback, ESTABLISHED accept, flag scans) survived
+    # too. Deletion is by rule NUMBER recomputed from -S after each
+    # delete - spec-based deletion breaks on quoted arguments.
+    nx_delete_matching() {
+        local _t="$1" _c="$2" _p="$3" _n
+        while true; do
+            _n=$(iptables -t "$_t" -S "$_c" 2>/dev/null | grep -nE "$_p" | head -1 | cut -d: -f1 || true)
+            [ -z "$_n" ] && break
+            # -S line 1 is the chain policy (-P): rule number = line - 1
+            iptables -t "$_t" -D "$_c" $((_n - 1)) 2>/dev/null || break
         done
+    }
+    local RULE_PAT='hashlimit|SYNPROXY|connlimit|cf_whitelist|auto-ban|subnet-ban|self_whitelist|user_whitelist|nx_connlimit|--ctstate INVALID|--tcp-flags| -f -j DROP|! --syn|-i lo|--ctstate ESTABLISHED,RELATED -j ACCEPT'
+    nx_delete_matching filter INPUT "$RULE_PAT"
+    nx_delete_matching filter FORWARD "$RULE_PAT"
+
+    # raw table: delete ONLY our own ACCEPTs - those whose source is a CF
+    # range, a self IP or a whitelist entry. The old loop's bare "ACCEPT"
+    # token deleted other software's raw PREROUTING rules (BUG-031).
+    local _snap _del="" _idx=0 _line _src _ours _r _w _n
+    _snap=$(iptables -t raw -S PREROUTING 2>/dev/null || true)
+    while IFS= read -r _line; do
+        _idx=$((_idx + 1))
+        case "$_line" in *'-j ACCEPT'*) : ;; *) continue ;; esac
+        _src=$(printf '%s' "$_line" | grep -oP '(?<=-s )[0-9./]+' || true)
+        [ -z "$_src" ] && continue
+        _ours=0
+        for _r in "${CF_RANGES[@]}"; do [ "$_src" = "$_r" ] && _ours=1 && break; done
+        if [ "$_ours" -eq 0 ]; then
+            while IFS= read -r _w; do
+                { [ "$_src" = "$_w" ] || [ "$_src" = "$_w/32" ]; } && _ours=1
+            done < <(list_self_ips)
+        fi
+        if [ "$_ours" -eq 0 ] && [ -f "$WHITELIST_FILE" ]; then
+            while IFS= read -r _w; do
+                _w="${_w%%#*}"; _w="${_w// /}"
+                [ -n "$_w" ] && [ "$_src" = "$_w" ] && _ours=1
+            done < "$WHITELIST_FILE"
+        fi
+        [ "$_ours" -eq 1 ] && _del="$_del $((_idx - 1))"
+    done << NXRAW
+$_snap
+NXRAW
+    for _n in $(printf '%s
+' $_del | sort -rn); do
+        [ -n "$_n" ] && iptables -t raw -D PREROUTING "$_n" 2>/dev/null || true
     done
-    # raw table
-    while iptables -t raw -L PREROUTING -n 2>/dev/null | grep -qE "CT|notrack|cf_whitelist|self_whitelist|user_whitelist"; do
-        RNUM=$(iptables -t raw -L PREROUTING -n --line-numbers 2>/dev/null | \
-              grep -E "CT|notrack|ACCEPT" | awk '{print $1}' | head -1 || true)
-        [ -z "$RNUM" ] && break
-        iptables -t raw -D PREROUTING "$RNUM" 2>/dev/null || break
-    done
+    nx_delete_matching raw PREROUTING '-j CT'
     success "iptables rules: removed"
 
     # fail2ban
@@ -5086,7 +5217,13 @@ remove_rules() {
     systemctl disable antiddos-restore.service 2>/dev/null || true
     rm -f /etc/systemd/system/antiddos-restore.service
     systemctl daemon-reload
-    rm -f "$STATE_FILE"
+    rm -f "$STATE_FILE" /opt/proxy-manager/tc-setup.sh \
+          /etc/antiddos/restore-rules.sh "$IPTABLES_SAVE_FILE"
+    # Regenerate the persistent ruleset from the now-cleaned live state,
+    # or the next boot would resurrect the removed rules (BUG-012/031).
+    if [ -d /etc/iptables ]; then
+        save_static_rules /etc/iptables/rules.v4
+    fi
     success "All Anti-DDoS rules removed."
 }
 

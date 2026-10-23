@@ -11,6 +11,14 @@ RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 CYAN='\033[0;36m'; NC='\033[0m'
 PROXY_BIN="/usr/local/bin/3proxy"
 PROXY_CONF="/etc/3proxy/3proxy.cfg"
+
+# BUG-019: every iptables call in this script takes the xtables lock with
+# a 5s wait. The daemon, fail2ban and the menus mutate rules concurrently;
+# without -w a contended call fails with "Resource temporarily
+# unavailable" and the failure is usually swallowed by || true - rules
+# silently never landed. (iptables-save/-restore are separate binaries
+# and are not affected by this wrapper.)
+iptables() { command iptables -w 5 "$@"; }
 PROXY_USERS="/etc/3proxy/users.cfg"
 PROXY_LOG_DIR="/var/log/3proxy"
 SERVICE_FILE="/etc/systemd/system/3proxy.service"

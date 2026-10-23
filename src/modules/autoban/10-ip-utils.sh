@@ -1,5 +1,13 @@
 # @part modules/autoban/10-ip-utils.sh - log, ip helpers, Cloudflare/self/whitelist exemption checks
 # Assembled into auto-ban.sh by tools/build.py - not a standalone script.
+# BUG-019: every iptables call in this script takes the xtables lock with
+# a 5s wait. The daemon, fail2ban and the menus mutate rules concurrently;
+# without -w a contended call fails with "Resource temporarily
+# unavailable" and the failure is usually swallowed by || true - rules
+# silently never landed. (iptables-save/-restore are separate binaries
+# and are not affected by this wrapper.)
+iptables() { command iptables -w 5 "$@"; }
+
 log() { echo "[$(date '+%H:%M:%S')] $*" | tee -a "$LOG"; }
 
 # Convert IP to integer for CIDR comparison

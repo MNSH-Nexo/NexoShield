@@ -1,5 +1,19 @@
 # @part modules/antiddos/20-iptables.sh - apply_iptables (single cohesive function)
 # Assembled into antiddos.sh by tools/build.py - not a standalone script.
+
+# nx_static_rules_filter: iptables-save output (stdin) -> the STATIC
+# ruleset (stdout). Transient enforcement state must never be baked into
+# boot persistence (BUG-012): auto-ban/subnet-ban DROP rules and fail2ban
+# chains are runtime state, rebuilt by their owners; persisting them made
+# expired bans immortal and resurrected removed rules after reboot.
+nx_static_rules_filter() {
+    grep -v -e '"auto-ban"' -e '"subnet-ban"' -e 'f2b-' -e 'fail2ban-' || true
+}
+
+# save_static_rules <file>: persist only the static ruleset.
+save_static_rules() {
+    iptables-save 2>/dev/null | nx_static_rules_filter > "$1" || true
+}
 apply_iptables() {
     info "Applying iptables rules..."
 
@@ -9,6 +23,20 @@ apply_iptables() {
         err "Cloudflare range list is empty/missing - refusing to apply iptables rules (CF would lose its exemption)"
         return 1
     fi
+
+    # BUG-063: purge rate rules from any previous run/tier first. The
+    # named hashlimit tables are ours by construction; re-applying with
+    # different thresholds otherwise APPENDS new rules next to the old
+    # ones (same --hashlimit-name), and the old rule - evaluated first -
+    # keeps deciding, so a raised limit silently never takes effect.
+    # Deletion is by rule number from `iptables -S` (spec deletion breaks
+    # on quoted arguments).
+    local _pn
+    for _pn in $(iptables -S INPUT 2>/dev/null | \
+            grep -nE 'hashlimit-name (syn_flood|udp_flood|icmp_flood|rst_flood|bw_per_ip|bw_per_ip_test|new_conn_rate|http_req_rate|udp_reflect_[0-9]+)|nx_connlimit' | \
+            cut -d: -f1 | sort -rn); do
+        iptables -D INPUT $((_pn - 1)) 2>/dev/null || true
+    done
 
     # Helper: add if not already present
     ipt_add() { iptables -C "$@" 2>/dev/null || iptables -A "$@"; }
@@ -22,9 +50,85 @@ apply_iptables() {
     ipt_ins FORWARD -m conntrack --ctstate INVALID -j DROP
     success "Invalid packet drop: ON"
 
-    # ── Step 2: Fast path for established ────────────
-    # Must come BEFORE rate-limit rules so existing CF connections never hit limits
+    # ── Step 2: ESTABLISHED fast path + the two rules that police it ──
+    # BUG-002 fix: the ESTABLISHED accept used to sit alone at the top, so
+    # the two rules that police ESTABLISHED traffic (bw_per_ip and
+    # http_req_rate, appended far below) were unreachable dead code - an
+    # established connection was accepted before ever reaching them.
+    # Insert order here is deliberate (ipt_ins stacks; last insert = top):
+    #   1) ESTABLISHED accept  -> ends up deepest of the three
+    #   2) bw_per_ip           -> above the accept, so it can police it
+    #   3) http_req_rate       -> above bw_per_ip
+    # The whitelist ACCEPTs (Steps 3-4c) are inserted AFTER this step and
+    # therefore land ABOVE all three: exempt traffic is never policed,
+    # exactly as before. Everything appended later stays below.
     ipt_ins INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+
+    # ── Step 2a: Per-IP bandwidth cap (polices ESTABLISHED) ──
+    # _proc_heavy sends 64MB+ per connection. Byte-mode hashlimit
+    # caps per-IP throughput on established flows.
+    # Try hashlimit byte-mode (kernel 4.1+), fallback to connlimit
+    local BW_APPLIED=0
+    if [ "$HASHLIMIT_OK" -eq 1 ]; then
+        # Test if byte-mode (mbit/s) is supported by this kernel
+        if iptables -A INPUT -p tcp \
+            -m hashlimit \
+            --hashlimit-above "${BW_PER_IP_MBIT}mbit/s" \
+            --hashlimit-burst "$((BW_PER_IP_MBIT * 2))mbit" \
+            --hashlimit-mode srcip \
+            --hashlimit-name bw_per_ip_test \
+            --hashlimit-htable-expire 5000 \
+            -j DROP 2>/dev/null; then
+            # Success — remove test rule, add the real one via ipt_ins
+            iptables -D INPUT -p tcp \
+                -m hashlimit \
+                --hashlimit-above "${BW_PER_IP_MBIT}mbit/s" \
+                --hashlimit-burst "$((BW_PER_IP_MBIT * 2))mbit" \
+                --hashlimit-mode srcip \
+                --hashlimit-name bw_per_ip_test \
+                --hashlimit-htable-expire 5000 \
+                -j DROP 2>/dev/null || true
+            ipt_ins INPUT -p tcp \
+                -m conntrack --ctstate ESTABLISHED,RELATED \
+                -m hashlimit \
+                --hashlimit-above "${BW_PER_IP_MBIT}mbit/s" \
+                --hashlimit-burst "$((BW_PER_IP_MBIT * 2))mbit" \
+                --hashlimit-mode srcip \
+                --hashlimit-name bw_per_ip \
+                --hashlimit-htable-expire 5000 \
+                -j DROP 2>/dev/null && BW_APPLIED=1
+            [ "$BW_APPLIED" -eq 1 ] && \
+                success "Per-IP bandwidth cap: ${BW_PER_IP_MBIT}Mbps max per non-CF IP"
+        fi
+    fi
+    if [ "$BW_APPLIED" -eq 0 ]; then
+        # Fallback: use connlimit — limit simultaneous connections per IP
+        # Each connection ~1-5 Mbps for proxy; 60 conns ≈ 60-300 Mbps cap
+        ipt_add INPUT -p tcp \
+            -m conntrack --ctstate NEW \
+            -m connlimit --connlimit-above 60 --connlimit-mask 32 \
+            -j DROP 2>/dev/null && \
+            success "Per-IP bandwidth cap: connlimit fallback (max 60 conns/IP — kernel too old for byte-mode)" || \
+            warn "Per-IP bandwidth cap: both byte-mode and connlimit fallback failed"
+    fi
+
+
+    # ── Step 2b: HTTP request rate (polices ESTABLISHED) ──
+    if [ "$HASHLIMIT_OK" -eq 1 ] && [ "$CONNTRACK_OK" -eq 1 ]; then
+            # ── HTTP request rate (packet rate on established TCP) ────
+            # _proc_http_burst sends hundreds of requests on keep-alive.
+            # hashlimit on all-TCP-packets (not just NEW) catches this.
+            ipt_ins INPUT -p tcp \
+                -m conntrack --ctstate ESTABLISHED \
+                -m hashlimit \
+                --hashlimit-above "$HTTP_REQ_RATE" \
+                --hashlimit-burst "$HTTP_REQ_BURST" \
+                --hashlimit-mode srcip \
+                --hashlimit-name http_req_rate \
+                --hashlimit-htable-expire 10000 \
+                -j DROP
+            success "HTTP burst rate: max $HTTP_REQ_RATE pkt/s per non-CF IP (heavy/http_burst defense)"
+    fi
 
     # ── Step 3: CF IPs → ACCEPT (NO limits ever) ─────
     # This is the MOST CRITICAL rule:
@@ -191,7 +295,7 @@ apply_iptables() {
             ss -tuln 2>/dev/null | grep -q ":${HTTP_PORT} " || continue
             ipt_add INPUT -p tcp --dport "$HTTP_PORT" \
                 -m connlimit --connlimit-above "$CONN_LIMIT_PER_IP" \
-                --connlimit-mask 32 \
+                --connlimit-mask 32 -m comment --comment "nx_connlimit" \
                 -j REJECT --reject-with tcp-reset
             success "HTTP Flood: connlimit :${HTTP_PORT} (max $CONN_LIMIT_PER_IP per non-CF IP)"
         done
@@ -203,12 +307,12 @@ apply_iptables() {
         # LOG before DROP so fail2ban conn-flood jail can read it from kern.log
         ipt_add INPUT -p tcp \
             -m connlimit --connlimit-above "$CONN_LIMIT_PER_IP" \
-            --connlimit-mask 32 \
+            --connlimit-mask 32 -m comment --comment "nx_connlimit" \
             -m limit --limit 10/min --limit-burst 20 \
             -j LOG --log-prefix "[CONNLIMIT DROP] " --log-level 4 2>/dev/null || true
         ipt_add INPUT -p tcp \
             -m connlimit --connlimit-above "$CONN_LIMIT_PER_IP" \
-            --connlimit-mask 32 \
+            --connlimit-mask 32 -m comment --comment "nx_connlimit" \
             -j REJECT --reject-with tcp-reset
         success "Slowloris/Hold/Heavy: global connlimit (max $CONN_LIMIT_PER_IP TCP per non-CF IP) + LOG→fail2ban"
 
@@ -225,72 +329,9 @@ apply_iptables() {
                 -j DROP
             success "New TCP conn rate: $NEW_CONN_RATE per non-CF IP"
 
-            # ── HTTP request rate (packet rate on established TCP) ────
-            # _proc_http_burst sends hundreds of requests on keep-alive.
-            # hashlimit on all-TCP-packets (not just NEW) catches this.
-            ipt_add INPUT -p tcp \
-                -m conntrack --ctstate ESTABLISHED \
-                -m hashlimit \
-                --hashlimit-above "$HTTP_REQ_RATE" \
-                --hashlimit-burst "$HTTP_REQ_BURST" \
-                --hashlimit-mode srcip \
-                --hashlimit-name http_req_rate \
-                --hashlimit-htable-expire 10000 \
-                -j DROP
-            success "HTTP burst rate: max $HTTP_REQ_RATE pkt/s per non-CF IP (heavy/http_burst defense)"
         fi
     else
         warn "connlimit unavailable - HTTP flood protection limited"
-    fi
-
-    # ── Step 8b: Per-IP bandwidth limit via tc ──────────
-    # _proc_heavy sends 64MB+ per connection. tc limits bandwidth before
-    # data reaches xray/kernel, preventing CPU spike from data processing.
-    # This adds an iptables MARK for non-CF IPs → tc filters pick it up.
-    # ── Step 8: Per-IP bandwidth cap ─────────────────────
-    # Try hashlimit byte-mode (kernel 4.1+), fallback to connlimit
-    local BW_APPLIED=0
-    if [ "$HASHLIMIT_OK" -eq 1 ]; then
-        # Test if byte-mode (mbit/s) is supported by this kernel
-        if iptables -A INPUT -p tcp \
-            -m hashlimit \
-            --hashlimit-above "${BW_PER_IP_MBIT}mbit/s" \
-            --hashlimit-burst "$((BW_PER_IP_MBIT * 2))mbit" \
-            --hashlimit-mode srcip \
-            --hashlimit-name bw_per_ip_test \
-            --hashlimit-htable-expire 5000 \
-            -j DROP 2>/dev/null; then
-            # Success — remove test rule, add via ipt_add (idempotent)
-            iptables -D INPUT -p tcp \
-                -m hashlimit \
-                --hashlimit-above "${BW_PER_IP_MBIT}mbit/s" \
-                --hashlimit-burst "$((BW_PER_IP_MBIT * 2))mbit" \
-                --hashlimit-mode srcip \
-                --hashlimit-name bw_per_ip_test \
-                --hashlimit-htable-expire 5000 \
-                -j DROP 2>/dev/null || true
-            ipt_add INPUT -p tcp \
-                -m conntrack --ctstate ESTABLISHED,RELATED \
-                -m hashlimit \
-                --hashlimit-above "${BW_PER_IP_MBIT}mbit/s" \
-                --hashlimit-burst "$((BW_PER_IP_MBIT * 2))mbit" \
-                --hashlimit-mode srcip \
-                --hashlimit-name bw_per_ip \
-                --hashlimit-htable-expire 5000 \
-                -j DROP 2>/dev/null && BW_APPLIED=1
-            [ "$BW_APPLIED" -eq 1 ] && \
-                success "Per-IP bandwidth cap: ${BW_PER_IP_MBIT}Mbps max per non-CF IP"
-        fi
-    fi
-    if [ "$BW_APPLIED" -eq 0 ]; then
-        # Fallback: use connlimit — limit simultaneous connections per IP
-        # Each connection ~1-5 Mbps for proxy; 60 conns ≈ 60-300 Mbps cap
-        ipt_add INPUT -p tcp \
-            -m conntrack --ctstate NEW \
-            -m connlimit --connlimit-above 60 --connlimit-mask 32 \
-            -j DROP 2>/dev/null && \
-            success "Per-IP bandwidth cap: connlimit fallback (max 60 conns/IP — kernel too old for byte-mode)" || \
-            warn "Per-IP bandwidth cap: both byte-mode and connlimit fallback failed"
     fi
 
     # ── Step 9: RST Flood ─────────────────────────────
@@ -323,8 +364,8 @@ apply_iptables() {
     ipt_add INPUT -f -j DROP
     success "Fragmented packets: dropped"
 
-    # Save rules
-    iptables-save > "$IPTABLES_SAVE_FILE" 2>/dev/null || true
+    # Save rules (static only - transient bans/f2b chains excluded, BUG-012)
+    save_static_rules "$IPTABLES_SAVE_FILE"
     chmod 600 "$IPTABLES_SAVE_FILE"
     success "iptables rules saved"
 }

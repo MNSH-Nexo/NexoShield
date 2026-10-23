@@ -14,6 +14,14 @@ fi
 PROXY_SCRIPT="$SCRIPT_DIR/3proxy-socks5.sh"
 SYSCTL_SCRIPT="$SCRIPT_DIR/optimize-sysctl.sh"
 ANTIDDOS_SCRIPT="$SCRIPT_DIR/antiddos.sh"
+
+# BUG-019: every iptables call in this script takes the xtables lock with
+# a 5s wait. The daemon, fail2ban and the menus mutate rules concurrently;
+# without -w a contended call fails with "Resource temporarily
+# unavailable" and the failure is usually swallowed by || true - rules
+# silently never landed. (iptables-save/-restore are separate binaries
+# and are not affected by this wrapper.)
+iptables() { command iptables -w 5 "$@"; }
 LOG_FILE="/var/log/proxy-manager.log"
 
 R='\033[0;31m'; G='\033[0;32m'; Y='\033[1;33m'; C='\033[0;36m'

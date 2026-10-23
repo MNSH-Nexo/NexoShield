@@ -137,7 +137,7 @@ setup_persistence() {
     if command -v apt-get >/dev/null 2>&1; then
         mkdir -p /etc/iptables
         DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iptables-persistent 2>/dev/null || true
-        iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+        save_static_rules /etc/iptables/rules.v4
     fi
 
     # Restore script

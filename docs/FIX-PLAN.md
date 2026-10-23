@@ -49,6 +49,32 @@ those waves land.
   unique persistent prios, no state on tc failure, no state without
   classes, hard-throttle band transitions). `make check` + `make test`
   green (57 tests total).
+- Wave 3 — DONE. BUG-002: `bw_per_ip` and `http_req_rate` relocated into
+  Step 2 as inserts — final stack (top→bottom) is whitelist ACCEPTs →
+  http_req_rate → bw_per_ip → ESTABLISHED accept, so both policing rules
+  can fire for the first time while exempt traffic is still never
+  policed. BUG-019: an `iptables()` wrapper (`command iptables -w 5`)
+  in all four programs routes every mutation through the xtables lock.
+  BUG-012: persistence snapshots pass through `nx_static_rules_filter`
+  (transient auto-ban/subnet-ban DROPs and fail2ban chains are never
+  persisted); removal regenerates rules.v4 from the cleaned live state.
+  BUG-013/014: 3proxy create/delete specs are mirror images (CF comment
+  match added, self-IP delete loop added, recent-rule deletes done by
+  enumeration over the stable rule name — hitcount depends on MAX_CONN
+  at create time); uninstall likewise, plus the Wave 1 whitelist rules
+  are removed and the bogus comment-only delete is gone. BUG-063:
+  apply_iptables purges the previous run's named rate rules before
+  adding new ones (connlimit rules gained an `nx_connlimit` tag so they
+  are findable), so threshold-tier changes actually take effect.
+  BUG-031: remove_rules deletes from `iptables -S` by rule number with
+  a pattern set covering every rule this product creates (the -L text
+  matching that silently kept all 753 CF rules is gone), the raw-table
+  cleanup deletes only ACCEPTs whose source is in the exempt set (never
+  foreign rules), leftover persistence files are removed, and the
+  sysctl message no longer claims running kernel values were reset.
+  Residual (documented): the hashlimit-less fallback UDP/ICMP limit
+  pairs are not pattern-deleted. Tests: static-filter 10/10, wave-3
+  source regressions 10/10. `make check` + `make test` green (77 tests).
 
 **Inputs:** `docs/BUGS.md` — 68 audited findings (BUG-001…068) plus the
 maintainer's field reports FR-1 (whitelist must exempt from *everything*),

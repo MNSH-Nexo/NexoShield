@@ -31,23 +31,34 @@ uninstall_proxy() {
     # ── Remove iptables rules ─────────────────────────────
     if [ -n "$PORT" ]; then
         echo -e "${YELLOW}Cleaning iptables rules for port $PORT...${NC}"
-        # CF-specific port rules
+        # CF-specific port rules (delete spec mirrors create, incl. the
+        # comment match - BUG-013)
         for CF in "${CF_RANGES[@]}"; do
             [[ "$CF" == *":"* ]] && continue
-            iptables -D INPUT -p tcp --dport "$PORT" -s "$CF" -j ACCEPT 2>/dev/null || true
+            iptables -D INPUT -p tcp --dport "$PORT" -s "$CF" \
+                -m comment --comment "3proxy_cf_allow" -j ACCEPT 2>/dev/null || true
         done
+        # User-whitelist rules for this port (Wave 1 create; remove here)
+        if [ -f /etc/antiddos/whitelist.list ]; then
+            while IFS= read -r WIP; do
+                WIP="${WIP%%#*}"; WIP="${WIP// /}"
+                [ -z "$WIP" ] && continue
+                iptables -D INPUT -p tcp --dport "$PORT" -s "$WIP" \
+                    -m comment --comment "3proxy_wl_allow" -j ACCEPT 2>/dev/null || true
+            done < /etc/antiddos/whitelist.list
+        fi
         # Self-IP rules for this port
         while IFS= read -r SIP; do
             [ -z "$SIP" ] && continue
             iptables -D INPUT -p tcp --dport "$PORT" -s "$SIP/32" \
                 -m comment --comment "3proxy_self_allow" -j ACCEPT 2>/dev/null || true
         done < <(get_server_ips)
-        # Rate-limit rules for this port
-        iptables -D INPUT -p tcp --dport "$PORT" -m state --state NEW \
-            -m recent --name "3proxy_${PORT}" --update \
-            --seconds 60 --hitcount 60 -j DROP 2>/dev/null || true
-        iptables -D INPUT -p tcp --dport "$PORT" -m state --state NEW \
-            -m recent --name "3proxy_${PORT}" --set 2>/dev/null || true
+        # Rate-limit rules for this port - by enumeration (BUG-014: the
+        # hitcount was MAX_CONN*3 at create, not a fixed 60)
+        local _rn
+        for _rn in $(iptables -S INPUT 2>/dev/null | grep -n "3proxy_${PORT}" | cut -d: -f1 | sort -rn); do
+            iptables -D INPUT $((_rn - 1)) 2>/dev/null || true
+        done
         # connlimit rule for this port
         iptables -D INPUT -p tcp --dport "$PORT" \
             -m connlimit --connlimit-above 30 --connlimit-mask 32 \
@@ -64,8 +75,6 @@ uninstall_proxy() {
             -m comment --comment "3proxy_stats_out" 2>/dev/null || true
         # Plain ACCEPT rule
         iptables -D INPUT -p tcp --dport "$PORT" -j ACCEPT 2>/dev/null || true
-        iptables -D INPUT -p tcp --dport "$PORT" \
-            -m comment --comment "3proxy_cf_allow" -j ACCEPT 2>/dev/null || true
         # UFW / firewalld
         command -v ufw >/dev/null 2>&1 && ufw delete allow "$PORT"/tcp 2>/dev/null || true
         command -v firewall-cmd >/dev/null 2>&1 && {

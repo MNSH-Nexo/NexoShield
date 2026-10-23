@@ -10,17 +10,29 @@ setup_iptables_for_port() {
         -m comment --comment "3proxy_stats_in" 2>/dev/null || true
     iptables -D OUTPUT -p tcp --sport "$PORT" \
         -m comment --comment "3proxy_stats_out" 2>/dev/null || true
-    # Remove old CF rules
+    # Remove old CF rules (BUG-013: the delete spec must mirror the
+    # create spec EXACTLY, including the comment match - without it the
+    # delete never matched and every reinstall duplicated all 753 rules)
     for CF in "${CF_RANGES[@]}"; do
         [[ "$CF" == *":"* ]] && continue
-        iptables -D INPUT -p tcp --dport "$PORT" -s "$CF" -j ACCEPT 2>/dev/null || true
+        iptables -D INPUT -p tcp --dport "$PORT" -s "$CF" \
+            -m comment --comment "3proxy_cf_allow" -j ACCEPT 2>/dev/null || true
     done
-    # Remove old rate-limit rules
-    iptables -D INPUT -p tcp --dport "$PORT" -m state --state NEW \
-        -m recent --name "3proxy_$PORT" --update --seconds 60 \
-        --hitcount $((MAX_CONN * 2)) -j DROP 2>/dev/null || true
-    iptables -D INPUT -p tcp --dport "$PORT" -m state --state NEW \
-        -m recent --name "3proxy_$PORT" --set 2>/dev/null || true
+    # Remove old self-IP rules (mirror of Step 2 - previously missing, so
+    # these duplicated on every reinstall too)
+    while IFS= read -r SIP; do
+        [ -z "$SIP" ] && continue
+        iptables -D INPUT -p tcp --dport "$PORT" -s "$SIP/32" \
+            -m comment --comment "3proxy_self_allow" -j ACCEPT 2>/dev/null || true
+    done < <(get_server_ips)
+    # Remove old rate-limit rules by enumeration (BUG-014: the hitcount
+    # depends on MAX_CONN at create time - *3 now, *2 in old versions -
+    # so a fixed spec delete can miss the real rule; the recent-rule name
+    # is the stable identifier)
+    local _rn
+    for _rn in $(iptables -S INPUT 2>/dev/null | grep -n "3proxy_$PORT" | cut -d: -f1 | sort -rn); do
+        iptables -D INPUT $((_rn - 1)) 2>/dev/null || true
+    done
     # Remove old user-whitelist rules (spec mirrors the create below)
     if [ -f /etc/antiddos/whitelist.list ]; then
         while IFS= read -r WIP; do

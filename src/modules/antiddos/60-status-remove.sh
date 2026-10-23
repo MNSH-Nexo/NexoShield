@@ -91,28 +91,64 @@ remove_rules() {
     fi
     [[ "$CONF_R" != "y" && "$CONF_R" != "Y" ]] && echo -e "  ${DIM}Cancelled.${NC}" && return
 
-    # Sysctl
+    # Sysctl (note: removing the file does not reset values already
+    # loaded into the running kernel - they reset at reboot)
     rm -f "$SYSCTL_FILE"
     sysctl --system >/dev/null 2>&1 || true
-    success "Kernel hardening: removed"
+    success "Kernel hardening: file removed (running values reset at reboot)"
 
-    # iptables — delete by content match (line numbers shift after each delete, so loop)
-    MATCH_PAT="hashlimit\|SYNPROXY\|connlimit\|cf_whitelist\|auto-ban\|self_whitelist\|user_whitelist\|syn_flood\|udp_flood\|icmp_flood\|rst_flood\|bw_per_ip\|new_conn_rate\|http_req_rate"
-    for TABLE in INPUT FORWARD; do
-        while iptables -L "$TABLE" -n 2>/dev/null | grep -qE "$MATCH_PAT"; do
-            RNUM=$(iptables -L "$TABLE" -n --line-numbers 2>/dev/null | \
-                  grep -E "$MATCH_PAT" | awk '{print $1}' | head -1 || true)
-            [ -z "$RNUM" ] && break
-            iptables -D "$TABLE" "$RNUM" 2>/dev/null || break
+    # iptables — delete by matching the `iptables -S` text (BUG-031).
+    # The old code matched `iptables -L` output, which never renders rule
+    # comments, so every comment-tagged rule (all 753 CF ACCEPTs, the
+    # whitelist, ...) silently survived a "full removal"; several
+    # untagged rules (loopback, ESTABLISHED accept, flag scans) survived
+    # too. Deletion is by rule NUMBER recomputed from -S after each
+    # delete - spec-based deletion breaks on quoted arguments.
+    nx_delete_matching() {
+        local _t="$1" _c="$2" _p="$3" _n
+        while true; do
+            _n=$(iptables -t "$_t" -S "$_c" 2>/dev/null | grep -nE "$_p" | head -1 | cut -d: -f1 || true)
+            [ -z "$_n" ] && break
+            # -S line 1 is the chain policy (-P): rule number = line - 1
+            iptables -t "$_t" -D "$_c" $((_n - 1)) 2>/dev/null || break
         done
+    }
+    local RULE_PAT='hashlimit|SYNPROXY|connlimit|cf_whitelist|auto-ban|subnet-ban|self_whitelist|user_whitelist|nx_connlimit|--ctstate INVALID|--tcp-flags| -f -j DROP|! --syn|-i lo|--ctstate ESTABLISHED,RELATED -j ACCEPT'
+    nx_delete_matching filter INPUT "$RULE_PAT"
+    nx_delete_matching filter FORWARD "$RULE_PAT"
+
+    # raw table: delete ONLY our own ACCEPTs - those whose source is a CF
+    # range, a self IP or a whitelist entry. The old loop's bare "ACCEPT"
+    # token deleted other software's raw PREROUTING rules (BUG-031).
+    local _snap _del="" _idx=0 _line _src _ours _r _w _n
+    _snap=$(iptables -t raw -S PREROUTING 2>/dev/null || true)
+    while IFS= read -r _line; do
+        _idx=$((_idx + 1))
+        case "$_line" in *'-j ACCEPT'*) : ;; *) continue ;; esac
+        _src=$(printf '%s' "$_line" | grep -oP '(?<=-s )[0-9./]+' || true)
+        [ -z "$_src" ] && continue
+        _ours=0
+        for _r in "${CF_RANGES[@]}"; do [ "$_src" = "$_r" ] && _ours=1 && break; done
+        if [ "$_ours" -eq 0 ]; then
+            while IFS= read -r _w; do
+                { [ "$_src" = "$_w" ] || [ "$_src" = "$_w/32" ]; } && _ours=1
+            done < <(list_self_ips)
+        fi
+        if [ "$_ours" -eq 0 ] && [ -f "$WHITELIST_FILE" ]; then
+            while IFS= read -r _w; do
+                _w="${_w%%#*}"; _w="${_w// /}"
+                [ -n "$_w" ] && [ "$_src" = "$_w" ] && _ours=1
+            done < "$WHITELIST_FILE"
+        fi
+        [ "$_ours" -eq 1 ] && _del="$_del $((_idx - 1))"
+    done << NXRAW
+$_snap
+NXRAW
+    for _n in $(printf '%s
+' $_del | sort -rn); do
+        [ -n "$_n" ] && iptables -t raw -D PREROUTING "$_n" 2>/dev/null || true
     done
-    # raw table
-    while iptables -t raw -L PREROUTING -n 2>/dev/null | grep -qE "CT|notrack|cf_whitelist|self_whitelist|user_whitelist"; do
-        RNUM=$(iptables -t raw -L PREROUTING -n --line-numbers 2>/dev/null | \
-              grep -E "CT|notrack|ACCEPT" | awk '{print $1}' | head -1 || true)
-        [ -z "$RNUM" ] && break
-        iptables -t raw -D PREROUTING "$RNUM" 2>/dev/null || break
-    done
+    nx_delete_matching raw PREROUTING '-j CT'
     success "iptables rules: removed"
 
     # fail2ban
@@ -149,7 +185,13 @@ remove_rules() {
     systemctl disable antiddos-restore.service 2>/dev/null || true
     rm -f /etc/systemd/system/antiddos-restore.service
     systemctl daemon-reload
-    rm -f "$STATE_FILE"
+    rm -f "$STATE_FILE" /opt/proxy-manager/tc-setup.sh \
+          /etc/antiddos/restore-rules.sh "$IPTABLES_SAVE_FILE"
+    # Regenerate the persistent ruleset from the now-cleaned live state,
+    # or the next boot would resurrect the removed rules (BUG-012/031).
+    if [ -d /etc/iptables ]; then
+        save_static_rules /etc/iptables/rules.v4
+    fi
     success "All Anti-DDoS rules removed."
 }
 
