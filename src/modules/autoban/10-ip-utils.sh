@@ -86,7 +86,7 @@ ip6_in_cidr() {
     }
     function hv(c) { return index("0123456789abcdef", c) - 1 }
     BEGIN {
-        split(cidr, C, "/"); pfx = C[2] + 0
+        np = split(cidr, C, "/"); pfx = (np < 2 || C[2] == "") ? 128 : C[2] + 0
         e1 = expand(ip); e2 = expand(C[1])
         full = int(pfx / 4)
         if (substr(e1, 1, full) != substr(e2, 1, full)) exit 1
@@ -183,6 +183,30 @@ is_user_whitelisted() {
 }
 
 # Check if IP should be exempt (CF or self or user-whitelisted)
+# E-3 (exemption audit): the self-IP sets are captured at daemon
+# start. An address added to the host later (failover IP, new v6
+# prefix) would not be immune until a restart. The main loop calls
+# this on the slow cadence; additions are logged, removals apply
+# silently (a reassigned address must not stay immune).
+refresh_self_ips() {
+    local _ip _o _found
+    local _new4=() _new6=()
+    while IFS= read -r _ip; do [ -n "$_ip" ] && _new4+=("$_ip"); done < <(list_self_ips)
+    while IFS= read -r _ip; do [ -n "$_ip" ] && _new6+=("$_ip"); done < <(list_self_ips6)
+    for _ip in "${_new4[@]}"; do
+        _found=0
+        for _o in "${SELF_IPS[@]}"; do [ "$_o" = "$_ip" ] && { _found=1; break; }; done
+        [ "$_found" -eq 0 ] && log " SELF: new own IPv4 detected: $_ip (immune)"
+    done
+    for _ip in "${_new6[@]}"; do
+        _found=0
+        for _o in "${SELF6_IPS[@]}"; do [ "$_o" = "$_ip" ] && { _found=1; break; }; done
+        [ "$_found" -eq 0 ] && log " SELF: new own IPv6 detected: $_ip (immune)"
+    done
+    SELF_IPS=("${_new4[@]}")
+    SELF6_IPS=("${_new6[@]}")
+}
+
 is_exempt() {
     local ip="$1"
     is_self_ip "$ip"  && return 0

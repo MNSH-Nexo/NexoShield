@@ -116,8 +116,9 @@ while true; do
     # Keep the persistent throttle mirror current (U-11).
     mirror_throttle_state
 
-    # Every ~5 min: unban expired IPs and subnets
-    [ $((CYCLE % 75)) -eq 0 ] && unban_expired && unban_subnet_expired
+    # Every ~5 min: pick up any newly assigned own IPs (E-3), then
+    # unban expired IPs and subnets
+    [ $((CYCLE % 75)) -eq 0 ] && refresh_self_ips && unban_expired && unban_subnet_expired
 
     # Every cycle: enforce self-IP immunity (cheap; iptables -S scan)
     self_guard

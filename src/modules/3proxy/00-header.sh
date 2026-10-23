@@ -34,6 +34,7 @@ SERVICE_FILE="/etc/systemd/system/3proxy.service"
 # @include lib/cloudflare-loader.sh
 
 # @include lib/server-ips.sh
+# @include lib/self-ips.sh
 
 get_server_ip() {
     curl -s -4 --max-time 5 https://api.ipify.org 2>/dev/null || \

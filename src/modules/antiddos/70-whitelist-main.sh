@@ -106,9 +106,108 @@ flush_autobans() {
     success "All auto-bans flushed (iptables rules + daemon state)"
 }
 
+# valid_ip6_or_cidr - IPv6 counterpart of valid_ip_or_cidr (E-5).
+# The whitelist was v4-only end to end: every layer HONOURS v6
+# entries (daemon is_exempt6, ip6tables, fail2ban ignoreip) but the
+# admin could never add one, and --exempt-check rejected v6 targets
+# as "invalid". Charset + group-count validation; embedded-IPv4
+# forms are rejected (whitelist the v4 form instead).
+valid_ip6_or_cidr() {
+    local input="${1:-}" addr mask
+    case "$input" in
+        */*) addr="${input%%/*}"; mask="${input#*/}"
+             case "$mask" in ''|*[!0-9]*) return 1 ;; esac
+             [ "${#mask}" -le 3 ] || return 1
+             (( 10#$mask <= 128 )) || return 1 ;;
+        *)   addr="$input" ;;
+    esac
+    case "$addr" in
+        *[!0-9a-fA-F:]*) return 1 ;;
+        *:::*) return 1 ;;
+    esac
+    case "$addr" in
+        *::*) case "${addr#*::}" in *::*) return 1 ;; esac ;;
+    esac
+    [ "$addr" = "::" ] && return 0
+    local _groups=0 _g
+    local _oldIFS="$IFS"; IFS=':'
+    # shellcheck disable=SC2086
+    set -- $addr
+    IFS="$_oldIFS"
+    for _g in "$@"; do
+        [ -z "$_g" ] && continue
+        [ "${#_g}" -le 4 ] || return 1
+        _groups=$((_groups + 1))
+    done
+    case "$addr" in
+        *::*) [ "$_groups" -le 7 ] || return 1 ;;
+        *)    [ "$_groups" -eq 8 ] || return 1 ;;
+    esac
+    return 0
+}
+
+# nx_ip6_in_cidr - the antiddos-side twin of the daemon's ip6_in_cidr
+# (same awk nibble-compare; a missing mask means /128).
+nx_ip6_in_cidr() {
+    awk -v ip="$1" -v cidr="$2" '
+    function hv(c) { return index("0123456789abcdef", c) - 1 }
+    function pad(h) { while (length(h) < 4) h = "0" h; return h }
+    function expand(a,    k,lp,rp,ln,rn,out,i) {
+        a = tolower(a)
+        k = index(a, "::")
+        if (k > 0) {
+            lp = substr(a, 1, k - 1); rp = substr(a, k + 2)
+            ln = (lp == "") ? 0 : split(lp, L, ":")
+            rn = (rp == "") ? 0 : split(rp, G, ":")
+            out = ""
+            for (i = 1; i <= ln; i++) out = out pad(L[i])
+            for (i = 1; i <= 8 - ln - rn; i++) out = out "0000"
+            for (i = 1; i <= rn; i++) out = out pad(G[i])
+            return out
+        }
+        split(a, P, ":"); out = ""
+        for (i = 1; i <= 8; i++) out = out pad(P[i])
+        return out
+    }
+    BEGIN {
+        np = split(cidr, C, "/"); pfx = (np < 2 || C[2] == "") ? 128 : C[2] + 0
+        e1 = expand(ip); e2 = expand(C[1])
+        full = int(pfx / 4)
+        if (substr(e1, 1, full) != substr(e2, 1, full)) exit 1
+        rem = pfx % 4
+        if (rem > 0) {
+            keep = 2 ^ (4 - rem)
+            if (int(hv(substr(e1, full + 1, 1)) / keep) != int(hv(substr(e2, full + 1, 1)) / keep)) exit 1
+        }
+        exit 0
+    }'
+}
+
 exempt_check() {
     local ip="${1:-}" rc=1 _e
     [ -n "$ip" ] || { echo "usage: --exempt-check <ip>"; return 2; }
+    case "$ip" in
+        *:*)
+            valid_ip6_or_cidr "$ip" || { echo "invalid IPv6/CIDR: $ip"; return 2; }
+            ip="${ip%%/*}"
+            echo "Exemption check for $ip (IPv6):"
+            local cf=no self=no wl=no
+            for _e in "${CF6_RANGES[@]}"; do nx_ip6_in_cidr "$ip" "$_e" && { cf=yes; break; }; done
+            list_self_ips6 2>/dev/null | grep -qxF "$ip" && self=yes
+            if [ -f "$WHITELIST_FILE" ]; then
+                while IFS= read -r _e; do
+                    _e="${_e%%#*}"; _e="${_e// /}"
+                    case "$_e" in *:*) : ;; *) continue ;; esac
+                    [ -n "$_e" ] && nx_ip6_in_cidr "$ip" "$_e" && { wl=yes; break; }
+                done < "$WHITELIST_FILE"
+            fi
+            echo "  cloudflare ranges : $cf"
+            echo "  server own IP     : $self"
+            echo "  admin whitelist   : $wl"
+            { [ "$cf" = yes ] || [ "$self" = yes ] || [ "$wl" = yes ]; } && rc=0
+            [ "$rc" -eq 0 ] && echo "  VERDICT: EXEMPT" || echo "  VERDICT: not exempt"
+            return $rc ;;
+    esac
     valid_ip_or_cidr "$ip" || { echo "invalid IP/CIDR: $ip"; return 2; }
     ip="${ip%%/*}"
     echo "Exemption check for $ip:"
@@ -182,7 +281,7 @@ manage_whitelist() {
                 WIP="${WIP// /}"
                 if [ -z "$WIP" ]; then
                     echo -e "  ${YELLOW}No input.${NC}"
-                elif ! valid_ip_or_cidr "$WIP"; then
+                elif ! valid_ip_or_cidr "$WIP" && ! valid_ip6_or_cidr "$WIP"; then
                     echo -e "  ${RED}Invalid IP/CIDR: $WIP${NC}"
                 elif grep -qF "$WIP" "$WL" 2>/dev/null; then
                     echo -e "  ${YELLOW}Already in whitelist.${NC}"

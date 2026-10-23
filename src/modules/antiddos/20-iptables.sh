@@ -140,10 +140,14 @@ apply_iptables() {
     done
 
     # ── Step 4: Server own IPs → ACCEPT ──────────────
+    # E-4: get_server_ips is display-grade (public only) - private and
+    # secondary self addresses were missing here, so traffic from the
+    # server's own private IP still hit the flood limits. Enforcement
+    # uses the exhaustive list_self_ips (loopback excluded, see above).
     while IFS= read -r SIP; do
         [ -z "$SIP" ] && continue
         ipt_ins INPUT -s "$SIP/32" -m comment --comment "self_whitelist" -j ACCEPT
-    done < <(get_server_ips)
+    done < <(list_self_ips | grep -v '^127\.0\.0\.1$')
 
     # ── Step 4b: User whitelist → ACCEPT (before ALL limits) ──
     mkdir -p /etc/antiddos
@@ -181,12 +185,12 @@ apply_iptables() {
             iptables -t raw -C PREROUTING -s "$CF" -j ACCEPT 2>/dev/null || \
             iptables -t raw -A PREROUTING -s "$CF" -j ACCEPT
         done
-        # Also whitelist server own IPs in raw
+        # Also whitelist server own IPs in raw (E-4: exhaustive list)
         while IFS= read -r SIP; do
             [ -z "$SIP" ] && continue
             iptables -t raw -C PREROUTING -s "$SIP/32" -j ACCEPT 2>/dev/null || \
             iptables -t raw -A PREROUTING -s "$SIP/32" -j ACCEPT
-        done < <(get_server_ips)
+        done < <(list_self_ips | grep -v '^127\.0\.0\.1$')
         # Also whitelist user whitelist in raw (SYNPROXY never touches them)
         if [ -f "$WHITELIST_FILE" ]; then
             while IFS= read -r WIP; do

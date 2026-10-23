@@ -83,6 +83,12 @@ EOF
     while IFS= read -r _F2B_SELF; do
         [ -n "$_F2B_SELF" ] && _F2B_IGNORE="$_F2B_IGNORE $_F2B_SELF/32"
     done < <(list_self_ips)
+    # E-1 (exemption audit): the server's own IPv6 addresses belong in
+    # ignoreip too - only ::1 was covered, so fail2ban could ban the
+    # server's own global v6 (e.g. via the sshd jail).
+    while IFS= read -r _F2B_SELF6; do
+        [ -n "$_F2B_SELF6" ] && _F2B_IGNORE="$_F2B_IGNORE $_F2B_SELF6"
+    done < <(list_self_ips6)
     if [ -f "$WHITELIST_FILE" ]; then
         while IFS= read -r _F2B_WL; do
             _F2B_WL="${_F2B_WL%%#*}"; _F2B_WL="${_F2B_WL// /}"

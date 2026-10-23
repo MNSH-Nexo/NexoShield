@@ -55,13 +55,14 @@ setup_tc() {
         HANDLE=$((HANDLE + 1))
     done
 
-    # Server own IPs → class 1:10
+    # Server own IPs → class 1:10 (E-4: exhaustive list, like the
+    # firewall steps - public-only left private self traffic shaped)
     while IFS= read -r SIP; do
         [ -z "$SIP" ] && continue
         tc filter add dev "$MAIN_IF" parent 1: protocol ip prio $HANDLE \
             u32 match ip dst "$SIP/32" flowid 1:10 2>/dev/null || true
         HANDLE=$((HANDLE + 1))
-    done < <(get_server_ips)
+    done < <(list_self_ips | grep -v '^127\.0\.0\.1$')
 
     # User whitelist → class 1:10 (unlimited, same as CF/self)
     if [ -f "$WHITELIST_FILE" ]; then
@@ -110,7 +111,7 @@ if [ -f /etc/antiddos/cloudflare-ipv6.list ]; then
     done < /etc/antiddos/cloudflare-ipv6.list
 fi
 for SIP in $(ip -4 addr show 2>/dev/null | grep 'inet ' | \
-    grep -v '127\.\|10\.\|192\.168\.' | awk '{print $2}' | cut -d/ -f1); do
+    grep -v '127\.' | awk '{print $2}' | cut -d/ -f1); do
     tc filter add dev "$IF" parent 1: protocol ip prio $H \
         u32 match ip dst "$SIP/32" flowid 1:10 2>/dev/null || true; H=$((H+1))
 done

@@ -24,7 +24,7 @@ setup_iptables_for_port() {
         [ -z "$SIP" ] && continue
         iptables -D INPUT -p tcp --dport "$PORT" -s "$SIP/32" \
             -m comment --comment "3proxy_self_allow" -j ACCEPT 2>/dev/null || true
-    done < <(get_server_ips)
+    done < <(list_self_ips)
     # Remove old rate-limit rules by enumeration (BUG-014: the hitcount
     # depends on MAX_CONN at create time - *3 now, *2 in old versions -
     # so a fixed spec delete can miss the real rule; the recent-rule name
@@ -55,7 +55,7 @@ setup_iptables_for_port() {
         [ -z "$SIP" ] && continue
         iptables -A INPUT -p tcp --dport "$PORT" -s "$SIP/32" \
             -m comment --comment "3proxy_self_allow" -j ACCEPT 2>/dev/null || true
-    done < <(get_server_ips)
+    done < <(list_self_ips)
 
     # ── Step 2b: User whitelist → ACCEPT (FR-1: exempt means exempt
     # in EVERY layer, including this port's rate limits) ──────

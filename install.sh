@@ -898,6 +898,18 @@ get_server_ips() {
         grep -v '127\.\|10\.\|192\.168\.\|172\.\(1[6-9]\|2[0-9]\|3[01]\)\.' | \
         awk '{print $2}' | cut -d/ -f1
 }
+list_self_ips() {
+    { ip -4 addr show 2>/dev/null | grep -oP '(?<=inet )\d+\.\d+\.\d+\.\d+'
+      hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'
+    } | sort -u | grep -v '^$'
+}
+
+# list_self_ips6 - every local IPv6 address (incl. ::1), one per line.
+list_self_ips6() {
+    { ip -6 addr show 2>/dev/null | grep -oP '(?<=inet6 )[0-9a-fA-F:]+'
+      echo "::1"
+    } | sort -u | grep -v '^$'
+}
 
 get_server_ip() {
     curl -s -4 --max-time 5 https://api.ipify.org 2>/dev/null || \
@@ -954,7 +966,7 @@ setup_tc() {
         tc filter add dev "$IF" parent 1: protocol ip prio $HANDLE \
             u32 match ip dst "$SIP/32" flowid 1:10 2>/dev/null || true
         HANDLE=$((HANDLE + 1))
-    done < <(get_server_ips)
+    done < <(list_self_ips)
 
     # User whitelist → class 1:10 (unlimited, same as CF/self)
     if [ -f "/etc/antiddos/whitelist.list" ]; then
@@ -1108,7 +1120,7 @@ setup_iptables_for_port() {
         [ -z "$SIP" ] && continue
         iptables -D INPUT -p tcp --dport "$PORT" -s "$SIP/32" \
             -m comment --comment "3proxy_self_allow" -j ACCEPT 2>/dev/null || true
-    done < <(get_server_ips)
+    done < <(list_self_ips)
     # Remove old rate-limit rules by enumeration (BUG-014: the hitcount
     # depends on MAX_CONN at create time - *3 now, *2 in old versions -
     # so a fixed spec delete can miss the real rule; the recent-rule name
@@ -1139,7 +1151,7 @@ setup_iptables_for_port() {
         [ -z "$SIP" ] && continue
         iptables -A INPUT -p tcp --dport "$PORT" -s "$SIP/32" \
             -m comment --comment "3proxy_self_allow" -j ACCEPT 2>/dev/null || true
-    done < <(get_server_ips)
+    done < <(list_self_ips)
 
     # ── Step 2b: User whitelist → ACCEPT (FR-1: exempt means exempt
     # in EVERY layer, including this port's rate limits) ──────
@@ -1609,7 +1621,7 @@ uninstall_proxy() {
             [ -z "$SIP" ] && continue
             iptables -D INPUT -p tcp --dport "$PORT" -s "$SIP/32" \
                 -m comment --comment "3proxy_self_allow" -j ACCEPT 2>/dev/null || true
-        done < <(get_server_ips)
+        done < <(list_self_ips)
         # Rate-limit rules for this port - by enumeration (BUG-014: the
         # hitcount was MAX_CONN*3 at create, not a fixed 60)
         local _rn
@@ -3968,10 +3980,14 @@ apply_iptables() {
     done
 
     # ── Step 4: Server own IPs → ACCEPT ──────────────
+    # E-4: get_server_ips is display-grade (public only) - private and
+    # secondary self addresses were missing here, so traffic from the
+    # server's own private IP still hit the flood limits. Enforcement
+    # uses the exhaustive list_self_ips (loopback excluded, see above).
     while IFS= read -r SIP; do
         [ -z "$SIP" ] && continue
         ipt_ins INPUT -s "$SIP/32" -m comment --comment "self_whitelist" -j ACCEPT
-    done < <(get_server_ips)
+    done < <(list_self_ips | grep -v '^127\.0\.0\.1$')
 
     # ── Step 4b: User whitelist → ACCEPT (before ALL limits) ──
     mkdir -p /etc/antiddos
@@ -4009,12 +4025,12 @@ apply_iptables() {
             iptables -t raw -C PREROUTING -s "$CF" -j ACCEPT 2>/dev/null || \
             iptables -t raw -A PREROUTING -s "$CF" -j ACCEPT
         done
-        # Also whitelist server own IPs in raw
+        # Also whitelist server own IPs in raw (E-4: exhaustive list)
         while IFS= read -r SIP; do
             [ -z "$SIP" ] && continue
             iptables -t raw -C PREROUTING -s "$SIP/32" -j ACCEPT 2>/dev/null || \
             iptables -t raw -A PREROUTING -s "$SIP/32" -j ACCEPT
-        done < <(get_server_ips)
+        done < <(list_self_ips | grep -v '^127\.0\.0\.1$')
         # Also whitelist user whitelist in raw (SYNPROXY never touches them)
         if [ -f "$WHITELIST_FILE" ]; then
             while IFS= read -r WIP; do
@@ -4397,6 +4413,12 @@ EOF
     while IFS= read -r _F2B_SELF; do
         [ -n "$_F2B_SELF" ] && _F2B_IGNORE="$_F2B_IGNORE $_F2B_SELF/32"
     done < <(list_self_ips)
+    # E-1 (exemption audit): the server's own IPv6 addresses belong in
+    # ignoreip too - only ::1 was covered, so fail2ban could ban the
+    # server's own global v6 (e.g. via the sshd jail).
+    while IFS= read -r _F2B_SELF6; do
+        [ -n "$_F2B_SELF6" ] && _F2B_IGNORE="$_F2B_IGNORE $_F2B_SELF6"
+    done < <(list_self_ips6)
     if [ -f "$WHITELIST_FILE" ]; then
         while IFS= read -r _F2B_WL; do
             _F2B_WL="${_F2B_WL%%#*}"; _F2B_WL="${_F2B_WL// /}"
@@ -4822,7 +4844,7 @@ ip6_in_cidr() {
     }
     function hv(c) { return index("0123456789abcdef", c) - 1 }
     BEGIN {
-        split(cidr, C, "/"); pfx = C[2] + 0
+        np = split(cidr, C, "/"); pfx = (np < 2 || C[2] == "") ? 128 : C[2] + 0
         e1 = expand(ip); e2 = expand(C[1])
         full = int(pfx / 4)
         if (substr(e1, 1, full) != substr(e2, 1, full)) exit 1
@@ -4919,6 +4941,30 @@ is_user_whitelisted() {
 }
 
 # Check if IP should be exempt (CF or self or user-whitelisted)
+# E-3 (exemption audit): the self-IP sets are captured at daemon
+# start. An address added to the host later (failover IP, new v6
+# prefix) would not be immune until a restart. The main loop calls
+# this on the slow cadence; additions are logged, removals apply
+# silently (a reassigned address must not stay immune).
+refresh_self_ips() {
+    local _ip _o _found
+    local _new4=() _new6=()
+    while IFS= read -r _ip; do [ -n "$_ip" ] && _new4+=("$_ip"); done < <(list_self_ips)
+    while IFS= read -r _ip; do [ -n "$_ip" ] && _new6+=("$_ip"); done < <(list_self_ips6)
+    for _ip in "${_new4[@]}"; do
+        _found=0
+        for _o in "${SELF_IPS[@]}"; do [ "$_o" = "$_ip" ] && { _found=1; break; }; done
+        [ "$_found" -eq 0 ] && log " SELF: new own IPv4 detected: $_ip (immune)"
+    done
+    for _ip in "${_new6[@]}"; do
+        _found=0
+        for _o in "${SELF6_IPS[@]}"; do [ "$_o" = "$_ip" ] && { _found=1; break; }; done
+        [ "$_found" -eq 0 ] && log " SELF: new own IPv6 detected: $_ip (immune)"
+    done
+    SELF_IPS=("${_new4[@]}")
+    SELF6_IPS=("${_new6[@]}")
+}
+
 is_exempt() {
     local ip="$1"
     is_self_ip "$ip"  && return 0
@@ -5576,8 +5622,9 @@ while true; do
     # Keep the persistent throttle mirror current (U-11).
     mirror_throttle_state
 
-    # Every ~5 min: unban expired IPs and subnets
-    [ $((CYCLE % 75)) -eq 0 ] && unban_expired && unban_subnet_expired
+    # Every ~5 min: pick up any newly assigned own IPs (E-3), then
+    # unban expired IPs and subnets
+    [ $((CYCLE % 75)) -eq 0 ] && refresh_self_ips && unban_expired && unban_subnet_expired
 
     # Every cycle: enforce self-IP immunity (cheap; iptables -S scan)
     self_guard
@@ -5885,13 +5932,14 @@ setup_tc() {
         HANDLE=$((HANDLE + 1))
     done
 
-    # Server own IPs → class 1:10
+    # Server own IPs → class 1:10 (E-4: exhaustive list, like the
+    # firewall steps - public-only left private self traffic shaped)
     while IFS= read -r SIP; do
         [ -z "$SIP" ] && continue
         tc filter add dev "$MAIN_IF" parent 1: protocol ip prio $HANDLE \
             u32 match ip dst "$SIP/32" flowid 1:10 2>/dev/null || true
         HANDLE=$((HANDLE + 1))
-    done < <(get_server_ips)
+    done < <(list_self_ips | grep -v '^127\.0\.0\.1$')
 
     # User whitelist → class 1:10 (unlimited, same as CF/self)
     if [ -f "$WHITELIST_FILE" ]; then
@@ -5953,7 +6001,7 @@ if [ -f /etc/antiddos/cloudflare-ipv6.list ]; then
     done < /etc/antiddos/cloudflare-ipv6.list
 fi
 for SIP in $(ip -4 addr show 2>/dev/null | grep 'inet ' | \
-    grep -v '127\.\|10\.\|192\.168\.' | awk '{print $2}' | cut -d/ -f1); do
+    grep -v '127\.' | awk '{print $2}' | cut -d/ -f1); do
     tc filter add dev "$IF" parent 1: protocol ip prio $H \
         u32 match ip dst "$SIP/32" flowid 1:10 2>/dev/null || true; H=$((H+1))
 done
@@ -6438,9 +6486,108 @@ flush_autobans() {
     success "All auto-bans flushed (iptables rules + daemon state)"
 }
 
+# valid_ip6_or_cidr - IPv6 counterpart of valid_ip_or_cidr (E-5).
+# The whitelist was v4-only end to end: every layer HONOURS v6
+# entries (daemon is_exempt6, ip6tables, fail2ban ignoreip) but the
+# admin could never add one, and --exempt-check rejected v6 targets
+# as "invalid". Charset + group-count validation; embedded-IPv4
+# forms are rejected (whitelist the v4 form instead).
+valid_ip6_or_cidr() {
+    local input="${1:-}" addr mask
+    case "$input" in
+        */*) addr="${input%%/*}"; mask="${input#*/}"
+             case "$mask" in ''|*[!0-9]*) return 1 ;; esac
+             [ "${#mask}" -le 3 ] || return 1
+             (( 10#$mask <= 128 )) || return 1 ;;
+        *)   addr="$input" ;;
+    esac
+    case "$addr" in
+        *[!0-9a-fA-F:]*) return 1 ;;
+        *:::*) return 1 ;;
+    esac
+    case "$addr" in
+        *::*) case "${addr#*::}" in *::*) return 1 ;; esac ;;
+    esac
+    [ "$addr" = "::" ] && return 0
+    local _groups=0 _g
+    local _oldIFS="$IFS"; IFS=':'
+    # shellcheck disable=SC2086
+    set -- $addr
+    IFS="$_oldIFS"
+    for _g in "$@"; do
+        [ -z "$_g" ] && continue
+        [ "${#_g}" -le 4 ] || return 1
+        _groups=$((_groups + 1))
+    done
+    case "$addr" in
+        *::*) [ "$_groups" -le 7 ] || return 1 ;;
+        *)    [ "$_groups" -eq 8 ] || return 1 ;;
+    esac
+    return 0
+}
+
+# nx_ip6_in_cidr - the antiddos-side twin of the daemon's ip6_in_cidr
+# (same awk nibble-compare; a missing mask means /128).
+nx_ip6_in_cidr() {
+    awk -v ip="$1" -v cidr="$2" '
+    function hv(c) { return index("0123456789abcdef", c) - 1 }
+    function pad(h) { while (length(h) < 4) h = "0" h; return h }
+    function expand(a,    k,lp,rp,ln,rn,out,i) {
+        a = tolower(a)
+        k = index(a, "::")
+        if (k > 0) {
+            lp = substr(a, 1, k - 1); rp = substr(a, k + 2)
+            ln = (lp == "") ? 0 : split(lp, L, ":")
+            rn = (rp == "") ? 0 : split(rp, G, ":")
+            out = ""
+            for (i = 1; i <= ln; i++) out = out pad(L[i])
+            for (i = 1; i <= 8 - ln - rn; i++) out = out "0000"
+            for (i = 1; i <= rn; i++) out = out pad(G[i])
+            return out
+        }
+        split(a, P, ":"); out = ""
+        for (i = 1; i <= 8; i++) out = out pad(P[i])
+        return out
+    }
+    BEGIN {
+        np = split(cidr, C, "/"); pfx = (np < 2 || C[2] == "") ? 128 : C[2] + 0
+        e1 = expand(ip); e2 = expand(C[1])
+        full = int(pfx / 4)
+        if (substr(e1, 1, full) != substr(e2, 1, full)) exit 1
+        rem = pfx % 4
+        if (rem > 0) {
+            keep = 2 ^ (4 - rem)
+            if (int(hv(substr(e1, full + 1, 1)) / keep) != int(hv(substr(e2, full + 1, 1)) / keep)) exit 1
+        }
+        exit 0
+    }'
+}
+
 exempt_check() {
     local ip="${1:-}" rc=1 _e
     [ -n "$ip" ] || { echo "usage: --exempt-check <ip>"; return 2; }
+    case "$ip" in
+        *:*)
+            valid_ip6_or_cidr "$ip" || { echo "invalid IPv6/CIDR: $ip"; return 2; }
+            ip="${ip%%/*}"
+            echo "Exemption check for $ip (IPv6):"
+            local cf=no self=no wl=no
+            for _e in "${CF6_RANGES[@]}"; do nx_ip6_in_cidr "$ip" "$_e" && { cf=yes; break; }; done
+            list_self_ips6 2>/dev/null | grep -qxF "$ip" && self=yes
+            if [ -f "$WHITELIST_FILE" ]; then
+                while IFS= read -r _e; do
+                    _e="${_e%%#*}"; _e="${_e// /}"
+                    case "$_e" in *:*) : ;; *) continue ;; esac
+                    [ -n "$_e" ] && nx_ip6_in_cidr "$ip" "$_e" && { wl=yes; break; }
+                done < "$WHITELIST_FILE"
+            fi
+            echo "  cloudflare ranges : $cf"
+            echo "  server own IP     : $self"
+            echo "  admin whitelist   : $wl"
+            { [ "$cf" = yes ] || [ "$self" = yes ] || [ "$wl" = yes ]; } && rc=0
+            [ "$rc" -eq 0 ] && echo "  VERDICT: EXEMPT" || echo "  VERDICT: not exempt"
+            return $rc ;;
+    esac
     valid_ip_or_cidr "$ip" || { echo "invalid IP/CIDR: $ip"; return 2; }
     ip="${ip%%/*}"
     echo "Exemption check for $ip:"
@@ -6514,7 +6661,7 @@ manage_whitelist() {
                 WIP="${WIP// /}"
                 if [ -z "$WIP" ]; then
                     echo -e "  ${YELLOW}No input.${NC}"
-                elif ! valid_ip_or_cidr "$WIP"; then
+                elif ! valid_ip_or_cidr "$WIP" && ! valid_ip6_or_cidr "$WIP"; then
                     echo -e "  ${RED}Invalid IP/CIDR: $WIP${NC}"
                 elif grep -qF "$WIP" "$WL" 2>/dev/null; then
                     echo -e "  ${YELLOW}Already in whitelist.${NC}"
