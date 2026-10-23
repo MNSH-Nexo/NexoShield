@@ -103,6 +103,17 @@ those waves land.
   reputation lifecycle suite 17/17 (incl. the FR-3 scenario: a stale
   score-5 IP at 130 conns is normalized to probation, NOT re-banned).
   `make check` + `make test` green (94 tests).
+- Wave 5 — DONE. BUG-017: the 3proxy-ddos failregex now keys on the
+  logformat's %E error field (only non-zero error lines count — a
+  legitimate heavy user's successful connections can no longer earn a
+  24 h ban); the portscan jail got its own data source (rate-limited
+  `[NX-SCAN]` LOG rules added in Step 10 for NULL/XMAS/FIN scans) after
+  years of waiting for UFW/fantasy log formats; http-flood is scoped to
+  real combined-log web servers (3proxy's log removed from its logpath —
+  3proxy floods are the daemon's and 3proxy-ddos's job). Filter
+  regression tests run the shipped regexes against sample log lines
+  with Python's re (fail2ban's engine): 8/8. Wave 1's ignoreip
+  generation re-verified. `make check` + `make test` green.
 
 **Inputs:** `docs/BUGS.md` — 68 audited findings (BUG-001…068) plus the
 maintainer's field reports FR-1 (whitelist must exempt from *everything*),

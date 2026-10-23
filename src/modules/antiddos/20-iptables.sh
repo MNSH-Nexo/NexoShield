@@ -347,6 +347,17 @@ apply_iptables() {
     fi
 
     # ── Step 10: Port Scan signatures ────────────────
+    # LOG first (rate-limited) so the portscan fail2ban jail has lines
+    # to match - previously nothing logged these, so it never fired.
+    ipt_add INPUT -p tcp --tcp-flags ALL NONE \
+        -m limit --limit 10/min --limit-burst 20 \
+        -j LOG --log-prefix "[NX-SCAN] " --log-level 4
+    ipt_add INPUT -p tcp --tcp-flags ALL ALL \
+        -m limit --limit 10/min --limit-burst 20 \
+        -j LOG --log-prefix "[NX-SCAN] " --log-level 4
+    ipt_add INPUT -p tcp --tcp-flags ALL FIN \
+        -m limit --limit 10/min --limit-burst 20 \
+        -j LOG --log-prefix "[NX-SCAN] " --log-level 4
     ipt_add INPUT -p tcp --tcp-flags ALL NONE -j DROP  # NULL scan
     ipt_add INPUT -p tcp --tcp-flags ALL ALL  -j DROP  # Xmas scan
     ipt_add INPUT -p tcp --tcp-flags ALL FIN  -j DROP  # FIN scan

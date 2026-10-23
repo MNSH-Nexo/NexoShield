@@ -25,8 +25,12 @@ apply_fail2ban() {
     # ── Filter: 3proxy abuse ──────────────────────────
     cat > "$F2B_FILTER_DIR/3proxy-ddos.conf" << 'EOF'
 [Definition]
-failregex = ^.*\s<HOST>:\d+\s.*\s(CONNECT|SOCKS5)\s.*$
-            ^L\d+-\d+-\d+ \d+:\d+:\d+ \S+ <HOST>:\d+.*$
+# Our 3proxy logformat: L<date> <time> %U %C:%c %R:%r %O %I %E %T
+# %E is the error code: 0 = success. The old regex matched EVERY
+# connection line, so a legitimate heavy user (100 conns/60s) earned a
+# 24h ban (BUG-017). Only lines with a NON-ZERO error code count now:
+# fields after <HOST>:port are remote, bytes-out, bytes-in, then %E.
+failregex = ^L\d+-\d+-\d+ \d+:\d+:\d+ \S+ <HOST>:\d+ \S+ \d+ \d+ [1-9][0-9]*\s
 ignoreregex =
 EOF
 
@@ -51,8 +55,11 @@ EOF
     # ── Filter: port scan ─────────────────────────────
     cat > "$F2B_FILTER_DIR/portscan.conf" << 'EOF'
 [Definition]
-failregex = kernel.*\[UFW BLOCK\].*SRC=<HOST>
-            kernel.*iptables.*DROP.*SRC=<HOST>
+# Matches the [NX-SCAN] LOG rules in apply_iptables (Step 10). The old
+# patterns waited for UFW blocks or a fantasy "iptables DROP" log format
+# that nothing on this system emits, so the jail could never fire.
+failregex = \[NX-SCAN\].*SRC=<HOST>
+            kernel.*\[UFW BLOCK\].*SRC=<HOST>
 ignoreregex =
 EOF
 
@@ -112,9 +119,10 @@ action    = iptables-allports[name=3proxy-ddos, protocol=all]
 [http-flood]
 enabled   = true
 filter    = http-flood
+# Combined-log-format web servers only. 3proxy's access.log is NOT an
+# HTTP access log; its floods are covered by the daemon and 3proxy-ddos.
 logpath   = /var/log/nginx/access.log
             /var/log/apache2/access.log
-            /var/log/3proxy/access.log
 # 200 requests in 30s = flood (normal user: <50 req/30s)
 # HTTP BURST mode sends 500 pipelined reqs per conn → caught immediately
 maxretry  = 200
