@@ -20,10 +20,16 @@ err()     { echo -e "  ${RED}✗${NC}  $*"; log "ERR: $*"; }
 sep()     { echo -e "${CYAN}════════════════════════════════════════════════${NC}"; }
 
 acquire_lock() {
-    [ -f "$LOCK_FILE" ] && OLD_PID=$(cat "$LOCK_FILE" 2>/dev/null || echo 0) && \
-        kill -0 "$OLD_PID" 2>/dev/null && err "Already running (PID:$OLD_PID)" && exit 1
-    echo $$ > "$LOCK_FILE"
+    # Real mutual exclusion (BUG-054): the old pidfile check-then-write
+    # had a race window and broke on PID reuse. flock on an open fd is
+    # atomic and releases automatically if the holder dies.
+    exec 9>"$LOCK_FILE" 2>/dev/null || return 0
+    if ! flock -n 9; then
+        err "Already running (another optimization holds the lock)"
+        exit 1
+    fi
+    echo $$ >&9 2>/dev/null || true
 }
-release_lock() { rm -f "$LOCK_FILE"; }
+release_lock() { flock -u 9 2>/dev/null || true; }
 trap release_lock EXIT INT TERM
 

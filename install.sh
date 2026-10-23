@@ -1839,11 +1839,17 @@ err()     { echo -e "  ${RED}✗${NC}  $*"; log "ERR: $*"; }
 sep()     { echo -e "${CYAN}════════════════════════════════════════════════${NC}"; }
 
 acquire_lock() {
-    [ -f "$LOCK_FILE" ] && OLD_PID=$(cat "$LOCK_FILE" 2>/dev/null || echo 0) && \
-        kill -0 "$OLD_PID" 2>/dev/null && err "Already running (PID:$OLD_PID)" && exit 1
-    echo $$ > "$LOCK_FILE"
+    # Real mutual exclusion (BUG-054): the old pidfile check-then-write
+    # had a race window and broke on PID reuse. flock on an open fd is
+    # atomic and releases automatically if the holder dies.
+    exec 9>"$LOCK_FILE" 2>/dev/null || return 0
+    if ! flock -n 9; then
+        err "Already running (another optimization holds the lock)"
+        exit 1
+    fi
+    echo $$ >&9 2>/dev/null || true
 }
-release_lock() { rm -f "$LOCK_FILE"; }
+release_lock() { flock -u 9 2>/dev/null || true; }
 trap release_lock EXIT INT TERM
 
 detect_environment() {
@@ -1903,28 +1909,44 @@ detect_environment() {
 
 calculate_values() {
     if [ "$RAM_MB" -ge 8192 ]; then
-        BUF_MAX=268435456; TCP_MEM_MAX=6291456; TCP_MEM_PRESSURE=2097152
+        BUF_MAX=268435456
         CONNTRACK_MAX=1048576; SOMAXCONN=65536; BACKLOG=65536; SYN_BACKLOG=32768
     elif [ "$RAM_MB" -ge 4096 ]; then
-        BUF_MAX=134217728; TCP_MEM_MAX=3145728; TCP_MEM_PRESSURE=1048576
+        BUF_MAX=134217728
         CONNTRACK_MAX=524288; SOMAXCONN=32768; BACKLOG=32768; SYN_BACKLOG=16384
     elif [ "$RAM_MB" -ge 2048 ]; then
-        BUF_MAX=134217728; TCP_MEM_MAX=3145728; TCP_MEM_PRESSURE=1048576
+        BUF_MAX=134217728
         CONNTRACK_MAX=262144; SOMAXCONN=32768; BACKLOG=32768; SYN_BACKLOG=16384
     elif [ "$RAM_MB" -ge 1024 ]; then
-        BUF_MAX=67108864; TCP_MEM_MAX=1572864; TCP_MEM_PRESSURE=524288
+        BUF_MAX=67108864
         CONNTRACK_MAX=131072; SOMAXCONN=16384; BACKLOG=16384; SYN_BACKLOG=8192
     else
-        BUF_MAX=33554432; TCP_MEM_MAX=786432; TCP_MEM_PRESSURE=262144
+        BUF_MAX=33554432
         CONNTRACK_MAX=65536; SOMAXCONN=8192; BACKLOG=8192; SYN_BACKLOG=4096
     fi
+
+    # BUG-010: net.ipv4.tcp_mem is measured in PAGES, not bytes - the
+    # old tier constants were byte-magnitudes (6,291,456 "max" = 24 GiB
+    # of pages on a big tier, no ceiling at all in practice). Derive
+    # from RAM: pressure at 50% of RAM, ceiling at 75%, in pages.
+    local _page_size _ram_pages
+    _page_size=$(getconf PAGE_SIZE 2>/dev/null || echo 4096)
+    _ram_pages=$(( RAM_MB * 1048576 / _page_size ))
+    TCP_MEM_PRESSURE=$(( _ram_pages / 2 ))
+    [ "$TCP_MEM_PRESSURE" -lt 131072 ] && TCP_MEM_PRESSURE=131072
+    TCP_MEM_MAX=$(( _ram_pages * 3 / 4 ))
+    [ "$TCP_MEM_MAX" -lt 262144 ] && TCP_MEM_MAX=262144
 
     [ "$BBR_AVAILABLE" -eq 1 ] && CONGESTION="bbr" || CONGESTION="cubic"
     QDISC="fq"
 
     # Multi-IP servers: rp_filter=0 (important for servers with multiple public IPs)
     [ "$PUBLIC_IP_COUNT" -gt 1 ] && RP_FILTER=0 || RP_FILTER=1
-    IP_FORWARD=1
+    # BUG-040: preserve the system's current forwarding setting - the
+    # optimizer used to force ip_forward=1 even on hosts that had it
+    # deliberately off (and hosts that need it on keep it on).
+    IP_FORWARD=$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo 0)
+    [[ "$IP_FORWARD" =~ ^[01]$ ]] || IP_FORWARD=0
     [ "$HAS_SWAP" -eq 1 ] && SWAPPINESS=10 || SWAPPINESS=1
     [ "$VIRT_TYPE" = "openvz" ] && CONNTRACK_AVAILABLE=0 && BUF_MAX=$((BUF_MAX / 2))
 }
@@ -1969,7 +1991,15 @@ take_snapshot() {
             net.ipv4.conf.all.send_redirects net.ipv4.conf.all.accept_source_route \
             net.ipv4.conf.all.log_martians net.ipv4.icmp_echo_ignore_broadcasts \
             net.ipv4.icmp_ignore_bogus_error_responses \
-            vm.swappiness vm.dirty_ratio vm.dirty_background_ratio; do
+            vm.swappiness vm.dirty_ratio vm.dirty_background_ratio \
+            fs.file-max \
+            net.ipv6.conf.all.forwarding \
+            net.ipv6.conf.all.accept_redirects \
+            net.ipv6.conf.default.accept_redirects \
+            net.ipv6.route.max_size \
+            net.ipv6.neigh.default.gc_thresh1 \
+            net.ipv6.neigh.default.gc_thresh2 \
+            net.ipv6.neigh.default.gc_thresh3; do
             V=$(sysctl -n "$KEY" 2>/dev/null) || continue
             echo "$KEY = $V"
         done
@@ -2083,16 +2113,39 @@ EOF
     chmod 644 "$TARGET_FILE"
 }
 
+
+# nx_sysctl_parse <line> — split "key = value" WITHOUT destroying
+# multi-token values (BUG-007: cut + tr -d ' ' glued "32768 262144
+# 67108864" into one giant number, so the tcp_rmem/tcp_wmem/tcp_mem
+# writes always failed kernel validation and were auto-disabled -
+# silently, on every install). Whitespace runs (spaces, or the tabs
+# sysctl -n emits) collapse to single spaces.
+nx_sysctl_parse() {
+    NX_KEY="${1%%=*}"
+    NX_KEY="${NX_KEY//[[:space:]]/}"
+    NX_VAL="${1#*=}"
+    NX_VAL="$(printf '%s' "$NX_VAL" | tr -s '[:space:]' ' ')"
+    NX_VAL="${NX_VAL# }"; NX_VAL="${NX_VAL% }"
+}
 apply_config() {
     FAILED_PARAMS=(); APPLIED_COUNT=0; SKIPPED_COUNT=0
-    modprobe tcp_bbr 2>/dev/null || true
-    modprobe nf_conntrack 2>/dev/null || true
+    # BUG-042: on a read-only /proc/sys (OpenVZ and friends) EVERY
+    # write fails - and the old flow reacted by permanently commenting
+    # the parameters out of the generated config. Detect it once, up
+    # front, and change nothing.
+    if [ ! -w /proc/sys/net/core/rmem_max ] && [ ! -w /proc/sys/net/ipv4/tcp_rmem ]; then
+        warn "sysctl is read-only on this system (virtualization limit) - nothing was changed"
+        return 1
+    fi
+    if [ "${VIRT_TYPE:-}" != "openvz" ]; then
+        modprobe tcp_bbr 2>/dev/null || true
+        modprobe nf_conntrack 2>/dev/null || true
+    fi
 
     while IFS= read -r line; do
         [[ "$line" =~ ^[[:space:]]*# ]] && continue
         [[ -z "${line// }" ]] && continue
-        KEY=$(echo "$line" | cut -d= -f1 | tr -d ' ')
-        VAL=$(echo "$line" | cut -d= -f2- | tr -d ' ')
+        nx_sysctl_parse "$line"; KEY="$NX_KEY"; VAL="$NX_VAL"
         [ -z "$KEY" ] || [ -z "$VAL" ] && continue
         if sysctl -w "${KEY}=${VAL}" >/dev/null 2>&1; then
             APPLIED_COUNT=$((APPLIED_COUNT + 1))
@@ -2216,8 +2269,7 @@ do_rollback() {
         while IFS= read -r line; do
             [[ "$line" =~ ^[[:space:]]*# ]] && continue
             [[ -z "${line//[[:space:]]/}" ]] && continue
-            KEY=$(echo "$line" | cut -d= -f1 | tr -d ' ')
-            VAL=$(echo "$line" | cut -d= -f2- | sed 's/^[[:space:]]*//')
+            nx_sysctl_parse "$line"; KEY="$NX_KEY"; VAL="$NX_VAL"
             [ -z "$KEY" ] || [ -z "$VAL" ] && SKIP=$((SKIP+1)) && continue
             if sysctl -w "${KEY}=${VAL}" >/dev/null 2>&1; then
                 R=$((R+1))
@@ -2237,8 +2289,7 @@ do_rollback() {
         while IFS= read -r line; do
             [[ "$line" =~ ^[[:space:]]*# ]] && continue
             [[ -z "${line//[[:space:]]/}" ]] && continue
-            KEY=$(echo "$line" | cut -d= -f1 | tr -d ' ')
-            VAL=$(echo "$line" | cut -d= -f2- | sed 's/^[[:space:]]*//')
+            nx_sysctl_parse "$line"; KEY="$NX_KEY"; VAL="$NX_VAL"
             [ -z "$KEY" ] || [ -z "$VAL" ] && continue
             echo "$KNOWN_KEYS" | grep -qw "$KEY" || { SKIP=$((SKIP+1)); continue; }
             if sysctl -w "${KEY}=${VAL}" >/dev/null 2>&1; then
@@ -2291,8 +2342,8 @@ show_server_info() {
     echo -e "  ${CYAN}Proposed changes:${NC}"
     printf "  %-25s %s -> ${CYAN}%s${NC}\n" "congestion:" "$CURRENT_CONGESTION" "$CONGESTION"
     printf "  %-25s %s -> ${CYAN}%s${NC}\n" "rmem_max:" \
-        "$(echo "scale=0; ${CURRENT_RMEM:-0}/1024/1024" | bc 2>/dev/null || echo 0)MB" \
-        "$(echo "scale=0; $BUF_MAX/1024/1024" | bc)MB"
+        "$(awk -v v="${CURRENT_RMEM:-0}" 'BEGIN{printf "%d", v/1048576}')MB" \
+        "$(awk -v v="$BUF_MAX" 'BEGIN{printf "%d", v/1048576}')MB"
     printf "  %-25s %s -> ${CYAN}%s${NC}\n" "swappiness:" "$CURRENT_SWAPPINESS" "$SWAPPINESS"
     printf "  %-25s %s -> ${CYAN}%s${NC}\n" "keepalive_time:" "$(sysctl -n net.ipv4.tcp_keepalive_time 2>/dev/null || echo '?')" "30"
     sep

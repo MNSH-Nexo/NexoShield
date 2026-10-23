@@ -135,6 +135,23 @@ those waves land.
   the dead yum stub. BUG-059: the non-working IPv6 socks URL is no
   longer printed. Tests: wave-6 regression guards 19/19; suites
   green.
+- Wave 7 — DONE. BUG-007 (the worst sysctl bug): one parser
+  (`nx_sysctl_parse`) now serves apply and both rollback paths —
+  multi-token values keep their spaces, so tcp_rmem/tcp_wmem/tcp_mem
+  actually reach the kernel instead of being glued into one invalid
+  number and auto-disabled. BUG-010: tcp_mem values are derived in
+  PAGES from RAM (pressure 50%, ceiling 75%, floored) — the old
+  byte-magnitude constants silently allowed tens of GB. BUG-009:
+  the snapshot key set now covers the full write set, enforced by a
+  test that diffs the two sets (fs.file-max + the IPv6 keys were the
+  gaps — those changes used to be un-rollbackable). BUG-040:
+  ip_forward is preserved, not forced to 1. BUG-042: read-only
+  /proc/sys is detected up front and changes nothing (instead of
+  disabling every parameter in the file); modprobe is skipped on
+  OpenVZ. BUG-054: the pidfile lock became a real flock. BUG-055:
+  the status display no longer needs `bc`. Tests: sysctl
+  correctness 7/7 (parser incl. tab-separated input, page math at
+  16 GiB and the small-RAM floors, set-equality guard).
 
 **Inputs:** `docs/BUGS.md` — 68 audited findings (BUG-001…068) plus the
 maintainer's field reports FR-1 (whitelist must exempt from *everything*),

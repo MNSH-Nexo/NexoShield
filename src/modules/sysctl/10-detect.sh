@@ -57,28 +57,44 @@ detect_environment() {
 
 calculate_values() {
     if [ "$RAM_MB" -ge 8192 ]; then
-        BUF_MAX=268435456; TCP_MEM_MAX=6291456; TCP_MEM_PRESSURE=2097152
+        BUF_MAX=268435456
         CONNTRACK_MAX=1048576; SOMAXCONN=65536; BACKLOG=65536; SYN_BACKLOG=32768
     elif [ "$RAM_MB" -ge 4096 ]; then
-        BUF_MAX=134217728; TCP_MEM_MAX=3145728; TCP_MEM_PRESSURE=1048576
+        BUF_MAX=134217728
         CONNTRACK_MAX=524288; SOMAXCONN=32768; BACKLOG=32768; SYN_BACKLOG=16384
     elif [ "$RAM_MB" -ge 2048 ]; then
-        BUF_MAX=134217728; TCP_MEM_MAX=3145728; TCP_MEM_PRESSURE=1048576
+        BUF_MAX=134217728
         CONNTRACK_MAX=262144; SOMAXCONN=32768; BACKLOG=32768; SYN_BACKLOG=16384
     elif [ "$RAM_MB" -ge 1024 ]; then
-        BUF_MAX=67108864; TCP_MEM_MAX=1572864; TCP_MEM_PRESSURE=524288
+        BUF_MAX=67108864
         CONNTRACK_MAX=131072; SOMAXCONN=16384; BACKLOG=16384; SYN_BACKLOG=8192
     else
-        BUF_MAX=33554432; TCP_MEM_MAX=786432; TCP_MEM_PRESSURE=262144
+        BUF_MAX=33554432
         CONNTRACK_MAX=65536; SOMAXCONN=8192; BACKLOG=8192; SYN_BACKLOG=4096
     fi
+
+    # BUG-010: net.ipv4.tcp_mem is measured in PAGES, not bytes - the
+    # old tier constants were byte-magnitudes (6,291,456 "max" = 24 GiB
+    # of pages on a big tier, no ceiling at all in practice). Derive
+    # from RAM: pressure at 50% of RAM, ceiling at 75%, in pages.
+    local _page_size _ram_pages
+    _page_size=$(getconf PAGE_SIZE 2>/dev/null || echo 4096)
+    _ram_pages=$(( RAM_MB * 1048576 / _page_size ))
+    TCP_MEM_PRESSURE=$(( _ram_pages / 2 ))
+    [ "$TCP_MEM_PRESSURE" -lt 131072 ] && TCP_MEM_PRESSURE=131072
+    TCP_MEM_MAX=$(( _ram_pages * 3 / 4 ))
+    [ "$TCP_MEM_MAX" -lt 262144 ] && TCP_MEM_MAX=262144
 
     [ "$BBR_AVAILABLE" -eq 1 ] && CONGESTION="bbr" || CONGESTION="cubic"
     QDISC="fq"
 
     # Multi-IP servers: rp_filter=0 (important for servers with multiple public IPs)
     [ "$PUBLIC_IP_COUNT" -gt 1 ] && RP_FILTER=0 || RP_FILTER=1
-    IP_FORWARD=1
+    # BUG-040: preserve the system's current forwarding setting - the
+    # optimizer used to force ip_forward=1 even on hosts that had it
+    # deliberately off (and hosts that need it on keep it on).
+    IP_FORWARD=$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo 0)
+    [[ "$IP_FORWARD" =~ ^[01]$ ]] || IP_FORWARD=0
     [ "$HAS_SWAP" -eq 1 ] && SWAPPINESS=10 || SWAPPINESS=1
     [ "$VIRT_TYPE" = "openvz" ] && CONNTRACK_AVAILABLE=0 && BUF_MAX=$((BUF_MAX / 2))
 }

@@ -1,15 +1,38 @@
 # @part modules/sysctl/30-apply-rollback.sh - apply_config + do_rollback
 # Assembled into optimize-sysctl.sh by tools/build.py - not a standalone script.
+
+# nx_sysctl_parse <line> — split "key = value" WITHOUT destroying
+# multi-token values (BUG-007: cut + tr -d ' ' glued "32768 262144
+# 67108864" into one giant number, so the tcp_rmem/tcp_wmem/tcp_mem
+# writes always failed kernel validation and were auto-disabled -
+# silently, on every install). Whitespace runs (spaces, or the tabs
+# sysctl -n emits) collapse to single spaces.
+nx_sysctl_parse() {
+    NX_KEY="${1%%=*}"
+    NX_KEY="${NX_KEY//[[:space:]]/}"
+    NX_VAL="${1#*=}"
+    NX_VAL="$(printf '%s' "$NX_VAL" | tr -s '[:space:]' ' ')"
+    NX_VAL="${NX_VAL# }"; NX_VAL="${NX_VAL% }"
+}
 apply_config() {
     FAILED_PARAMS=(); APPLIED_COUNT=0; SKIPPED_COUNT=0
-    modprobe tcp_bbr 2>/dev/null || true
-    modprobe nf_conntrack 2>/dev/null || true
+    # BUG-042: on a read-only /proc/sys (OpenVZ and friends) EVERY
+    # write fails - and the old flow reacted by permanently commenting
+    # the parameters out of the generated config. Detect it once, up
+    # front, and change nothing.
+    if [ ! -w /proc/sys/net/core/rmem_max ] && [ ! -w /proc/sys/net/ipv4/tcp_rmem ]; then
+        warn "sysctl is read-only on this system (virtualization limit) - nothing was changed"
+        return 1
+    fi
+    if [ "${VIRT_TYPE:-}" != "openvz" ]; then
+        modprobe tcp_bbr 2>/dev/null || true
+        modprobe nf_conntrack 2>/dev/null || true
+    fi
 
     while IFS= read -r line; do
         [[ "$line" =~ ^[[:space:]]*# ]] && continue
         [[ -z "${line// }" ]] && continue
-        KEY=$(echo "$line" | cut -d= -f1 | tr -d ' ')
-        VAL=$(echo "$line" | cut -d= -f2- | tr -d ' ')
+        nx_sysctl_parse "$line"; KEY="$NX_KEY"; VAL="$NX_VAL"
         [ -z "$KEY" ] || [ -z "$VAL" ] && continue
         if sysctl -w "${KEY}=${VAL}" >/dev/null 2>&1; then
             APPLIED_COUNT=$((APPLIED_COUNT + 1))
@@ -133,8 +156,7 @@ do_rollback() {
         while IFS= read -r line; do
             [[ "$line" =~ ^[[:space:]]*# ]] && continue
             [[ -z "${line//[[:space:]]/}" ]] && continue
-            KEY=$(echo "$line" | cut -d= -f1 | tr -d ' ')
-            VAL=$(echo "$line" | cut -d= -f2- | sed 's/^[[:space:]]*//')
+            nx_sysctl_parse "$line"; KEY="$NX_KEY"; VAL="$NX_VAL"
             [ -z "$KEY" ] || [ -z "$VAL" ] && SKIP=$((SKIP+1)) && continue
             if sysctl -w "${KEY}=${VAL}" >/dev/null 2>&1; then
                 R=$((R+1))
@@ -154,8 +176,7 @@ do_rollback() {
         while IFS= read -r line; do
             [[ "$line" =~ ^[[:space:]]*# ]] && continue
             [[ -z "${line//[[:space:]]/}" ]] && continue
-            KEY=$(echo "$line" | cut -d= -f1 | tr -d ' ')
-            VAL=$(echo "$line" | cut -d= -f2- | sed 's/^[[:space:]]*//')
+            nx_sysctl_parse "$line"; KEY="$NX_KEY"; VAL="$NX_VAL"
             [ -z "$KEY" ] || [ -z "$VAL" ] && continue
             echo "$KNOWN_KEYS" | grep -qw "$KEY" || { SKIP=$((SKIP+1)); continue; }
             if sysctl -w "${KEY}=${VAL}" >/dev/null 2>&1; then

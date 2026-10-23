@@ -36,8 +36,8 @@ show_server_info() {
     echo -e "  ${CYAN}Proposed changes:${NC}"
     printf "  %-25s %s -> ${CYAN}%s${NC}\n" "congestion:" "$CURRENT_CONGESTION" "$CONGESTION"
     printf "  %-25s %s -> ${CYAN}%s${NC}\n" "rmem_max:" \
-        "$(echo "scale=0; ${CURRENT_RMEM:-0}/1024/1024" | bc 2>/dev/null || echo 0)MB" \
-        "$(echo "scale=0; $BUF_MAX/1024/1024" | bc)MB"
+        "$(awk -v v="${CURRENT_RMEM:-0}" 'BEGIN{printf "%d", v/1048576}')MB" \
+        "$(awk -v v="$BUF_MAX" 'BEGIN{printf "%d", v/1048576}')MB"
     printf "  %-25s %s -> ${CYAN}%s${NC}\n" "swappiness:" "$CURRENT_SWAPPINESS" "$SWAPPINESS"
     printf "  %-25s %s -> ${CYAN}%s${NC}\n" "keepalive_time:" "$(sysctl -n net.ipv4.tcp_keepalive_time 2>/dev/null || echo '?')" "30"
     sep

@@ -40,7 +40,15 @@ take_snapshot() {
             net.ipv4.conf.all.send_redirects net.ipv4.conf.all.accept_source_route \
             net.ipv4.conf.all.log_martians net.ipv4.icmp_echo_ignore_broadcasts \
             net.ipv4.icmp_ignore_bogus_error_responses \
-            vm.swappiness vm.dirty_ratio vm.dirty_background_ratio; do
+            vm.swappiness vm.dirty_ratio vm.dirty_background_ratio \
+            fs.file-max \
+            net.ipv6.conf.all.forwarding \
+            net.ipv6.conf.all.accept_redirects \
+            net.ipv6.conf.default.accept_redirects \
+            net.ipv6.route.max_size \
+            net.ipv6.neigh.default.gc_thresh1 \
+            net.ipv6.neigh.default.gc_thresh2 \
+            net.ipv6.neigh.default.gc_thresh3; do
             V=$(sysctl -n "$KEY" 2>/dev/null) || continue
             echo "$KEY = $V"
         done
