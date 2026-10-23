@@ -71,3 +71,11 @@ the traffic-generation tooling, and the disposable server's window
 expired. These scenarios remain covered by 166 unit assertions, but
 **live-fire confirmation is still owed** and should run on the next
 test server before v3.6.0 is tagged.
+
+Update 2026-10-23: the battery is now scripted and committed as
+`tests/live/` (00 lab setup, 10 conn-flood with ground truth, 20 XMAS,
+30 proxy auth-fail, 40 SYN burst, 50 FR-1 whitelist exemption, 60 IPv6,
+90 evidence collection + teardown, plus a `run-all.sh` orchestrator).
+Safety: `NX_LIVEFIRE=1` opt-in, targets restricted to the lab ranges
+and loopback, every step time-boxed and repetition-capped. Next server
+window: copy the directory over, run `run-all.sh` first, then tag v3.6.0.
