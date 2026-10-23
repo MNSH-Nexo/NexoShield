@@ -135,6 +135,24 @@ while true; do
             [ -n "$IP" ] && [ -n "$CNT" ] && CONN_COUNT["$IP"]="$CNT"
         done <<< "$SS_OUT"
     fi
+    # SYN-RECV per IP (scoring v2): half-open sockets are the SYN-flood
+    # signature; v1 merged them into the same counter as ESTABLISHED,
+    # so scoring could not tell a flood from honest load.
+    declare -A SYN_COUNT
+    SS_SYN=$(ss -tnH state syn-recv 2>/dev/null | \
+        awk '{ split($4, L, ":"); lp = L[length(L)];
+               if (lp !~ /^[0-9]+$/) next;
+               if (lp >= 32768) next;
+               print $5 }' | \
+        { grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+'; grep -oE '\[[0-9a-fA-F:]+\]' | tr -d '[]'; } | \
+        sort | uniq -c | sort -rn | head -100 || true)
+    if [ -n "$SS_SYN" ]; then
+        while IFS= read -r line; do
+            CNT=$(echo "$line" | awk '{print $1}')
+            IP=$(echo "$line" | awk '{print $2}')
+            [ -n "$IP" ] && [ -n "$CNT" ] && SYN_COUNT["$IP"]="$CNT"
+        done <<< "$SS_SYN"
+    fi
     sleep "$SAMPLE_INTERVAL"
 
     # Process results — based on real connection count, not packets
@@ -150,7 +168,7 @@ while true; do
 
         # Reputation scoring: adjust score for this sample and enforce band.
         # Uses the connection count and the interval since the last sample.
-        update_score "$ip" "$count" "$SAMPLE_INTERVAL"
+        update_score "$ip" "$count" "${SYN_COUNT[$ip]:-0}" "$SAMPLE_INTERVAL"
 
         # Immediate action if way over limit (≥ BAN_CONN_THRESHOLD conns)
         if [ "${count:-0}" -ge "$BAN_CONN_THRESHOLD" ]; then
@@ -288,5 +306,5 @@ while true; do
     # Recovery for quiet IPs (D3): hot IPs were handled by update_score.
     reputation_sweep
 
-    unset CONN_COUNT SUBNET_COUNT
+    unset CONN_COUNT SUBNET_COUNT SYN_COUNT
 done

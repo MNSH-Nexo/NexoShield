@@ -49,10 +49,12 @@ show_stats() {
             paste - - | awk -F'\t' '{printf "  %-30s %s\n", $1, $2}' | head -6 || true
     fi
 
-    [ -f "$PROXY_LOG_DIR/access.log" ] && {
+    # 3proxy rotates daily: live file is access.log.YYYY.MM.DD (T-2).
+    _LF=$(ls -t "$PROXY_LOG_DIR"/access.log* 2>/dev/null | head -1 || true)
+    [ -n "$_LF" ] && {
         echo ""
         echo -e "  ${CYAN}Last 10 connections:${NC}"
-        tail -10 "$PROXY_LOG_DIR/access.log" 2>/dev/null || true
+        tail -10 "$_LF" 2>/dev/null || true
     }
     sep
     printf '%s\n' "  Press Enter to continue..." >/dev/tty; read -r _PE </dev/tty 2>/dev/null || true
@@ -88,7 +90,7 @@ case "${1:-}" in
                       echo -e "${GREEN}Stopped${NC}" || echo -e "${RED}Error${NC}"; exit 0 ;;
     --start)      systemctl start 3proxy 2>/dev/null && \
                       echo -e "${GREEN}Started${NC}" || echo -e "${RED}Error${NC}"; exit 0 ;;
-    --log)        tail -f "$PROXY_LOG_DIR/access.log" 2>/dev/null || \
+    --log)        tail -f "$PROXY_LOG_DIR"/access.log.* 2>/dev/null || \
                       journalctl -u 3proxy -f --no-pager; exit 0 ;;
     --tc-status)  MAIN_IF=$(ip route show default 2>/dev/null | awk '/default/{print $5}' | head -1)
                   echo -e "${CYAN}tc classes on ${MAIN_IF:-eth0}:${NC}"
@@ -130,7 +132,7 @@ while true; do
                echo -e "${RED}Error restarting${NC}"; sleep 1 ;;
         5) show_stats ;;
         6) show_info; printf '%s\n' "  Press Enter to continue..." >/dev/tty; read -r _PE </dev/tty 2>/dev/null || true ;;
-        7) tail -f "$PROXY_LOG_DIR/access.log" 2>/dev/null || \
+        7) tail -f "$PROXY_LOG_DIR"/access.log.* 2>/dev/null || \
                journalctl -u 3proxy -f --no-pager ;;
         8) MAIN_IF=$(ip route show default 2>/dev/null | awk '/default/{print $5}' | head -1)
            echo -e "${CYAN}tc classes on ${MAIN_IF:-eth0}:${NC}"

@@ -28,8 +28,8 @@ extract_fn src/modules/autoban/50-main-loop.sh unban_expired "$TMP/fns.sh" || { 
 SCORE_DIR="$TMP/scores"; SCORE_FILE="$SCORE_DIR/reputation.dat"
 BANNED_LIST="$TMP/banned.list"; WATCH_LIST="$TMP/watch.list"; THROTTLE_LIST="$TMP/throttled.list"
 SUBNET_WATCH_LIST="$TMP/subnet-watch.list"
-SCORE_BAN=20; SCORE_HARD=40; SCORE_THROTTLE=60; SCORE_SUSPECT=80; SCORE_RECOVER=3
-PROBATION_SCORE=50; PROBATION_SECONDS=1800; PROBATION_RECOVER=5
+SCORE_BAN=20; SCORE_HARD=40; SCORE_THROTTLE=60; SCORE_SUSPECT=80; SCORE_RECOVER_PER_MIN=6; SCORE_DROP_CAP_PER_MIN=45
+PROBATION_SCORE=50; PROBATION_SECONDS=1800; PROBATION_RECOVER_PER_MIN=10
 CONN_THRESHOLD=120; BAN_HOURS=4
 declare -A CONN_COUNT=()
 mkdir -p "$SCORE_DIR"; : > "$SCORE_FILE"; : > "$BANNED_LIST"; : > "$WATCH_LIST"; : > "$THROTTLE_LIST"
@@ -62,7 +62,7 @@ state_has_ip "$WATCH_LIST" 1.2.3.45 && ok || bad "state_del_ip removed the wrong
 # ── 2) FR-3 core: stale post-ban score is normalized, no instant re-ban ──
 printf '%s\n' "7.7.7.7 5 300 $((NOW - 100)) 0" > "$SCORE_FILE"
 : > "$BANNED_LIST"; : > "$CALLS"
-update_score 7.7.7.7 130 2
+update_score 7.7.7.7 130 0 2
 grep -q "ban 7.7.7.7" "$CALLS" && bad "stale-score IP was instantly re-banned (FR-3!)" || ok
 S=$(score_of 7.7.7.7)
 [ "${S:-0}" -ge 40 ] && [ "${S:-999}" -le 50 ] && ok || bad "normalized score should be ~46-50, got ${S:-none}"
@@ -71,7 +71,7 @@ S=$(score_of 7.7.7.7)
 # ── 3) reputation ban sets up its own probation release ──
 printf '%s\n' "8.8.8.8 25 0 $((NOW - 10)) 0" > "$SCORE_FILE"
 : > "$CALLS"
-update_score 8.8.8.8 900 2
+update_score 8.8.8.8 900 0 2
 grep -q "ban 8.8.8.8" "$CALLS" && ok || bad "score 25 with 900 conns should be banned"
 [ "$(score_of 8.8.8.8)" = "50" ] && ok || bad "post-ban score should be PROBATION_SCORE=50, got $(score_of 8.8.8.8)"
 [ "$(prob_of 8.8.8.8)" -ge $((NOW + 14400)) ] && ok || bad "probation should extend past the ban"
@@ -84,12 +84,13 @@ state_has_ip "$BANNED_LIST" 9.9.9.9 && bad "expired ban still listed" || ok
 [ "$(score_of 9.9.9.9)" = "50" ] && ok || bad "expired ban should land at score 50, got $(score_of 9.9.9.9)"
 [ "$(prob_of 9.9.9.9)" -gt "$NOW" ] && ok || bad "expiry should open a probation window"
 
-# ── 5) quiet recovery in the sweep (+3 normal, +5 probation, prune) ──
+# ── 5) quiet recovery in the sweep (v2: time-based, 50s elapsed ->
+# +5 normal at 6/min, +8 probation at 10/min; prune unchanged) ──
 printf '%s\n' "1.1.1.1 40 0 $((NOW - 50)) 0" "2.2.2.2 40 0 $((NOW - 50)) $((NOW + 600))" "3.3.3.3 100 0 $((NOW - 90000)) 0" > "$SCORE_FILE"
 : > "$BANNED_LIST"
 reputation_sweep
-[ "$(score_of 1.1.1.1)" = "43" ] && ok || bad "quiet recovery +3 (got $(score_of 1.1.1.1))"
-[ "$(score_of 2.2.2.2)" = "45" ] && ok || bad "probation recovery +5 (got $(score_of 2.2.2.2))"
+[ "$(score_of 1.1.1.1)" = "45" ] && ok || bad "quiet recovery +5/50s (got $(score_of 1.1.1.1))"
+[ "$(score_of 2.2.2.2)" = "48" ] && ok || bad "probation recovery +8/50s (got $(score_of 2.2.2.2))"
 state_has_ip "$SCORE_FILE" 3.3.3.3 && bad "stale full-score entry should be pruned" || ok
 
 # ── 6) banned IPs are frozen in the sweep ──

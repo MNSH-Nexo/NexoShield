@@ -1744,10 +1744,12 @@ show_stats() {
             paste - - | awk -F'\t' '{printf "  %-30s %s\n", $1, $2}' | head -6 || true
     fi
 
-    [ -f "$PROXY_LOG_DIR/access.log" ] && {
+    # 3proxy rotates daily: live file is access.log.YYYY.MM.DD (T-2).
+    _LF=$(ls -t "$PROXY_LOG_DIR"/access.log* 2>/dev/null | head -1 || true)
+    [ -n "$_LF" ] && {
         echo ""
         echo -e "  ${CYAN}Last 10 connections:${NC}"
-        tail -10 "$PROXY_LOG_DIR/access.log" 2>/dev/null || true
+        tail -10 "$_LF" 2>/dev/null || true
     }
     sep
     printf '%s\n' "  Press Enter to continue..." >/dev/tty; read -r _PE </dev/tty 2>/dev/null || true
@@ -1783,7 +1785,7 @@ case "${1:-}" in
                       echo -e "${GREEN}Stopped${NC}" || echo -e "${RED}Error${NC}"; exit 0 ;;
     --start)      systemctl start 3proxy 2>/dev/null && \
                       echo -e "${GREEN}Started${NC}" || echo -e "${RED}Error${NC}"; exit 0 ;;
-    --log)        tail -f "$PROXY_LOG_DIR/access.log" 2>/dev/null || \
+    --log)        tail -f "$PROXY_LOG_DIR"/access.log.* 2>/dev/null || \
                       journalctl -u 3proxy -f --no-pager; exit 0 ;;
     --tc-status)  MAIN_IF=$(ip route show default 2>/dev/null | awk '/default/{print $5}' | head -1)
                   echo -e "${CYAN}tc classes on ${MAIN_IF:-eth0}:${NC}"
@@ -1825,7 +1827,7 @@ while true; do
                echo -e "${RED}Error restarting${NC}"; sleep 1 ;;
         5) show_stats ;;
         6) show_info; printf '%s\n' "  Press Enter to continue..." >/dev/tty; read -r _PE </dev/tty 2>/dev/null || true ;;
-        7) tail -f "$PROXY_LOG_DIR/access.log" 2>/dev/null || \
+        7) tail -f "$PROXY_LOG_DIR"/access.log.* 2>/dev/null || \
                journalctl -u 3proxy -f --no-pager ;;
         8) MAIN_IF=$(ip route show default 2>/dev/null | awk '/default/{print $5}' | head -1)
            echo -e "${CYAN}tc classes on ${MAIN_IF:-eth0}:${NC}"
@@ -4271,6 +4273,29 @@ EOF
         fi
     done
 
+    # Field finding T-1 (live test, 2026-10-23): on journal-only images
+    # (Debian 12 cloud ships without rsyslog) the classic log files do
+    # not exist, and fail2ban refuses to start when ANY enabled jail
+    # has no log file at all - the whole service died while the
+    # installer reported success. Ensure the syslog-family files exist
+    # (empty is fine; rsyslog fills them when present). With no rsyslog
+    # at all, kernel/auth jails read the systemd journal instead -
+    # otherwise they would run but stay blind forever.
+    local _lf
+    for _lf in /var/log/kern.log /var/log/auth.log /var/log/secure; do
+        [ -e "$_lf" ] || touch "$_lf" 2>/dev/null || true
+    done
+    local KERN_BACKEND="" SSH_BACKEND="" HTTP_ENABLED="true"
+    if ! command -v rsyslogd >/dev/null 2>&1 && command -v journalctl >/dev/null 2>&1; then
+        KERN_BACKEND='backend   = systemd
+journalmatch = _TRANSPORT=kernel'
+        SSH_BACKEND='backend   = systemd'
+    fi
+    if [ ! -f /var/log/nginx/access.log ] && [ ! -f /var/log/apache2/access.log ]; then
+        HTTP_ENABLED="false"
+        info "http-flood jail disabled: no nginx/apache access log on this server"
+    fi
+
     cat > "$F2B_JAIL_DIR/antiddos.conf" << EOF
 # Anti-DDoS fail2ban jails — generated $(date)
 # CF IPs are ignored via ignoreip (no false bans)
@@ -4282,14 +4307,15 @@ ignoreip = ${_F2B_IGNORE}
 [3proxy-ddos]
 enabled   = true
 filter    = 3proxy-ddos
-logpath   = /var/log/3proxy/access.log
+# 3proxy rotates daily: the live file is access.log.YYYY.MM.DD (T-2).
+logpath   = /var/log/3proxy/access.log.*
 maxretry  = 100
 findtime  = 60
 bantime   = 86400
 action    = iptables-allports[name=3proxy-ddos, protocol=all]
 
 [http-flood]
-enabled   = true
+enabled   = ${HTTP_ENABLED}
 filter    = http-flood
 # Combined-log-format web servers only. 3proxy's access.log is NOT an
 # HTTP access log; its floods are covered by the daemon and 3proxy-ddos.
@@ -4307,6 +4333,7 @@ enabled   = true
 filter    = conn-flood
 logpath   = /var/log/kern.log
             /var/log/syslog
+${KERN_BACKEND}
 # 20 iptables DROP events from same IP in 10s = flood
 # connlimit DROP fires when IP exceeds CONN_LIMIT_PER_IP connections
 maxretry  = 20
@@ -4319,6 +4346,7 @@ enabled   = true
 filter    = portscan
 logpath   = /var/log/kern.log
             /var/log/syslog
+${KERN_BACKEND}
 maxretry  = 5
 findtime  = 30
 bantime   = 86400
@@ -4329,6 +4357,7 @@ enabled   = true
 filter    = sshd
 logpath   = /var/log/auth.log
             /var/log/secure
+${SSH_BACKEND}
 maxretry  = 3
 findtime  = 30
 bantime   = 86400
@@ -4345,11 +4374,23 @@ bantime   = 3600
 action    = iptables-allports[name=xray-proxy, protocol=all]
 EOF
 
+    # Verify, never assume (T-1): a written config is not a running
+    # jail set. Test the configuration, then check the real service.
+    if command -v fail2ban-client >/dev/null 2>&1 && \
+        ! fail2ban-client -t >/dev/null 2>&1; then
+        warn "fail2ban: configuration test FAILED - jails not applied (diagnose: fail2ban-client -t)"
+        return 1
+    fi
     systemctl reload fail2ban 2>/dev/null || systemctl restart fail2ban 2>/dev/null || true
     sleep 2
-    ACTIVE_JAILS=$(fail2ban-client status 2>/dev/null | grep "Jail list" | \
-        sed 's/.*://;s/,/ /g' | wc -w || echo 0)
-    success "fail2ban: $ACTIVE_JAILS jails active"
+    if systemctl is-active --quiet fail2ban 2>/dev/null; then
+        ACTIVE_JAILS=$(fail2ban-client status 2>/dev/null | grep "Jail list" | \
+            sed 's/.*://;s/,/ /g' | wc -w || echo 0)
+        success "fail2ban: $ACTIVE_JAILS jails active"
+    else
+        warn "fail2ban: service is NOT running after apply (diagnose: systemctl status fail2ban)"
+        return 1
+    fi
 }
 
 # Regenerate the jail file (its ignoreip is built from the live exempt
@@ -4417,18 +4458,23 @@ SCORE_BAN=20
 SCORE_HARD=40
 SCORE_THROTTLE=60
 SCORE_SUSPECT=80
-# Recovery: how fast a well-behaved IP regains reputation (per cycle).
-SCORE_RECOVER=3
+# Scoring model v2 (docs/SCORING.md): every score movement is rated in
+# points per MINUTE and scaled by the real elapsed time of the sample,
+# so an IP's fate depends on its behaviour - never on daemon loop speed.
+# Fractional points accumulate in the score file instead of rounding
+# away each cycle.
+SCORE_RECOVER_PER_MIN=6
+SCORE_DROP_CAP_PER_MIN=45
 # Probation (D3, FR-3): EVERY ban - reputation, classic or instant - ends
 # in the same defined state: the IP returns at PROBATION_SCORE with a
-# probation window. During probation, recovery is faster (+5/cycle) but
+# probation window. During probation, recovery is faster (10/min) but
 # score drops are doubled; a ban still requires the score to actually
 # reach the ban band again, so one minor spike cannot re-ban (the old
 # behaviour: score stayed wherever the ban path left it, often <20, so
 # the smallest trigger re-banned instantly - a de-facto permanent ban).
 PROBATION_SCORE=50
 PROBATION_SECONDS=1800
-PROBATION_RECOVER=5
+PROBATION_RECOVER_PER_MIN=10
 # When connections are counted we snapshot the previous sample to derive the
 # new-connection rate (attacker signature) without per-packet overhead.
 
@@ -4940,17 +4986,23 @@ load_reputation() {
     REP_PREV_CNT=0
     REP_TS=0
     REP_PROB_UNTIL=0
-    local line prev prob
+    REP_FRAC=0
+    REP_RATE=0
+    local line prev prob frac rate
     line=$(awk -v x="$ip" '$1==x' "$SCORE_FILE" 2>/dev/null | tail -1 || true)
     [ -z "$line" ] && return 0
     REP_SCORE=$(echo "$line" | awk '{print $2}')
     prev=$(echo "$line" | awk '{print $3}')
     REP_TS=$(echo "$line" | awk '{print $4}')
     prob=$(echo "$line" | awk '{print $5}')
+    frac=$(echo "$line" | awk '{print $6}')
+    rate=$(echo "$line" | awk '{print $7}')
     REP_SCORE="${REP_SCORE:-100}"; REP_SCORE="${REP_SCORE//[^0-9]/}"; REP_SCORE="${REP_SCORE:-100}"
     REP_PREV_CNT="${prev:-0}"; REP_PREV_CNT="${REP_PREV_CNT//[^0-9]/}"; REP_PREV_CNT="${REP_PREV_CNT:-0}"
     REP_TS="${REP_TS:-0}"; REP_TS="${REP_TS//[^0-9]/}"; REP_TS="${REP_TS:-0}"
     REP_PROB_UNTIL="${prob:-0}"; REP_PROB_UNTIL="${REP_PROB_UNTIL//[^0-9]/}"; REP_PROB_UNTIL="${REP_PROB_UNTIL:-0}"
+    REP_FRAC="${frac:-0}"; [[ "$REP_FRAC" =~ ^-?[0-9]+$ ]] || REP_FRAC=0
+    REP_RATE="${rate:-0}"; REP_RATE="${REP_RATE//[^0-9]/}"; REP_RATE="${REP_RATE:-0}"
     [ "$REP_SCORE" -gt 100 ] && REP_SCORE=100
     [ "$REP_SCORE" -lt 0 ] && REP_SCORE=0
 }
@@ -4960,7 +5012,7 @@ load_reputation() {
 save_reputation() {
     local ip="$1"
     awk -v x="$ip" '$1!=x' "$SCORE_FILE" > "$SCORE_FILE.tmp.$$" 2>/dev/null || true
-    echo "$ip $REP_SCORE $REP_PREV_CNT $(date +%s) ${REP_PROB_UNTIL:-0}" >> "$SCORE_FILE.tmp.$$"
+    echo "$ip $REP_SCORE $REP_PREV_CNT $(date +%s) ${REP_PROB_UNTIL:-0} ${REP_FRAC:-0} ${REP_RATE:-0}" >> "$SCORE_FILE.tmp.$$"
     mv "$SCORE_FILE.tmp.$$" "$SCORE_FILE" 2>/dev/null || true
 }
 
@@ -4978,6 +5030,8 @@ rep_on_ban() {
     now=$(date +%s)
     load_reputation "$ip"
     REP_SCORE="$PROBATION_SCORE"
+    REP_FRAC=0
+    REP_RATE=0
     REP_PROB_UNTIL=$(( now + BAN_HOURS * 3600 + PROBATION_SECONDS ))
     save_reputation "$ip"
 }
@@ -5006,43 +5060,60 @@ rep_on_unban() {
 # main loop scored this cycle (hot right now) are left to update_score.
 reputation_sweep() {
     [ -f "$SCORE_FILE" ] || return 0
-    local now ip score prev ts prob rec ns
+    local now ip score prev ts prob frac rate rec gain acc apply ns elapsed
     now=$(date +%s)
     local tmp="$SCORE_FILE.sweep.$$"
     : > "$tmp"
-    while read -r ip score prev ts prob; do
+    while read -r ip score prev ts prob frac rate; do
         [ -z "$ip" ] && continue
         score="${score//[^0-9]/}"; score="${score:-100}"
         ts="${ts//[^0-9]/}"; ts="${ts:-0}"
         prob="${prob//[^0-9]/}"; prob="${prob:-0}"
+        [[ "${frac:-}" =~ ^-?[0-9]+$ ]] || frac=0
+        rate="${rate//[^0-9]/}"; rate="${rate:-0}"
         if state_has_ip "$BANNED_LIST" "$ip"; then
-            echo "$ip $score $prev $ts $prob" >> "$tmp"; continue
+            echo "$ip $score $prev $ts $prob $frac $rate" >> "$tmp"; continue
         fi
         if [ "${CONN_COUNT[$ip]:-0}" -ge "$CONN_THRESHOLD" ]; then
-            echo "$ip $score $prev $ts $prob" >> "$tmp"; continue
+            echo "$ip $score $prev $ts $prob $frac $rate" >> "$tmp"; continue
         fi
         if [ "$score" -ge 100 ] && [ "$prob" -le "$now" ] && [ $(( now - ts )) -gt 86400 ]; then
-            continue  # prune
+            continue  # prune fully-recovered stale entries
         fi
-        rec="$SCORE_RECOVER"; [ "$prob" -gt "$now" ] && rec="$PROBATION_RECOVER"
-        ns=$(( score + rec )); [ "$ns" -gt 100 ] && ns=100
-        echo "$ip $ns $prev $ts $prob" >> "$tmp"
+        if [ "$score" -lt 100 ]; then
+            # Scoring v2: recovery is time-based (points per minute of
+            # quiet), accumulated through the fractional field - the old
+            # flat per-cycle gain made recovery speed depend on how
+            # often the daemon happened to loop.
+            elapsed=$(( now - ts )); [ "$elapsed" -lt 0 ] && elapsed=0
+            [ "$elapsed" -gt 3600 ] && elapsed=3600
+            rec="$SCORE_RECOVER_PER_MIN"; [ "$prob" -gt "$now" ] && rec="$PROBATION_RECOVER_PER_MIN"
+            gain=$(( rec * 100 * elapsed / 60 ))
+            acc=$(( frac + gain ))
+            apply=$(( acc / 100 ))
+            frac=$(( acc - apply * 100 ))
+            ns=$(( score + apply )); [ "$ns" -gt 100 ] && ns=100
+            echo "$ip $ns $prev $now $prob $frac $rate" >> "$tmp"
+        else
+            echo "$ip $score $prev $ts $prob $frac $rate" >> "$tmp"
+        fi
     done < "$SCORE_FILE"
     mv "$tmp" "$SCORE_FILE" 2>/dev/null || true
 }
 
-# update_score <ip> <current_conn_count> <elapsed_seconds_since_last>
-# Adjusts REP_SCORE based on behavior, then enforces the matching band.
+# update_score <ip> <current_conn_count> <syn_recv_count> <elapsed_hint>
+# Scoring model v2 (docs/SCORING.md): continuous, time-normalized terms
+# with fractional accumulation; adjusts REP_SCORE, enforces the band.
 update_score() {
-    local ip="$1" cur="$2" dt="$3"
+    local ip="$1" cur="$2" syn="${3:-0}" dt="${4:-2}"
     [ "$dt" -lt 1 ] && dt=1
     is_exempt_any "$ip" && { clear_reputation "$ip"; return 0; }
-    state_has_ip "$SCORE_FILE" "$ip" || echo "$ip 100 0 0 0" >> "$SCORE_FILE" 2>/dev/null || true
+    state_has_ip "$SCORE_FILE" "$ip" || echo "$ip 100 0 0 0 0 0" >> "$SCORE_FILE" 2>/dev/null || true
 
     load_reputation "$ip"
 
-    # ── D3: real elapsed time (BUG-020: the caller-supplied dt was a
-    # constant; measure from the persisted timestamp instead, clamped)
+    # Real elapsed time (BUG-020/D3): measured from the persisted
+    # timestamp, clamped - the caller value is only a fallback.
     local now; now=$(date +%s)
     if [ "$REP_TS" -gt 0 ] && [ "$REP_TS" -le "$now" ]; then
         dt=$(( now - REP_TS ))
@@ -5050,80 +5121,84 @@ update_score() {
         [ "$dt" -gt 60 ] && dt=60
     fi
 
-    # ── D3 normalization (FR-3): a score in the ban band while the IP is
-    # NOT banned is a leftover from a ban that ended outside this path
-    # (manual unban, older daemon, expiry race). That state was a
-    # de-facto permanent ban. Normalize it to a probation release.
+    # D3 normalization (FR-3): a score in the ban band while the IP is
+    # NOT banned is a leftover from a ban that ended outside this path.
+    # Normalize it to a probation release instead of re-banning.
     if [ "$REP_SCORE" -lt "$SCORE_BAN" ] && ! state_has_ip "$BANNED_LIST" "$ip"; then
         REP_SCORE="$PROBATION_SCORE"
         REP_PROB_UNTIL=$(( now + PROBATION_SECONDS ))
         log " REP-PROBATION: $ip | stale post-ban score normalized to $PROBATION_SCORE (probation ${PROBATION_SECONDS}s)"
     fi
-    local new_rate=0  # new connections per second
-    if [ "$REP_PREV_CNT" -gt 0 ] && [ "$cur" -ge "$REP_PREV_CNT" ]; then
-        new_rate=$(( (cur - REP_PREV_CNT) / dt ))
-    fi
 
-    # ── Score adjustment (deltas per cycle) ──────────────
-    local drop=0
-    # 1) Connection churn — the attacker signature. Rapid new-connection rate.
-    if   [ "$new_rate" -ge 50 ]; then drop=$(( drop + 18 ))
-    elif [ "$new_rate" -ge 25 ]; then drop=$(( drop + 12 ))
-    elif [ "$new_rate" -ge 10 ]; then drop=$(( drop + 6 ))
-    elif [ "$new_rate" -ge 5  ]; then drop=$(( drop + 2 ))
-    fi
-    # 2) Sustained high concurrent connections (holding many, near-flood)
-    if   [ "$cur" -ge 800 ]; then drop=$(( drop + 15 ))
-    elif [ "$cur" -ge 400 ]; then drop=$(( drop + 8 ))
-    elif [ "$cur" -ge 200 ]; then drop=$(( drop + 4 ))
-    elif [ "$cur" -gt "$CONN_THRESHOLD" ]; then drop=$(( drop + 1 ))
-    fi
-    # 3) Time-based decay: a hot IP that stays hot loses a little each cycle
-    #    (prevents an IP hovering at a band boundary forever).
-    if [ "$drop" -gt 0 ]; then
-        drop=$(( drop + 1 ))
-    fi
+    local old_score="$REP_SCORE"
+    local in_prob=0; [ "$now" -lt "${REP_PROB_UNTIL:-0}" ] && in_prob=1
 
-    # Probation (D3): during the window, drops count double - a real
-    # repeat offender returns to the ban band quickly - but a ban still
-    # only fires from the band itself, never from a stale state.
-    if [ "$drop" -gt 0 ] && [ "$now" -lt "${REP_PROB_UNTIL:-0}" ]; then
-        drop=$(( drop * 2 ))
-    fi
+    # ── Scoring v2 terms, all in points per minute (docs/SCORING.md) ──
+    # churn: EWMA-smoothed new-connection rate above a 2/s allowance,
+    #   continuous (the v1 step table jumped +2 -> +18 between 49 and
+    #   50 conn/s); sustained: concurrent-connection excess over the
+    #   watch threshold; syn: half-open share of the total (the SYN
+    #   flood signature v1 could not see - it merged SYN-RECV into the
+    #   same counter as ESTABLISHED). First sample of a tracked IP
+    #   (prev=0): every connection is new within the window.
+    local CHURN SUST SYNP RS
+    read -r CHURN SUST SYNP RS <<< "$(awk \
+        -v cur="$cur" -v prev="$REP_PREV_CNT" -v syn="$syn" \
+        -v dt="$dt" -v rate_prev="${REP_RATE:-0}" -v thr="$CONN_THRESHOLD" \
+        'BEGIN{
+            r = (prev > 0) ? ((cur >= prev) ? (cur - prev) / dt : 0) : cur / dt;
+            rs = 0.5 * r + 0.5 * (rate_prev / 100);
+            churn = (rs <= 2) ? 0 : (rs - 2) * 1.2; if (churn > 30) churn = 30;
+            ex = cur - thr; sust = (ex <= 0) ? 0 : ex / 40; if (sust > 20) sust = 20;
+            synp = 0;
+            if (syn >= 20 && cur > 0) { ratio = syn / cur; if (ratio > 0.5) { synp = (ratio - 0.5) * 40; if (synp > 15) synp = 15; } }
+            printf "%.2f %.2f %.2f %.2f", churn, sust, synp, rs;
+        }')"
+    REP_RATE=$(awk -v rs="$RS" 'BEGIN{ printf "%d", rs * 100 + 0.5 }')
 
-    # Recover if this cycle was clean (below churn, below flood, low enough)
-    if [ "$drop" -eq 0 ]; then
-        local _rec="$SCORE_RECOVER"
-        [ "$now" -lt "${REP_PROB_UNTIL:-0}" ] && _rec="$PROBATION_RECOVER"
-        REP_SCORE=$(( REP_SCORE + _rec ))
-        [ "$REP_SCORE" -gt 100 ] && REP_SCORE=100
+    # Probation: drops count double; the total is capped per minute.
+    local total_x100 acc apply
+    total_x100=$(awk -v c="$CHURN" -v s="$SUST" -v y="$SYNP" \
+        -v prob="$in_prob" -v cap="$SCORE_DROP_CAP_PER_MIN" 'BEGIN{
+            t = c + s + y; if (prob) t *= 2; if (t > cap) t = cap;
+            printf "%d", t * 100 + 0.5 }')
+    if [ "$total_x100" -gt 0 ]; then
+        acc=$(( REP_FRAC - total_x100 * dt / 60 ))
     else
-        REP_SCORE=$(( REP_SCORE - drop ))
-        [ "$REP_SCORE" -lt 0 ] && REP_SCORE=0
+        local rec="$SCORE_RECOVER_PER_MIN"
+        [ "$in_prob" -eq 1 ] && rec="$PROBATION_RECOVER_PER_MIN"
+        acc=$(( REP_FRAC + rec * 100 * dt / 60 ))
     fi
+    apply=$(( acc / 100 ))
+    REP_FRAC=$(( acc - apply * 100 ))
+    REP_SCORE=$(( REP_SCORE + apply ))
+    [ "$REP_SCORE" -gt 100 ] && REP_SCORE=100
+    [ "$REP_SCORE" -lt 0 ] && REP_SCORE=0
     REP_PREV_CNT="$cur"
     save_reputation "$ip"
 
-    # ── Enforce band (graduated, only escalate; never penalize a NORMAL IP) ──
+    # Structured, explainable logging: every material score change is
+    # recorded with the exact terms that produced it.
+    if [ "$apply" -ne 0 ]; then
+        local dstr; [ "$apply" -ge 0 ] && dstr="+$apply" || dstr="$apply"
+        log " SCORE: $ip | $old_score->$REP_SCORE (d$dstr) | churn=${CHURN}/min sust=${SUST}/min syn=${SYNP}/min rate=${RS}/s syn_n=$syn dt=${dt}s prob=$in_prob"
+    fi
+
+    # ── Enforce band (graduated, only escalate) ──
     if [ "$REP_SCORE" -lt "$SCORE_BAN" ]; then
         if ! state_has_ip "$BANNED_LIST" "$ip"; then
-            log " REP-BAN: $ip | score $REP_SCORE (below $SCORE_BAN) → ban ${BAN_HOURS}h"
+            log " REP-BAN: $ip | score $REP_SCORE (below $SCORE_BAN) -> ban ${BAN_HOURS}h"
             nx_throttle "$ip"
             nx_ban "$ip"
-            # D3: the ban sets up its own release - when it expires, the
-            # IP returns in PROBATION at PROBATION_SCORE (rep_on_unban
-            # enforces the same transition on the expiry path).
             rep_on_ban "$ip"
         fi
     elif [ "$REP_SCORE" -lt "$SCORE_HARD" ]; then
         nx_hard_throttle "$ip"
-        log " REP-HARD: $ip | score $REP_SCORE → 50Mbps"
+        log " REP-HARD: $ip | score $REP_SCORE -> 50Mbps"
     elif [ "$REP_SCORE" -lt "$SCORE_THROTTLE" ]; then
         nx_throttle "$ip"
-        log " REP-THROTTLE: $ip | score $REP_SCORE → 100Mbps"
+        log " REP-THROTTLE: $ip | score $REP_SCORE -> 100Mbps"
     elif [ "$REP_SCORE" -lt "$SCORE_SUSPECT" ]; then
-        # SUSPECT band: watch only, no bandwidth penalty. But ensure it is on
-        # the watch list so the classic per-IP path can escalate it if it grows.
         if ! state_has_ip "$WATCH_LIST" "$ip"; then
             echo "$ip $(date +%s)" >> "$WATCH_LIST" 2>/dev/null || true
         fi
@@ -5332,6 +5407,24 @@ while true; do
             [ -n "$IP" ] && [ -n "$CNT" ] && CONN_COUNT["$IP"]="$CNT"
         done <<< "$SS_OUT"
     fi
+    # SYN-RECV per IP (scoring v2): half-open sockets are the SYN-flood
+    # signature; v1 merged them into the same counter as ESTABLISHED,
+    # so scoring could not tell a flood from honest load.
+    declare -A SYN_COUNT
+    SS_SYN=$(ss -tnH state syn-recv 2>/dev/null | \
+        awk '{ split($4, L, ":"); lp = L[length(L)];
+               if (lp !~ /^[0-9]+$/) next;
+               if (lp >= 32768) next;
+               print $5 }' | \
+        { grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+'; grep -oE '\[[0-9a-fA-F:]+\]' | tr -d '[]'; } | \
+        sort | uniq -c | sort -rn | head -100 || true)
+    if [ -n "$SS_SYN" ]; then
+        while IFS= read -r line; do
+            CNT=$(echo "$line" | awk '{print $1}')
+            IP=$(echo "$line" | awk '{print $2}')
+            [ -n "$IP" ] && [ -n "$CNT" ] && SYN_COUNT["$IP"]="$CNT"
+        done <<< "$SS_SYN"
+    fi
     sleep "$SAMPLE_INTERVAL"
 
     # Process results — based on real connection count, not packets
@@ -5347,7 +5440,7 @@ while true; do
 
         # Reputation scoring: adjust score for this sample and enforce band.
         # Uses the connection count and the interval since the last sample.
-        update_score "$ip" "$count" "$SAMPLE_INTERVAL"
+        update_score "$ip" "$count" "${SYN_COUNT[$ip]:-0}" "$SAMPLE_INTERVAL"
 
         # Immediate action if way over limit (≥ BAN_CONN_THRESHOLD conns)
         if [ "${count:-0}" -ge "$BAN_CONN_THRESHOLD" ]; then
@@ -5485,7 +5578,7 @@ while true; do
     # Recovery for quiet IPs (D3): hot IPs were handled by update_score.
     reputation_sweep
 
-    unset CONN_COUNT SUBNET_COUNT
+    unset CONN_COUNT SUBNET_COUNT SYN_COUNT
 done
 AUTOBAN_EOF
 

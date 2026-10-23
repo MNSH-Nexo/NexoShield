@@ -39,18 +39,23 @@ SCORE_BAN=20
 SCORE_HARD=40
 SCORE_THROTTLE=60
 SCORE_SUSPECT=80
-# Recovery: how fast a well-behaved IP regains reputation (per cycle).
-SCORE_RECOVER=3
+# Scoring model v2 (docs/SCORING.md): every score movement is rated in
+# points per MINUTE and scaled by the real elapsed time of the sample,
+# so an IP's fate depends on its behaviour - never on daemon loop speed.
+# Fractional points accumulate in the score file instead of rounding
+# away each cycle.
+SCORE_RECOVER_PER_MIN=6
+SCORE_DROP_CAP_PER_MIN=45
 # Probation (D3, FR-3): EVERY ban - reputation, classic or instant - ends
 # in the same defined state: the IP returns at PROBATION_SCORE with a
-# probation window. During probation, recovery is faster (+5/cycle) but
+# probation window. During probation, recovery is faster (10/min) but
 # score drops are doubled; a ban still requires the score to actually
 # reach the ban band again, so one minor spike cannot re-ban (the old
 # behaviour: score stayed wherever the ban path left it, often <20, so
 # the smallest trigger re-banned instantly - a de-facto permanent ban).
 PROBATION_SCORE=50
 PROBATION_SECONDS=1800
-PROBATION_RECOVER=5
+PROBATION_RECOVER_PER_MIN=10
 # When connections are counted we snapshot the previous sample to derive the
 # new-connection rate (attacker signature) without per-packet overhead.
 

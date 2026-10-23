@@ -103,6 +103,29 @@ EOF
         fi
     done
 
+    # Field finding T-1 (live test, 2026-10-23): on journal-only images
+    # (Debian 12 cloud ships without rsyslog) the classic log files do
+    # not exist, and fail2ban refuses to start when ANY enabled jail
+    # has no log file at all - the whole service died while the
+    # installer reported success. Ensure the syslog-family files exist
+    # (empty is fine; rsyslog fills them when present). With no rsyslog
+    # at all, kernel/auth jails read the systemd journal instead -
+    # otherwise they would run but stay blind forever.
+    local _lf
+    for _lf in /var/log/kern.log /var/log/auth.log /var/log/secure; do
+        [ -e "$_lf" ] || touch "$_lf" 2>/dev/null || true
+    done
+    local KERN_BACKEND="" SSH_BACKEND="" HTTP_ENABLED="true"
+    if ! command -v rsyslogd >/dev/null 2>&1 && command -v journalctl >/dev/null 2>&1; then
+        KERN_BACKEND='backend   = systemd
+journalmatch = _TRANSPORT=kernel'
+        SSH_BACKEND='backend   = systemd'
+    fi
+    if [ ! -f /var/log/nginx/access.log ] && [ ! -f /var/log/apache2/access.log ]; then
+        HTTP_ENABLED="false"
+        info "http-flood jail disabled: no nginx/apache access log on this server"
+    fi
+
     cat > "$F2B_JAIL_DIR/antiddos.conf" << EOF
 # Anti-DDoS fail2ban jails — generated $(date)
 # CF IPs are ignored via ignoreip (no false bans)
@@ -114,14 +137,15 @@ ignoreip = ${_F2B_IGNORE}
 [3proxy-ddos]
 enabled   = true
 filter    = 3proxy-ddos
-logpath   = /var/log/3proxy/access.log
+# 3proxy rotates daily: the live file is access.log.YYYY.MM.DD (T-2).
+logpath   = /var/log/3proxy/access.log.*
 maxretry  = 100
 findtime  = 60
 bantime   = 86400
 action    = iptables-allports[name=3proxy-ddos, protocol=all]
 
 [http-flood]
-enabled   = true
+enabled   = ${HTTP_ENABLED}
 filter    = http-flood
 # Combined-log-format web servers only. 3proxy's access.log is NOT an
 # HTTP access log; its floods are covered by the daemon and 3proxy-ddos.
@@ -139,6 +163,7 @@ enabled   = true
 filter    = conn-flood
 logpath   = /var/log/kern.log
             /var/log/syslog
+${KERN_BACKEND}
 # 20 iptables DROP events from same IP in 10s = flood
 # connlimit DROP fires when IP exceeds CONN_LIMIT_PER_IP connections
 maxretry  = 20
@@ -151,6 +176,7 @@ enabled   = true
 filter    = portscan
 logpath   = /var/log/kern.log
             /var/log/syslog
+${KERN_BACKEND}
 maxretry  = 5
 findtime  = 30
 bantime   = 86400
@@ -161,6 +187,7 @@ enabled   = true
 filter    = sshd
 logpath   = /var/log/auth.log
             /var/log/secure
+${SSH_BACKEND}
 maxretry  = 3
 findtime  = 30
 bantime   = 86400
@@ -177,11 +204,23 @@ bantime   = 3600
 action    = iptables-allports[name=xray-proxy, protocol=all]
 EOF
 
+    # Verify, never assume (T-1): a written config is not a running
+    # jail set. Test the configuration, then check the real service.
+    if command -v fail2ban-client >/dev/null 2>&1 && \
+        ! fail2ban-client -t >/dev/null 2>&1; then
+        warn "fail2ban: configuration test FAILED - jails not applied (diagnose: fail2ban-client -t)"
+        return 1
+    fi
     systemctl reload fail2ban 2>/dev/null || systemctl restart fail2ban 2>/dev/null || true
     sleep 2
-    ACTIVE_JAILS=$(fail2ban-client status 2>/dev/null | grep "Jail list" | \
-        sed 's/.*://;s/,/ /g' | wc -w || echo 0)
-    success "fail2ban: $ACTIVE_JAILS jails active"
+    if systemctl is-active --quiet fail2ban 2>/dev/null; then
+        ACTIVE_JAILS=$(fail2ban-client status 2>/dev/null | grep "Jail list" | \
+            sed 's/.*://;s/,/ /g' | wc -w || echo 0)
+        success "fail2ban: $ACTIVE_JAILS jails active"
+    else
+        warn "fail2ban: service is NOT running after apply (diagnose: systemctl status fail2ban)"
+        return 1
+    fi
 }
 
 # Regenerate the jail file (its ignoreip is built from the live exempt
