@@ -288,11 +288,50 @@ Most findings are instances of eight recurring design mistakes:
 
 ## Maintainer's field reports
 
-<!-- Mahan: bugs you have personally experienced go here. They will be
-     cross-checked against the registry above (several audit findings may
-     share a root cause with a field report) and prioritized together. -->
+Reported by Mahan from production experience, 2026-10-23. Cross-checked
+against the audit registry — all three map to verified audit findings,
+which raises their priority in the fix plan (docs/FIX-PLAN.md).
 
-_(to be added)_
+### FR-1 — Whitelisting an arbitrary admin IP must exempt it from EVERYTHING
+- **Requirement:** an admin must be able to whitelist any IP, and
+  "whitelisted" must mean exempt in every layer, no exceptions.
+- **Current state (verified by census):** the whitelist IS consulted by
+  iptables INPUT (`user_whitelist` ACCEPT), the raw/SYNPROXY table, tc
+  (nominally — broken by BUG-001), and the auto-ban daemon's `is_exempt`.
+  It is **NOT** consulted by: fail2ban `ignoreip` (BUG-028), the 3proxy
+  per-port rate-limit rules (no whitelist step in
+  `3proxy/20-iptables.sh`), or the menus' manual Block-IP flows
+  (BUG-039). Input validation is missing (BUG-029).
+- **Maps to:** BUG-028, BUG-029, BUG-039, BUG-001 (tc leg).
+
+### FR-2 — The server's own IPs must never be blocked, under any circumstance
+- **Requirement:** a hard guarantee, not a best effort, across every
+  blocking mechanism (auto-ban, subnet ban, fail2ban, manual blocks,
+  rate-limit DROPs).
+- **Current state (verified):** self IPs are whitelisted in iptables and
+  in the daemon's `is_exempt`, but fail2ban `ignoreip` omits them
+  (BUG-028), the subnet-ban self-guard checks only the *first* local IP
+  (BUG-065), and manual Block-IP has no self guard at all (BUG-039).
+  There is no watchdog that would detect/remove a self-block if one
+  ever slipped through.
+- **Maps to:** BUG-028, BUG-065, BUG-039.
+
+### FR-3 — After an unban, reputation does not recover; the IP re-blocks on the smallest trigger and effectively stays blocked
+- **Requirement:** the reputation lifecycle after a ban must be redesigned
+  properly: serving a ban must have a defined, fair effect on score, and
+  a released IP must be able to earn its way back to normal.
+- **Current state (verified by call-site census):** post-ban score
+  handling is inconsistent *by ban path*. The reputation path clears the
+  score when it bans (`autoban/30-reputation.sh:92`); the classic
+  watch→throttle→ban paths (`autoban/50-main-loop.sh:71,88`) never touch
+  the score; `unban_expired` never touches the score; and
+  `update_score` only runs for IPs currently ≥120 connections, so no
+  recovery is possible while quiet or while banned (BUG-034). Net
+  effect matches the field report exactly: an IP unbanned with a stale
+  low score re-crosses the ban band on a trivial spike, and the cycle
+  repeats — a de-facto permanent ban.
+- **Maps to:** BUG-034, BUG-020 (dt distortion accelerates the fall),
+  BUG-003 (substring state corruption can worsen it).
 
 ---
 
