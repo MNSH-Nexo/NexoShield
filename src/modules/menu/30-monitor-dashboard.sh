@@ -27,7 +27,7 @@ _monitor_dashboard() {
     clear
     while true; do
         # ── Non-blocking key check ──────────────────────────
-        read -t 0.8 -n 1 K 2>/dev/null || true
+        read -r -t 0.8 -n 1 K 2>/dev/null || true
         [ "$K" = "q" ] || [ "$K" = "Q" ] && break
         if [ "$K" = "r" ] || [ "$K" = "R" ]; then
             PREV_BAN_COUNT=$(cnt "BANNED:" "$BAN_LOG")

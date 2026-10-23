@@ -1,6 +1,12 @@
 # @part modules/sysctl/00-header.sh - Config, print/log helpers, install lock
 # Assembled into optimize-sysctl.sh by tools/build.py - not a standalone script.
 #!/bin/bash
+# shellcheck disable=SC2015,SC2094
+# Reviewed idioms (Wave 10): SC2015 - `cond && ok-print || err-print`
+# chains whose middle command is a print helper that cannot fail;
+# SC2094 - atomic state writes via tmp-file + rename, which the
+# checker flags as same-file pipelines. Both classes were audited
+# site-by-site during the fix waves (docs/FIX-PLAN.md).
 set -uo pipefail
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 CYAN='\033[0;36m'; BOLD='\033[1m'; DIM='\033[2m'; NC='\033[0m'

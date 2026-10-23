@@ -1,6 +1,12 @@
 # @part modules/autoban/00-header.sh - Config: thresholds, reputation bands, subnet detection, CF include, self IPs
 # Assembled into auto-ban.sh by tools/build.py - not a standalone script.
 #!/bin/bash
+# shellcheck disable=SC2015,SC2094
+# Reviewed idioms (Wave 10): SC2015 - `cond && ok-print || err-print`
+# chains whose middle command is a print helper that cannot fail;
+# SC2094 - atomic state writes via tmp-file + rename, which the
+# checker flags as same-file pipelines. Both classes were audited
+# site-by-site during the fix waves (docs/FIX-PLAN.md).
 # ============================================================
 #  Smart Throttle+Ban — Anti-DDoS Layer 4
 #  Pipeline: watch(120 conns) → throttle(100Mbps) → ban(4h) | instant ban: 300 conns

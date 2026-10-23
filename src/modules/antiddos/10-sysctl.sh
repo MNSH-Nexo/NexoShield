@@ -21,7 +21,8 @@ detect_env() {
 
     # Count public IPs (for rp_filter decision)
     PUBLIC_IP_COUNT=$(ip -4 addr show 2>/dev/null | grep 'inet ' | \
-        grep -v '127\.\|10\.\|192\.168\.\|172\.\(1[6-9]\|2[0-9]\|3[01]\)\.' | wc -l || echo 0)
+        grep -cv '127\.\|10\.\|192\.168\.\|172\.\(1[6-9]\|2[0-9]\|3[01]\)\.' || true)
+    PUBLIC_IP_COUNT="${PUBLIC_IP_COUNT:-0}"
 
     # Scale rate limits by RAM
     if [ "$RAM_MB" -ge 4096 ]; then

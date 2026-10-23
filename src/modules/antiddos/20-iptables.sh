@@ -224,7 +224,7 @@ apply_iptables() {
         # A global cap absorbs the total SYN rate regardless of source.
         # Value: 5× per-IP limit to allow bursts from many legit IPs simultaneously.
         local _GS_LIMIT _GS_BURST
-        _GS_LIMIT=$(echo "$SYN_LIMIT" | sed 's|/sec||')
+        _GS_LIMIT="${SYN_LIMIT//\/sec/}"
         _GS_LIMIT="${_GS_LIMIT//[^0-9]/}"; _GS_LIMIT="${_GS_LIMIT:-500}"
         _GS_BURST="${SYN_BURST:-1000}"
         _GS_BURST="${_GS_BURST//[^0-9]/}"; _GS_BURST="${_GS_BURST:-1000}"
@@ -263,7 +263,7 @@ apply_iptables() {
                 --hashlimit-name "udp_reflect_${REFLECT_PORT}" \
                 -j DROP
         done
-        success "UDP Amplification (DNS/NTP/SSDP/memcached): blocked"
+        success "UDP Amplification (chargen/DNS/rpcbind/NetBIOS/NTP/SNMP/SSDP/memcached/mDNS): blocked"
     else
         warn "UDP Flood: hashlimit unavailable - using global limit"
         ipt_add INPUT -p udp -m limit --limit 100/s --limit-burst 200 -j ACCEPT

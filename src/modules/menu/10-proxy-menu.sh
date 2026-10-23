@@ -63,64 +63,7 @@ menu_proxy() {
     done
 }
 
-_proxy_stats() {
-    clear; PORT=$(get_proxy_port); sep
-    echo -e "  ${C}Traffic Stats - port $PORT${NC}"; sep
-    ACTIVE=$(ss -tnp 2>/dev/null | grep ":$PORT " | grep -v LISTEN | wc -l || echo 0)
-    echo -e "  Active connections: ${G}$ACTIVE${NC}"
 
-    _fmt() {
-        # Format bytes without depending on `bc` (absent on some systems → used to show blank)
-        awk -v n="${1:-0}" 'BEGIN{
-            if (n>=1073741824) printf "%.2f GB\n", n/1073741824;
-            else if (n>=1048576) printf "%.2f MB\n", n/1048576;
-            else if (n>=1024) printf "%.2f KB\n", n/1024;
-            else printf "%d B\n", n;
-        }'
-    }
-    IN_B=$(iptables -L INPUT -v -n -x 2>/dev/null | grep "3proxy_stats_in" | awk '{print $2}' | head -1)
-    OUT_B=$(iptables -L OUTPUT -v -n -x 2>/dev/null | grep "3proxy_stats_out" | awk '{print $2}' | head -1)
-    # 3proxy_stats_in  = bytes clients SENT to proxy (upload)
-    # 3proxy_stats_out = bytes proxy   SENT to clients (download)
-    echo -e "  Download (proxy -> client): ${G}$(_fmt "$OUT_B")${NC}"
-    echo -e "  Upload   (client -> proxy): ${G}$(_fmt "$IN_B")${NC}"
-
-    # Banned IPs (auto-ban)
-    if [ -f /var/log/auto-ban.log ]; then
-        BANNED_COUNT=$(cnt "BANNED:" /var/log/auto-ban.log)
-        echo -e "  Auto-bans today: ${Y}$BANNED_COUNT${NC}"
-    fi
-
-    [ -f /var/log/3proxy/access.log ] && {
-        echo ""
-        echo -e "  ${C}Last 10 connections:${NC}"
-        tail -10 /var/log/3proxy/access.log 2>/dev/null || true
-    }
-    press_enter
-}
-
-_proxy_change_pass() {
-    clear; echo -e "  ${C}Change Password${NC}"; echo ""
-    [ ! -f /etc/3proxy/3proxy.cfg ] && warn "3proxy not installed" && press_enter && return
-    echo -e "  ${DIM}Leave empty to generate a random password.${NC}"; echo ""
-    printf '%s' "  New password (empty = random): " >/dev/tty; read -r NP </dev/tty || NP=""
-    if [ -z "$NP" ]; then
-        NP=$(tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c 16)
-        if [ -z "$NP" ]; then
-            warn "Failed to generate a secure password (/dev/urandom unavailable)"
-            press_enter
-            return 1
-        fi
-    fi
-    CU=$(grep -oP '(?<=allow )\S+' /etc/3proxy/3proxy.cfg 2>/dev/null | head -1 || echo "")
-    [ -z "$CU" ] && warn "Cannot find username" && press_enter && return
-    echo "users ${CU}:CL:${NP}" > /etc/3proxy/users.cfg
-    [ -f /etc/3proxy/install.info ] && \
-        sed -i "s/^PASS=.*/PASS=${NP}/" /etc/3proxy/install.info 2>/dev/null || true
-    systemctl restart 3proxy 2>/dev/null && ok "Password changed" || err "Restart failed"
-    echo -e "  ${G}socks5://${CU}:${NP}@$(get_ip):$(get_proxy_port)${NC}"
-    press_enter
-}
 
 _proxy_suspicious() {
     clear; echo -e "  ${C}Threat IPs (real blocked/throttled attackers)${NC}"; echo ""

@@ -10,7 +10,7 @@
 
 <img src="https://img.shields.io/badge/Platform-Ubuntu%2020%2B-E95420?style=flat-square&logo=ubuntu&logoColor=white" alt="Platform"/>
 <img src="https://img.shields.io/badge/Shell-Bash%205%2B-4EAA25?style=flat-square&logo=gnubash&logoColor=white" alt="Shell"/>
-<img src="https://img.shields.io/badge/Version-3.4.12-7c3aed?style=flat-square" alt="Version"/>
+<img src="https://img.shields.io/badge/Version-3.5.0-7c3aed?style=flat-square" alt="Version"/>
 <img src="https://img.shields.io/badge/License-MIT-1a73e8?style=flat-square" alt="License"/>
 
 </div>
@@ -115,7 +115,7 @@ NexoShield از **۵ لایه موازی** برای محافظت استفاده 
 | HTTP Burst (pipeline) | hashlimit + fail2ban 200req/30s | Active |
 | Botnet distributed (/24) | Subnet aggregate tracking | Active |
 | UDP Flood | hashlimit per-IP | Active |
-| UDP Amplification | DNS/NTP/SSDP/memcached blocked | Active |
+| UDP Amplification | chargen/DNS/rpcbind/NetBIOS/NTP/SNMP/SSDP/memcached/mDNS blocked | Active |
 | ICMP Flood | rate-limited per-IP | Active |
 | Port Scan | NULL/XMAS/FIN/bogus flags DROP | Active |
 | SSH Brute Force | fail2ban (3 tries → 24h ban) | Active |
@@ -137,7 +137,7 @@ NexoShield دارای **753 رنج IP رسمی Cloudflare** است که در **�
 
 ```
 ════════════════════════════════════════
-  NexoShield — Server Toolkit v3.4.12
+  NexoShield — Server Toolkit v3.5.0
 ════════════════════════════════════════
   1.  SOCKS5 Proxy Manager
   2.  Kernel Optimizer (sysctl)
@@ -184,6 +184,9 @@ Connection Detected
 
   Reputation scoring:  80+ normal → 60+ watch → 40+ 100M throttle
                        → 20+ 50M → <20 instant ban (4h)
+  probation (v3.5+):   every ban ends in probation — the IP returns at
+                       score 50 with doubled drops for 30 min, instead
+                       of a stale low score that re-banned it forever
   auto-release:        IPs that calm down are automatically released
 ```
 

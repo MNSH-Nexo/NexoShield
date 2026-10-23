@@ -18,7 +18,8 @@ show_stats() {
     PORT=$(get_current_port || true)
     [ -z "$PORT" ] && echo -e "${RED}Not installed.${NC}" && return
     sep; echo -e "  ${CYAN}Stats - port $PORT${NC}"; sep
-    ACTIVE=$(ss -tnp 2>/dev/null | grep ":$PORT " | grep -v LISTEN | wc -l || echo 0)
+    ACTIVE=$(ss -tnp state established 2>/dev/null | grep -c ":$PORT " || true)
+    ACTIVE="${ACTIVE:-0}"
     echo -e "  Active connections: ${GREEN}$ACTIVE${NC}"
 
     IN_B=$(iptables -L INPUT -v -n -x 2>/dev/null | grep "3proxy_stats_in" | awk '{print $2}' | head -1)

@@ -3,7 +3,7 @@ exec bash <(tr -d '\r' < "$0" | tail -n +3) "$@"
 #!/bin/bash
 # ── GENERATED FILE ─ built by tools/build.py from src/ ─ do not edit directly; edit the sources and rebuild ──
 # ============================================================
-#  Proxy Manager - Auto Installer  v3.4.12
+#  Proxy Manager - Auto Installer  v3.5.0
 #  One file, one command, everything ready
 #
 #  Install:
@@ -28,7 +28,7 @@ exec bash <(tr -d '\r' < "$0" | tail -n +3) "$@"
 # ============================================================
 set -euo pipefail
 
-VERSION="3.4.12"
+VERSION="3.5.0"
 INSTALL_DIR="/opt/proxy-manager"
 BIN_LINK="/usr/local/bin/proxy"
 LOG="/var/log/proxy-manager-install.log"
@@ -847,6 +847,12 @@ info "Creating files..."
 # ══════════════════════════════════════════════════════════
 cat > "$INSTALL_DIR/.3proxy-socks5.sh.nxnew" << 'PROXY_SCRIPT'
 #!/bin/bash
+# shellcheck disable=SC2015,SC2094
+# Reviewed idioms (Wave 10): SC2015 - `cond && ok-print || err-print`
+# chains whose middle command is a print helper that cannot fail;
+# SC2094 - atomic state writes via tmp-file + rename, which the
+# checker flags as same-file pipelines. Both classes were audited
+# site-by-site during the fix waves (docs/FIX-PLAN.md).
 # ============================================================
 #  3proxy SOCKS5 Manager
 #  - Cloudflare IPs: ALWAYS unlimited (no connlimit, no rate)
@@ -1375,6 +1381,7 @@ install_proxy() {
         fi
     fi
     if [ -z "$PROXY_PASS" ]; then
+        # shellcheck disable=SC2018 # byte-range alphabet is deliberate (credential generation)
         PROXY_USER=$(tr -dc 'a-z' </dev/urandom 2>/dev/null | head -c 8 || echo "proxyuser")
         PROXY_PASS=$(tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c 16)
         if [ -z "$PROXY_PASS" ]; then
@@ -1706,7 +1713,8 @@ show_stats() {
     PORT=$(get_current_port || true)
     [ -z "$PORT" ] && echo -e "${RED}Not installed.${NC}" && return
     sep; echo -e "  ${CYAN}Stats - port $PORT${NC}"; sep
-    ACTIVE=$(ss -tnp 2>/dev/null | grep ":$PORT " | grep -v LISTEN | wc -l || echo 0)
+    ACTIVE=$(ss -tnp state established 2>/dev/null | grep -c ":$PORT " || true)
+    ACTIVE="${ACTIVE:-0}"
     echo -e "  Active connections: ${GREEN}$ACTIVE${NC}"
 
     IN_B=$(iptables -L INPUT -v -n -x 2>/dev/null | grep "3proxy_stats_in" | awk '{print $2}' | head -1)
@@ -1833,6 +1841,12 @@ PROXY_SCRIPT
 # ══════════════════════════════════════════════════════════
 cat > "$INSTALL_DIR/.optimize-sysctl.sh.nxnew" << 'SYSCTL_SCRIPT'
 #!/bin/bash
+# shellcheck disable=SC2015,SC2094
+# Reviewed idioms (Wave 10): SC2015 - `cond && ok-print || err-print`
+# chains whose middle command is a print helper that cannot fail;
+# SC2094 - atomic state writes via tmp-file + rename, which the
+# checker flags as same-file pipelines. Both classes were audited
+# site-by-site during the fix waves (docs/FIX-PLAN.md).
 set -uo pipefail
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 CYAN='\033[0;36m'; BOLD='\033[1m'; DIM='\033[2m'; NC='\033[0m'
@@ -1840,7 +1854,7 @@ TARGET_FILE="/etc/sysctl.d/99-vpn-optimized.conf"
 SNAPSHOT_DIR="/var/lib/vpn-sysctl-snapshots"
 LOG_FILE="/var/log/vpn-sysctl-optimizer.log"
 LOCK_FILE="/var/run/vpn-sysctl.lock"
-SCRIPT_VERSION="3.4.12"
+SCRIPT_VERSION="3.5.0"
 
 [ "$EUID" -ne 0 ] && echo -e "${RED}Root required${NC}" && exit 1
 
@@ -1893,8 +1907,8 @@ detect_environment() {
     fi
 
     PUBLIC_IP_COUNT=$(ip -4 addr show 2>/dev/null | grep 'inet ' | \
-        grep -v '127\.\|10\.\|192\.168\.\|172\.\(1[6-9]\|2[0-9]\|3[01]\)\.' | \
-        wc -l 2>/dev/null || echo 0)
+        grep -cv '127\.\|10\.\|192\.168\.\|172\.\(1[6-9]\|2[0-9]\|3[01]\)\.' || true)
+    PUBLIC_IP_COUNT="${PUBLIC_IP_COUNT:-0}"
 
 
     BBR_AVAILABLE=0
@@ -2425,7 +2439,13 @@ SYSCTL_SCRIPT
 # ══════════════════════════════════════════════════════════
 cat > "$INSTALL_DIR/.proxy-menu.sh.nxnew" << 'MENU_SCRIPT'
 #!/bin/bash
-VERSION="3.4.12"
+# shellcheck disable=SC2015,SC2094
+# Reviewed idioms (Wave 10): SC2015 - `cond && ok-print || err-print`
+# chains whose middle command is a print helper that cannot fail;
+# SC2094 - atomic state writes via tmp-file + rename, which the
+# checker flags as same-file pipelines. Both classes were audited
+# site-by-site during the fix waves (docs/FIX-PLAN.md).
+VERSION="3.5.0"
 INSTALL_DIR="/opt/proxy-manager"
 _BSRC="${BASH_SOURCE[0]:-}"
 if [ -n "$_BSRC" ] && [ "$_BSRC" != "/dev/stdin" ] && [[ "$_BSRC" != /dev/fd/* ]]; then
@@ -2578,64 +2598,7 @@ menu_proxy() {
     done
 }
 
-_proxy_stats() {
-    clear; PORT=$(get_proxy_port); sep
-    echo -e "  ${C}Traffic Stats - port $PORT${NC}"; sep
-    ACTIVE=$(ss -tnp 2>/dev/null | grep ":$PORT " | grep -v LISTEN | wc -l || echo 0)
-    echo -e "  Active connections: ${G}$ACTIVE${NC}"
 
-    _fmt() {
-        # Format bytes without depending on `bc` (absent on some systems → used to show blank)
-        awk -v n="${1:-0}" 'BEGIN{
-            if (n>=1073741824) printf "%.2f GB\n", n/1073741824;
-            else if (n>=1048576) printf "%.2f MB\n", n/1048576;
-            else if (n>=1024) printf "%.2f KB\n", n/1024;
-            else printf "%d B\n", n;
-        }'
-    }
-    IN_B=$(iptables -L INPUT -v -n -x 2>/dev/null | grep "3proxy_stats_in" | awk '{print $2}' | head -1)
-    OUT_B=$(iptables -L OUTPUT -v -n -x 2>/dev/null | grep "3proxy_stats_out" | awk '{print $2}' | head -1)
-    # 3proxy_stats_in  = bytes clients SENT to proxy (upload)
-    # 3proxy_stats_out = bytes proxy   SENT to clients (download)
-    echo -e "  Download (proxy -> client): ${G}$(_fmt "$OUT_B")${NC}"
-    echo -e "  Upload   (client -> proxy): ${G}$(_fmt "$IN_B")${NC}"
-
-    # Banned IPs (auto-ban)
-    if [ -f /var/log/auto-ban.log ]; then
-        BANNED_COUNT=$(cnt "BANNED:" /var/log/auto-ban.log)
-        echo -e "  Auto-bans today: ${Y}$BANNED_COUNT${NC}"
-    fi
-
-    [ -f /var/log/3proxy/access.log ] && {
-        echo ""
-        echo -e "  ${C}Last 10 connections:${NC}"
-        tail -10 /var/log/3proxy/access.log 2>/dev/null || true
-    }
-    press_enter
-}
-
-_proxy_change_pass() {
-    clear; echo -e "  ${C}Change Password${NC}"; echo ""
-    [ ! -f /etc/3proxy/3proxy.cfg ] && warn "3proxy not installed" && press_enter && return
-    echo -e "  ${DIM}Leave empty to generate a random password.${NC}"; echo ""
-    printf '%s' "  New password (empty = random): " >/dev/tty; read -r NP </dev/tty || NP=""
-    if [ -z "$NP" ]; then
-        NP=$(tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c 16)
-        if [ -z "$NP" ]; then
-            warn "Failed to generate a secure password (/dev/urandom unavailable)"
-            press_enter
-            return 1
-        fi
-    fi
-    CU=$(grep -oP '(?<=allow )\S+' /etc/3proxy/3proxy.cfg 2>/dev/null | head -1 || echo "")
-    [ -z "$CU" ] && warn "Cannot find username" && press_enter && return
-    echo "users ${CU}:CL:${NP}" > /etc/3proxy/users.cfg
-    [ -f /etc/3proxy/install.info ] && \
-        sed -i "s/^PASS=.*/PASS=${NP}/" /etc/3proxy/install.info 2>/dev/null || true
-    systemctl restart 3proxy 2>/dev/null && ok "Password changed" || err "Restart failed"
-    echo -e "  ${G}socks5://${CU}:${NP}@$(get_ip):$(get_proxy_port)${NC}"
-    press_enter
-}
 
 _proxy_suspicious() {
     clear; echo -e "  ${C}Threat IPs (real blocked/throttled attackers)${NC}"; echo ""
@@ -2779,7 +2742,7 @@ _monitor_dashboard() {
     clear
     while true; do
         # ── Non-blocking key check ──────────────────────────
-        read -t 0.8 -n 1 K 2>/dev/null || true
+        read -r -t 0.8 -n 1 K 2>/dev/null || true
         [ "$K" = "q" ] || [ "$K" = "Q" ] && break
         if [ "$K" = "r" ] || [ "$K" = "R" ]; then
             PREV_BAN_COUNT=$(cnt "BANNED:" "$BAN_LOG")
@@ -3454,8 +3417,14 @@ MENU_SCRIPT
 # ══════════════════════════════════════════════════════════
 cat > "$INSTALL_DIR/.antiddos.sh.nxnew" << 'ANTIDDOS_SCRIPT'
 #!/bin/bash
+# shellcheck disable=SC2015,SC2094
+# Reviewed idioms (Wave 10): SC2015 - `cond && ok-print || err-print`
+# chains whose middle command is a print helper that cannot fail;
+# SC2094 - atomic state writes via tmp-file + rename, which the
+# checker flags as same-file pipelines. Both classes were audited
+# site-by-site during the fix waves (docs/FIX-PLAN.md).
 # ============================================================
-#  Anti-DDoS Protection Manager v3.4.12
+#  Anti-DDoS Protection Manager v3.5.0
 #
 #  Layers:
 #    1. Kernel (sysctl hardening + tight conntrack timeouts)
@@ -3479,7 +3448,7 @@ set -euo pipefail
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 CYAN='\033[0;36m'; WHITE='\033[1;37m'; DIM='\033[2m'; BOLD='\033[1m'; NC='\033[0m'
 
-SCRIPT_VERSION="3.4.12"
+SCRIPT_VERSION="3.5.0"
 LOG_FILE="/var/log/antiddos.log"
 STATE_FILE="/etc/antiddos/state.conf"
 BANNED_LIST="/etc/antiddos/banned.list"
@@ -3582,7 +3551,8 @@ detect_env() {
 
     # Count public IPs (for rp_filter decision)
     PUBLIC_IP_COUNT=$(ip -4 addr show 2>/dev/null | grep 'inet ' | \
-        grep -v '127\.\|10\.\|192\.168\.\|172\.\(1[6-9]\|2[0-9]\|3[01]\)\.' | wc -l || echo 0)
+        grep -cv '127\.\|10\.\|192\.168\.\|172\.\(1[6-9]\|2[0-9]\|3[01]\)\.' || true)
+    PUBLIC_IP_COUNT="${PUBLIC_IP_COUNT:-0}"
 
     # Scale rate limits by RAM
     if [ "$RAM_MB" -ge 4096 ]; then
@@ -3936,7 +3906,7 @@ apply_iptables() {
         # A global cap absorbs the total SYN rate regardless of source.
         # Value: 5× per-IP limit to allow bursts from many legit IPs simultaneously.
         local _GS_LIMIT _GS_BURST
-        _GS_LIMIT=$(echo "$SYN_LIMIT" | sed 's|/sec||')
+        _GS_LIMIT="${SYN_LIMIT//\/sec/}"
         _GS_LIMIT="${_GS_LIMIT//[^0-9]/}"; _GS_LIMIT="${_GS_LIMIT:-500}"
         _GS_BURST="${SYN_BURST:-1000}"
         _GS_BURST="${_GS_BURST//[^0-9]/}"; _GS_BURST="${_GS_BURST:-1000}"
@@ -3975,7 +3945,7 @@ apply_iptables() {
                 --hashlimit-name "udp_reflect_${REFLECT_PORT}" \
                 -j DROP
         done
-        success "UDP Amplification (DNS/NTP/SSDP/memcached): blocked"
+        success "UDP Amplification (chargen/DNS/rpcbind/NetBIOS/NTP/SNMP/SSDP/memcached/mDNS): blocked"
     else
         warn "UDP Flood: hashlimit unavailable - using global limit"
         ipt_add INPUT -p udp -m limit --limit 100/s --limit-burst 200 -j ACCEPT
@@ -4409,6 +4379,12 @@ setup_autoban() {
 
     cat > "$AUTOBAN_SCRIPT.nxnew" << 'AUTOBAN_EOF'
 #!/bin/bash
+# shellcheck disable=SC2015,SC2094
+# Reviewed idioms (Wave 10): SC2015 - `cond && ok-print || err-print`
+# chains whose middle command is a print helper that cannot fail;
+# SC2094 - atomic state writes via tmp-file + rename, which the
+# checker flags as same-file pipelines. Both classes were audited
+# site-by-site during the fix waves (docs/FIX-PLAN.md).
 # ============================================================
 #  Smart Throttle+Ban — Anti-DDoS Layer 4
 #  Pipeline: watch(120 conns) → throttle(100Mbps) → ban(4h) | instant ban: 300 conns

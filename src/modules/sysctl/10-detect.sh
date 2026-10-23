@@ -28,8 +28,8 @@ detect_environment() {
     fi
 
     PUBLIC_IP_COUNT=$(ip -4 addr show 2>/dev/null | grep 'inet ' | \
-        grep -v '127\.\|10\.\|192\.168\.\|172\.\(1[6-9]\|2[0-9]\|3[01]\)\.' | \
-        wc -l 2>/dev/null || echo 0)
+        grep -cv '127\.\|10\.\|192\.168\.\|172\.\(1[6-9]\|2[0-9]\|3[01]\)\.' || true)
+    PUBLIC_IP_COUNT="${PUBLIC_IP_COUNT:-0}"
 
 
     BBR_AVAILABLE=0

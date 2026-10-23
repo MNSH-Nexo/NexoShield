@@ -1,6 +1,12 @@
 # @part modules/3proxy/00-header.sh - Config, colours, Cloudflare + server-IP includes, small getters
 # Assembled into 3proxy-socks5.sh by tools/build.py - not a standalone script.
 #!/bin/bash
+# shellcheck disable=SC2015,SC2094
+# Reviewed idioms (Wave 10): SC2015 - `cond && ok-print || err-print`
+# chains whose middle command is a print helper that cannot fail;
+# SC2094 - atomic state writes via tmp-file + rename, which the
+# checker flags as same-file pipelines. Both classes were audited
+# site-by-site during the fix waves (docs/FIX-PLAN.md).
 # ============================================================
 #  3proxy SOCKS5 Manager
 #  - Cloudflare IPs: ALWAYS unlimited (no connlimit, no rate)

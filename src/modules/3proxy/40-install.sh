@@ -130,6 +130,7 @@ install_proxy() {
         fi
     fi
     if [ -z "$PROXY_PASS" ]; then
+        # shellcheck disable=SC2018 # byte-range alphabet is deliberate (credential generation)
         PROXY_USER=$(tr -dc 'a-z' </dev/urandom 2>/dev/null | head -c 8 || echo "proxyuser")
         PROXY_PASS=$(tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c 16)
         if [ -z "$PROXY_PASS" ]; then

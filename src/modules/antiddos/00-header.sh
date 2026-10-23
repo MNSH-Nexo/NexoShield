@@ -1,6 +1,12 @@
 # @part modules/antiddos/00-header.sh - Config, helpers, Cloudflare + server-IP includes
 # Assembled into antiddos.sh by tools/build.py - not a standalone script.
 #!/bin/bash
+# shellcheck disable=SC2015,SC2094
+# Reviewed idioms (Wave 10): SC2015 - `cond && ok-print || err-print`
+# chains whose middle command is a print helper that cannot fail;
+# SC2094 - atomic state writes via tmp-file + rename, which the
+# checker flags as same-file pipelines. Both classes were audited
+# site-by-site during the fix waves (docs/FIX-PLAN.md).
 # ============================================================
 #  Anti-DDoS Protection Manager v@@VERSION@@
 #

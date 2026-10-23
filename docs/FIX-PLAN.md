@@ -174,6 +174,10 @@ those waves land.
   a sweep confirmed no dead duplicate function copies remain in the
   menu (the shared names are per-program print/lock helpers, by
   design). Tests: wave-8 regression guards 17/17; suites green.
+  (Addendum, Wave 10: the BUG-051 entry above was initially closed by
+  inspection, but the registry's precise claim — that menu/10's
+  `_proxy_stats` and `_proxy_change_pass` are dead duplicates — was
+  verified in Wave 10 and both functions were deleted there.)
 - Wave 9 — DONE (IPv6 full parity, Q1 default). New data + loader:
   `src/data/cloudflare-ipv6.list` (the 7 official CF v6 ranges) and
   `src/lib/cloudflare6-loader.sh`; the installer writes both v6 data
@@ -492,3 +496,21 @@ or closed as documented non-issues. Version → **3.5.0**, tag
 No language rewrite, no new features beyond FR-1…FR-3, no change to the
 single-file distribution model, no threshold retuning beyond what a
 bug fix requires (D3 parameters excepted, per Q2).
+- Wave 10 — DONE. Debt + release: BUG-051 closed for real (the menu's
+  dead `_proxy_stats`/`_proxy_change_pass` duplicates deleted);
+  BUG-046 (the UDP-amplification completion message and README row
+  now list every port family the code actually blocks); the two
+  remaining `grep | wc -l || echo 0` counters converted to grep -c
+  form. ShellCheck note debt (78 notes): SC2015 (53) and SC2094 (11)
+  are waived at module level with written justifications — both are
+  reviewed idiom classes (print-helper `&&`/`||` chains; atomic
+  tmp+rename state writes); the rest were fixed (SC2126, SC2162,
+  SC2001, SC2018) or individually reviewed and left (5 notes:
+  os-release sourcing, two `ls` on self-generated snapshot names,
+  two intentional word-splitting expansions). Modules remain
+  warning-clean, now verified with ShellCheck actually present.
+  README truth-synced (version, UDP row, probation in the reputation
+  diagram). VERSION → **3.5.0**; local tag `v3.5.0`. All 68 findings
+  + FR-1..FR-3 are now addressed; the only remaining items are
+  external: fill `T3PROXY_SHA256` from a trusted download (Q4) and
+  push the branch / open the PR (Q5).
