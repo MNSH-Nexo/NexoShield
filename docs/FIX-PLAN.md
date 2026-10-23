@@ -152,6 +152,28 @@ those waves land.
   the status display no longer needs `bc`. Tests: sysctl
   correctness 7/7 (parser incl. tab-separated input, page math at
   16 GiB and the small-RAM floors, set-equality guard).
+- Wave 8 — DONE. BUG-008: "Flush all auto-bans" now delegates to a
+  real engine (`antiddos.sh --flush-autobans`): tagged rules deleted
+  by number from `iptables -S`, recorded tc throttle filters removed
+  by prio, daemon state truncated — the old menu loop grepped
+  `iptables -L` for comment text that never appears there and flushed
+  nothing while printing success. BUG-038: both unban flows delete
+  the exact tagged rule specs and edit state by exact field-1 match
+  (plus input validation in the antiddos flow). BUG-041: a `cnt()`
+  helper replaces every `grep -c ... || echo 0` (which printed "0"
+  twice); the dashboard counts DROP rules from `iptables -S` and
+  established connections only. BUG-043: the server-IP lookup is
+  memoized per menu session (was a fresh external curl per screen).
+  BUG-044: the system-update flow branches properly (apt / dnf /
+  yum) and reports failure honestly. BUG-052: config backup warns
+  that it contains proxy credentials, verifies the archive with
+  tar -tzf, and reports failure instead of unconditional success.
+  BUG-053: the Anti-DDoS status probes the auto-ban service itself
+  (Active / Installed-stopped / Not installed), not state.conf's
+  existence. BUG-051: the banned-IP view reads the state file only;
+  a sweep confirmed no dead duplicate function copies remain in the
+  menu (the shared names are per-program print/lock helpers, by
+  design). Tests: wave-8 regression guards 17/17; suites green.
 
 **Inputs:** `docs/BUGS.md` — 68 audited findings (BUG-001…068) plus the
 maintainer's field reports FR-1 (whitelist must exempt from *everything*),

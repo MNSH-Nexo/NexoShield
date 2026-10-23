@@ -37,6 +37,11 @@ err()  { echo -e "  ${R}✗${NC}  $*"; }
 warn() { echo -e "  ${Y}⚠${NC}  $*"; }
 press_enter() { echo ""; printf '%s\n' "  Press Enter to go back..." >/dev/tty; read -r _PE </dev/tty 2>/dev/null || true; }
 
+# cnt <pattern> <file> — a grep -c that always prints exactly ONE
+# number (BUG-041: `grep -c ... || echo 0` prints "0" twice when grep
+# exits 1 on no-match, corrupting counters and their arithmetic).
+cnt() { local _n; _n=$(grep -c -- "$1" "$2" 2>/dev/null || true); echo "${_n:-0}"; }
+
 svc_status() {
     case "$(systemctl is-active "$1" 2>/dev/null)" in
         active)   echo -e "${G}● Running${NC}" ;;
@@ -54,9 +59,13 @@ get_proxy_port() {
     grep -oP '(?<=socks5 -p)\s*\K\d+' /etc/3proxy/3proxy.cfg 2>/dev/null | head -1 || true
 }
 get_ip() {
-    curl -s -4 --max-time 4 https://api.ipify.org 2>/dev/null || \
+    # Memoized (BUG-043): draw_header runs on every screen and used to
+    # pay a fresh external curl (up to 4s) each time.
+    [ -n "${_NX_IP_CACHE:-}" ] && { echo "$_NX_IP_CACHE"; return 0; }
+    _NX_IP_CACHE=$(curl -s -4 --max-time 4 https://api.ipify.org 2>/dev/null || \
     ip -4 addr show 2>/dev/null | grep 'inet ' | grep -v '127\.' | \
-        head -1 | awk '{print $2}' | cut -d/ -f1 || echo "?"
+        head -1 | awk '{print $2}' | cut -d/ -f1 || echo "?")
+    echo "$_NX_IP_CACHE"
 }
 
 draw_header() {

@@ -54,9 +54,18 @@ menu_antiddos() {
             3) echo -e "  ${C}Unban IP${NC}"; echo ""
                printf '%s' "  Enter IP to unban (removes from iptables + fail2ban): " >/dev/tty; read -r UIP </dev/tty || UIP=""
                [ -n "$UIP" ] && {
-                   iptables -D INPUT -s "$UIP" -j DROP 2>/dev/null && ok "iptables: unblocked" || true
-                   [ -f /etc/antiddos/banned.list ] && \
-                       sed -i "/$UIP/d" /etc/antiddos/banned.list 2>/dev/null || true
+                   # Exact deletes (BUG-038): match the tagged specs the
+                   # daemon creates; state edit by exact field 1 (the
+                   # old substring sed also removed 11.2.3.4's entry
+                   # when unbanning 1.2.3.4).
+                   iptables -D INPUT -s "$UIP" -m comment --comment "auto-ban" -j DROP 2>/dev/null || \
+                   iptables -D INPUT -s "$UIP" -m comment --comment "subnet-ban" -j DROP 2>/dev/null || \
+                   iptables -D INPUT -s "$UIP" -j DROP 2>/dev/null || true
+                   ok "iptables: unblocked"
+                   if [ -f /etc/antiddos/banned.list ]; then
+                       awk -v x="$UIP" '$1!=x' /etc/antiddos/banned.list > /etc/antiddos/banned.list.tmp 2>/dev/null && \
+                           mv /etc/antiddos/banned.list.tmp /etc/antiddos/banned.list
+                   fi
                    fail2ban-client status 2>/dev/null | grep "Jail list" | \
                        sed 's/.*://;s/,/\n/g' | tr -d ' ' | while read -r j; do
                        [ -z "$j" ] && continue

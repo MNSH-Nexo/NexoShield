@@ -80,6 +80,32 @@ nx_ip_in_cidr() {
 # exempt_check <ip> — per-layer exemption status for one IP.
 # Exit: 0 = member of the exempt set (CF / self / whitelist), 1 = not
 # exempt, 2 = invalid input. Manual block flows MUST refuse on 0 (FR-1/2).
+# flush_autobans — remove every auto-ban/subnet-ban rule and clear the
+# daemon's ban/throttle/watch state. Backs the menu's "Flush all
+# auto-bans" (BUG-008): the old menu implementation grepped
+# `iptables -L` output for the comment text - comments never appear in
+# -L listings, so it flushed nothing while reporting success. Rules
+# are deleted by number from `iptables -S` (nx_delete_matching) and
+# recorded tc throttle filters are removed by their prios.
+flush_autobans() {
+    nx_delete_matching INPUT '--comment "auto-ban"'
+    nx_delete_matching INPUT '--comment "subnet-ban"'
+    local _iface _f _ip _prio _rest
+    _iface=$(ip route show default 2>/dev/null | awk '/default/{print $5}' | head -1)
+    for _f in /tmp/autoban_throttle /etc/antiddos/throttled.list; do
+        [ -f "$_f" ] || continue
+        while read -r _ip _prio _rest; do
+            if [ -n "${_prio:-}" ] && [ -n "$_iface" ]; then
+                tc filter del dev "$_iface" parent 1: prio "$_prio" 2>/dev/null || true
+            fi
+        done < "$_f"
+        : > "$_f" 2>/dev/null || true
+    done
+    : > /etc/antiddos/banned.list 2>/dev/null || true
+    : > /tmp/autoban_watch 2>/dev/null || true
+    success "All auto-bans flushed (iptables rules + daemon state)"
+}
+
 exempt_check() {
     local ip="${1:-}" rc=1 _e
     [ -n "$ip" ] || { echo "usage: --exempt-check <ip>"; return 2; }
@@ -211,6 +237,7 @@ case "${1:-}" in
     --remove-force)  detect_env; CONF_R="y"; remove_rules; exit 0 ;;
     --status|-s)     detect_env; show_status; exit 0 ;;
     --exempt-check)  exempt_check "${2:-}"; exit $? ;;
+    --flush-autobans) flush_autobans; exit $? ;;
     --thresholds|-t) detect_env; show_thresholds; exit 0 ;;
     --sysctl)        detect_env; apply_sysctl_hardening; exit 0 ;;
     --iptables)      detect_env; apply_iptables; exit 0 ;;
@@ -280,11 +307,24 @@ while true; do
         8) setup_tc; printf '%s\n' "  Press Enter to continue..." >/dev/tty; read -r _PE </dev/tty 2>/dev/null || true ;;
         9) echo -e "  ${CYAN}Unban IP${NC}"; echo ""
            printf '%s' "  Enter IP to unban (iptables + fail2ban): " >/dev/tty; read -r UIP </dev/tty || UIP=""
+           if [ -n "$UIP" ] && ! valid_ip_or_cidr "$UIP"; then
+               echo -e "  ${RED}✗ Invalid IP/CIDR: $UIP${NC}"
+               UIP=""
+           fi
            [ -n "$UIP" ] && {
-               iptables -D INPUT -s "$UIP" -j DROP 2>/dev/null && \
-                   echo -e "  ${GREEN}✓ iptables unblocked${NC}" || true
-               [ -f "$BANNED_LIST" ] && \
-                   sed -i "/${UIP}/d" "$BANNED_LIST" 2>/dev/null || true
+               # Exact deletes (BUG-038): the daemon's rules carry the
+               # auto-ban/subnet-ban comments, so the old bare-spec
+               # delete never matched them; and the state edit was a
+               # substring sed - unbanning 1.2.3.4 also dropped
+               # 11.2.3.4's entry. Match field 1 exactly instead.
+               iptables -D INPUT -s "$UIP" -m comment --comment "auto-ban" -j DROP 2>/dev/null || \
+               iptables -D INPUT -s "$UIP" -m comment --comment "subnet-ban" -j DROP 2>/dev/null || \
+               iptables -D INPUT -s "$UIP" -j DROP 2>/dev/null || true
+               echo -e "  ${GREEN}✓ iptables unblocked${NC}"
+               if [ -f "$BANNED_LIST" ]; then
+                   awk -v x="$UIP" '$1!=x' "$BANNED_LIST" > "$BANNED_LIST.tmp" 2>/dev/null && \
+                       mv "$BANNED_LIST.tmp" "$BANNED_LIST"
+               fi
                fail2ban-client status 2>/dev/null | grep "Jail list" | \
                    sed 's/.*://;s/,/\n/g' | tr -d ' ' | while read -r jail; do
                    [ -z "$jail" ] && continue

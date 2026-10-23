@@ -87,7 +87,7 @@ _proxy_stats() {
 
     # Banned IPs (auto-ban)
     if [ -f /var/log/auto-ban.log ]; then
-        BANNED_COUNT=$(grep -c "BANNED:" /var/log/auto-ban.log 2>/dev/null || echo 0)
+        BANNED_COUNT=$(cnt "BANNED:" /var/log/auto-ban.log)
         echo -e "  Auto-bans today: ${Y}$BANNED_COUNT${NC}"
     fi
 

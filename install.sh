@@ -2448,6 +2448,11 @@ err()  { echo -e "  ${R}✗${NC}  $*"; }
 warn() { echo -e "  ${Y}⚠${NC}  $*"; }
 press_enter() { echo ""; printf '%s\n' "  Press Enter to go back..." >/dev/tty; read -r _PE </dev/tty 2>/dev/null || true; }
 
+# cnt <pattern> <file> — a grep -c that always prints exactly ONE
+# number (BUG-041: `grep -c ... || echo 0` prints "0" twice when grep
+# exits 1 on no-match, corrupting counters and their arithmetic).
+cnt() { local _n; _n=$(grep -c -- "$1" "$2" 2>/dev/null || true); echo "${_n:-0}"; }
+
 svc_status() {
     case "$(systemctl is-active "$1" 2>/dev/null)" in
         active)   echo -e "${G}● Running${NC}" ;;
@@ -2465,9 +2470,13 @@ get_proxy_port() {
     grep -oP '(?<=socks5 -p)\s*\K\d+' /etc/3proxy/3proxy.cfg 2>/dev/null | head -1 || true
 }
 get_ip() {
-    curl -s -4 --max-time 4 https://api.ipify.org 2>/dev/null || \
+    # Memoized (BUG-043): draw_header runs on every screen and used to
+    # pay a fresh external curl (up to 4s) each time.
+    [ -n "${_NX_IP_CACHE:-}" ] && { echo "$_NX_IP_CACHE"; return 0; }
+    _NX_IP_CACHE=$(curl -s -4 --max-time 4 https://api.ipify.org 2>/dev/null || \
     ip -4 addr show 2>/dev/null | grep 'inet ' | grep -v '127\.' | \
-        head -1 | awk '{print $2}' | cut -d/ -f1 || echo "?"
+        head -1 | awk '{print $2}' | cut -d/ -f1 || echo "?")
+    echo "$_NX_IP_CACHE"
 }
 
 draw_header() {
@@ -2580,7 +2589,7 @@ _proxy_stats() {
 
     # Banned IPs (auto-ban)
     if [ -f /var/log/auto-ban.log ]; then
-        BANNED_COUNT=$(grep -c "BANNED:" /var/log/auto-ban.log 2>/dev/null || echo 0)
+        BANNED_COUNT=$(cnt "BANNED:" /var/log/auto-ban.log)
         echo -e "  Auto-bans today: ${Y}$BANNED_COUNT${NC}"
     fi
 
@@ -2748,7 +2757,7 @@ _monitor_dashboard() {
     local MAIN_IF; MAIN_IF=$(ip route show default 2>/dev/null | awk '/default/{print $5}' | head -1)
     local CYCLE=0 NEW_BANS_SINCE=0 BAN_LOG=/var/log/auto-ban.log PREV_BAN_COUNT=0
     if [ -f "$BAN_LOG" ]; then
-        PREV_BAN_COUNT=$(grep -c "BANNED:" "$BAN_LOG" 2>/dev/null || echo 0)
+        PREV_BAN_COUNT=$(cnt "BANNED:" "$BAN_LOG")
         PREV_BAN_COUNT="${PREV_BAN_COUNT//[^0-9]/}"; PREV_BAN_COUNT="${PREV_BAN_COUNT:-0}"
     fi
     local PREV_RX=0 PREV_TX=0 PREV_TIME=0
@@ -2760,7 +2769,7 @@ _monitor_dashboard() {
         read -t 0.8 -n 1 K 2>/dev/null || true
         [ "$K" = "q" ] || [ "$K" = "Q" ] && break
         if [ "$K" = "r" ] || [ "$K" = "R" ]; then
-            PREV_BAN_COUNT=$(grep -c "BANNED:" "$BAN_LOG" 2>/dev/null || echo 0)
+            PREV_BAN_COUNT=$(cnt "BANNED:" "$BAN_LOG")
             PREV_BAN_COUNT="${PREV_BAN_COUNT//[^0-9]/}"; PREV_BAN_COUNT="${PREV_BAN_COUNT:-0}"
             NEW_BANS_SINCE=0; RESET_TIME=$(date '+%H:%M:%S'); CYCLE=0
         fi
@@ -2779,11 +2788,13 @@ _monitor_dashboard() {
         DP="${DP//[^0-9]/}"; DP="${DP:-0}"
         local ACTIVE_CONNS=0
         if [ -n "$PORT" ]; then
-            ACTIVE_CONNS=$(ss -tnp 2>/dev/null | grep -c ":$PORT " || echo 0)
+            ACTIVE_CONNS=$(ss -tnp state established 2>/dev/null | grep -c ":$PORT " || true)
+            ACTIVE_CONNS="${ACTIVE_CONNS:-0}"
             ACTIVE_CONNS="${ACTIVE_CONNS//[^0-9]/}"; ACTIVE_CONNS="${ACTIVE_CONNS:-0}"
         fi
         local TOTAL_CONNS=0
-        TOTAL_CONNS=$(ss -tn 2>/dev/null | grep -c ESTAB || echo 0)
+        TOTAL_CONNS=$(ss -tn 2>/dev/null | grep -c ESTAB || true)
+        TOTAL_CONNS="${TOTAL_CONNS:-0}"
         TOTAL_CONNS="${TOTAL_CONNS//[^0-9]/}"; TOTAL_CONNS="${TOTAL_CONNS:-0}"
 
         # ── Bandwidth ───────────────────────────────────────
@@ -2809,7 +2820,7 @@ _monitor_dashboard() {
         # ── Ban stats ───────────────────────────────────────
         local CUR_BAN_COUNT=0
         if [ -f "$BAN_LOG" ]; then
-            CUR_BAN_COUNT=$(grep -c "BANNED:" "$BAN_LOG" 2>/dev/null || echo 0)
+            CUR_BAN_COUNT=$(cnt "BANNED:" "$BAN_LOG")
             CUR_BAN_COUNT="${CUR_BAN_COUNT//[^0-9]/}"
             CUR_BAN_COUNT="${CUR_BAN_COUNT:-0}"
         fi
@@ -2819,7 +2830,8 @@ _monitor_dashboard() {
 
         # ── iptables drops ──────────────────────────────────
         local DROP_RULES=0 SYNPROXY_HIT=0
-        DROP_RULES=$(iptables -L INPUT -n 2>/dev/null | grep -c "^DROP" 2>/dev/null || echo 0)
+        DROP_RULES=$(iptables -S INPUT 2>/dev/null | grep -c -- "-j DROP" || true)
+        DROP_RULES="${DROP_RULES:-0}"
         DROP_RULES="${DROP_RULES//[^0-9]/}"; DROP_RULES="${DROP_RULES:-0}"
         if [ -f /proc/net/stat/synproxy ]; then
             SYNPROXY_HIT=$(awk 'NR>1{s+=$8}END{print s+0}' /proc/net/stat/synproxy 2>/dev/null || echo 0)
@@ -3043,7 +3055,7 @@ menu_security() {
             6) # Auto-ban status
                if systemctl is-active auto-ban >/dev/null 2>&1; then
                    echo -e "  ${G}● auto-ban: Running${NC}"
-                   BANS=$(grep -c "BANNED:" /var/log/auto-ban.log 2>/dev/null || echo 0)
+                   BANS=$(cnt "BANNED:" /var/log/auto-ban.log)
                    echo -e "  Total bans logged: ${Y}$BANS${NC}"
                    echo ""; tail -10 /var/log/auto-ban.log 2>/dev/null || true
                else
@@ -3132,8 +3144,22 @@ menu_system() {
             2) echo ""
                printf '%s' "  Update system packages? (y/N): " >/dev/tty; read -r _UC </dev/tty || _UC=""
                if [[ "$_UC" == "y" || "$_UC" == "Y" ]]; then
-                   command -v apt-get >/dev/null && apt-get update -y && apt-get upgrade -y || yum update -y
-                   ok "Update complete"
+                   # BUG-044: the old && / || chain ran yum on Debian
+                   # boxes when apt failed and printed "Update complete"
+                   # either way. Branch properly, dnf first on RHEL.
+                   if command -v apt-get >/dev/null 2>&1; then
+                       if apt-get update -y && apt-get upgrade -y; then
+                           ok "Update complete"
+                       else
+                           err "Package update FAILED"
+                       fi
+                   elif command -v dnf >/dev/null 2>&1; then
+                       dnf update -y && ok "Update complete" || err "Package update FAILED"
+                   elif command -v yum >/dev/null 2>&1; then
+                       yum update -y && ok "Update complete" || err "Package update FAILED"
+                   else
+                       err "No supported package manager found"
+                   fi
                else
                    echo -e "  ${DIM}Cancelled.${NC}"
                fi
@@ -3143,7 +3169,7 @@ menu_system() {
                find /var/log -name "*.gz" -mtime +3 -delete 2>/dev/null || true
                apt-get clean 2>/dev/null || true
                AFTER=$(df / 2>/dev/null | awk 'NR==2{print $3}' || echo 0)
-               ok "Freed: $(echo "scale=1; (${BEFORE:-0}-${AFTER:-0})/1024" | bc 2>/dev/null || echo '?') MB"
+               ok "Freed: $(awk -v b="${BEFORE:-0}" -v a="${AFTER:-0}" 'BEGIN{printf "%.1f", (b-a)/1024}') MB"
                press_enter ;;
             4) echo ""
                printf '%s' "  Reboot server now? (y/N): " >/dev/tty; read -r _RBC </dev/tty || _RBC=""
@@ -3154,14 +3180,22 @@ menu_system() {
                    echo -e "  ${DIM}Cancelled.${NC}"; press_enter
                fi ;;
             5) BACKUP="/root/proxy-manager-backup-$(date +%Y%m%d_%H%M%S).tar.gz"
-               tar -czf "$BACKUP" \
+               # BUG-052: the archive contains the proxy password
+               # (/etc/3proxy/users.cfg) - warn, verify the archive,
+               # and only claim success when it actually worked.
+               warn "This backup includes proxy credentials - store it somewhere private."
+               if tar -czf "$BACKUP" \
                    /etc/3proxy/ \
                    /etc/antiddos/ \
                    /etc/fail2ban/jail.d/ \
                    /etc/sysctl.d/ \
                    /opt/proxy-manager/ \
-                   2>/dev/null || true
-               ok "Backup saved: $BACKUP"
+                   2>/dev/null && tar -tzf "$BACKUP" >/dev/null 2>&1; then
+                   ok "Backup saved: $BACKUP ($(du -h "$BACKUP" 2>/dev/null | cut -f1))"
+               else
+                   err "Backup FAILED - no archive was created"
+                   rm -f "$BACKUP"
+               fi
                press_enter ;;
             0) return ;;
         esac
@@ -3223,9 +3257,18 @@ menu_antiddos() {
             3) echo -e "  ${C}Unban IP${NC}"; echo ""
                printf '%s' "  Enter IP to unban (removes from iptables + fail2ban): " >/dev/tty; read -r UIP </dev/tty || UIP=""
                [ -n "$UIP" ] && {
-                   iptables -D INPUT -s "$UIP" -j DROP 2>/dev/null && ok "iptables: unblocked" || true
-                   [ -f /etc/antiddos/banned.list ] && \
-                       sed -i "/$UIP/d" /etc/antiddos/banned.list 2>/dev/null || true
+                   # Exact deletes (BUG-038): match the tagged specs the
+                   # daemon creates; state edit by exact field 1 (the
+                   # old substring sed also removed 11.2.3.4's entry
+                   # when unbanning 1.2.3.4).
+                   iptables -D INPUT -s "$UIP" -m comment --comment "auto-ban" -j DROP 2>/dev/null || \
+                   iptables -D INPUT -s "$UIP" -m comment --comment "subnet-ban" -j DROP 2>/dev/null || \
+                   iptables -D INPUT -s "$UIP" -j DROP 2>/dev/null || true
+                   ok "iptables: unblocked"
+                   if [ -f /etc/antiddos/banned.list ]; then
+                       awk -v x="$UIP" '$1!=x' /etc/antiddos/banned.list > /etc/antiddos/banned.list.tmp 2>/dev/null && \
+                           mv /etc/antiddos/banned.list.tmp /etc/antiddos/banned.list
+                   fi
                    fail2ban-client status 2>/dev/null | grep "Jail list" | \
                        sed 's/.*://;s/,/\n/g' | tr -d ' ' | while read -r j; do
                        [ -z "$j" ] && continue
@@ -3318,23 +3361,25 @@ _autoban_control() {
             3) tail -30 /var/log/auto-ban.log 2>/dev/null || warn "Log not found"
                press_enter ;;
             4) echo -e "  ${C}Currently banned IPs:${NC}"
-               [ -f /etc/antiddos/banned.list ] && cat /etc/antiddos/banned.list 2>/dev/null || \
-               iptables -L INPUT -n 2>/dev/null | grep DROP | \
-                   grep -oP '\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}' | head -30 | \
-                   while read -r ip; do echo -e "  ${R}$ip${NC}"; done
+               # The state file is the source of truth (BUG-051: the old
+               # fallback scraped iptables -L output and presented other
+               # tools' DROP rules as auto-bans).
+               if [ -s /etc/antiddos/banned.list ]; then
+                   cat /etc/antiddos/banned.list
+               else
+                   echo -e "  ${DIM}(none)${NC}"
+               fi
                press_enter ;;
             5) echo -e "  ${Y}Flushing all auto-ban blocks...${NC}"
-               # Delete by matching rule content (safe: line numbers shift after each delete)
-               while iptables -L INPUT -n 2>/dev/null | grep -q '"auto-ban"'; do
-                   iptables -D INPUT \
-                       "$(iptables -L INPUT -n --line-numbers 2>/dev/null | \
-                          grep '"auto-ban"' | awk '{print $1}' | head -1)" \
-                       2>/dev/null || break
-               done
-               [ -f /etc/antiddos/banned.list ] && : > /etc/antiddos/banned.list
-               [ -f /tmp/autoban_throttle ]     && : > /tmp/autoban_throttle
-               [ -f /tmp/autoban_watch ]        && : > /tmp/autoban_watch
-               ok "All auto-bans flushed"
+               # Delegates to the Anti-DDoS engine (BUG-008): comments
+               # never appear in `iptables -L` output, so the old
+               # grep-the-listing loop deleted nothing while reporting
+               # success.
+               if bash "$ANTIDDOS_SCRIPT" --flush-autobans 2>/dev/null; then
+                   ok "All auto-bans flushed"
+               else
+                   err "Flush failed"
+               fi
                press_enter ;;
             0) return ;;
         esac
@@ -3349,11 +3394,22 @@ while true; do
 
     # Show inline status for key items
     _PROXY_ST="$(systemctl is-active 3proxy 2>/dev/null)"
-    _DDOS_ST="$([ -f /etc/antiddos/state.conf ] && echo 'active' || echo 'inactive')"
+    # BUG-053: "Active" must mean the daemon is RUNNING - the old probe
+    # used state.conf's existence, which stays true after the daemon
+    # died or was stopped.
+    if systemctl is-active auto-ban >/dev/null 2>&1; then
+        _DDOS_ST='active'
+    elif [ -f /etc/antiddos/state.conf ]; then
+        _DDOS_ST='installed'
+    else
+        _DDOS_ST='inactive'
+    fi
     _NET_ST="$([ -f /etc/sysctl.d/99-vpn-optimized.conf ] && echo 'active' || echo 'inactive')"
 
     [ "$_PROXY_ST" = "active" ] && _P="${G}● Running${NC}" || _P="${Y}○ Not running${NC}"
-    [ "$_DDOS_ST"  = "active" ] && _D="${G}● Active${NC}"  || _D="${Y}○ Not installed${NC}"
+    if [ "$_DDOS_ST" = "active" ]; then _D="${G}● Active${NC}"
+    elif [ "$_DDOS_ST" = "installed" ]; then _D="${Y}○ Installed (stopped)${NC}"
+    else _D="${Y}○ Not installed${NC}"; fi
     [ "$_NET_ST"   = "active" ] && _N="${G}● Optimized${NC}" || _N="${Y}○ Default${NC}"
 
     echo -e "  ${C}1.${NC}  SOCKS5 Proxy         $_P"
@@ -5739,6 +5795,32 @@ nx_ip_in_cidr() {
 # exempt_check <ip> — per-layer exemption status for one IP.
 # Exit: 0 = member of the exempt set (CF / self / whitelist), 1 = not
 # exempt, 2 = invalid input. Manual block flows MUST refuse on 0 (FR-1/2).
+# flush_autobans — remove every auto-ban/subnet-ban rule and clear the
+# daemon's ban/throttle/watch state. Backs the menu's "Flush all
+# auto-bans" (BUG-008): the old menu implementation grepped
+# `iptables -L` output for the comment text - comments never appear in
+# -L listings, so it flushed nothing while reporting success. Rules
+# are deleted by number from `iptables -S` (nx_delete_matching) and
+# recorded tc throttle filters are removed by their prios.
+flush_autobans() {
+    nx_delete_matching INPUT '--comment "auto-ban"'
+    nx_delete_matching INPUT '--comment "subnet-ban"'
+    local _iface _f _ip _prio _rest
+    _iface=$(ip route show default 2>/dev/null | awk '/default/{print $5}' | head -1)
+    for _f in /tmp/autoban_throttle /etc/antiddos/throttled.list; do
+        [ -f "$_f" ] || continue
+        while read -r _ip _prio _rest; do
+            if [ -n "${_prio:-}" ] && [ -n "$_iface" ]; then
+                tc filter del dev "$_iface" parent 1: prio "$_prio" 2>/dev/null || true
+            fi
+        done < "$_f"
+        : > "$_f" 2>/dev/null || true
+    done
+    : > /etc/antiddos/banned.list 2>/dev/null || true
+    : > /tmp/autoban_watch 2>/dev/null || true
+    success "All auto-bans flushed (iptables rules + daemon state)"
+}
+
 exempt_check() {
     local ip="${1:-}" rc=1 _e
     [ -n "$ip" ] || { echo "usage: --exempt-check <ip>"; return 2; }
@@ -5870,6 +5952,7 @@ case "${1:-}" in
     --remove-force)  detect_env; CONF_R="y"; remove_rules; exit 0 ;;
     --status|-s)     detect_env; show_status; exit 0 ;;
     --exempt-check)  exempt_check "${2:-}"; exit $? ;;
+    --flush-autobans) flush_autobans; exit $? ;;
     --thresholds|-t) detect_env; show_thresholds; exit 0 ;;
     --sysctl)        detect_env; apply_sysctl_hardening; exit 0 ;;
     --iptables)      detect_env; apply_iptables; exit 0 ;;
@@ -5939,11 +6022,24 @@ while true; do
         8) setup_tc; printf '%s\n' "  Press Enter to continue..." >/dev/tty; read -r _PE </dev/tty 2>/dev/null || true ;;
         9) echo -e "  ${CYAN}Unban IP${NC}"; echo ""
            printf '%s' "  Enter IP to unban (iptables + fail2ban): " >/dev/tty; read -r UIP </dev/tty || UIP=""
+           if [ -n "$UIP" ] && ! valid_ip_or_cidr "$UIP"; then
+               echo -e "  ${RED}✗ Invalid IP/CIDR: $UIP${NC}"
+               UIP=""
+           fi
            [ -n "$UIP" ] && {
-               iptables -D INPUT -s "$UIP" -j DROP 2>/dev/null && \
-                   echo -e "  ${GREEN}✓ iptables unblocked${NC}" || true
-               [ -f "$BANNED_LIST" ] && \
-                   sed -i "/${UIP}/d" "$BANNED_LIST" 2>/dev/null || true
+               # Exact deletes (BUG-038): the daemon's rules carry the
+               # auto-ban/subnet-ban comments, so the old bare-spec
+               # delete never matched them; and the state edit was a
+               # substring sed - unbanning 1.2.3.4 also dropped
+               # 11.2.3.4's entry. Match field 1 exactly instead.
+               iptables -D INPUT -s "$UIP" -m comment --comment "auto-ban" -j DROP 2>/dev/null || \
+               iptables -D INPUT -s "$UIP" -m comment --comment "subnet-ban" -j DROP 2>/dev/null || \
+               iptables -D INPUT -s "$UIP" -j DROP 2>/dev/null || true
+               echo -e "  ${GREEN}✓ iptables unblocked${NC}"
+               if [ -f "$BANNED_LIST" ]; then
+                   awk -v x="$UIP" '$1!=x' "$BANNED_LIST" > "$BANNED_LIST.tmp" 2>/dev/null && \
+                       mv "$BANNED_LIST.tmp" "$BANNED_LIST"
+               fi
                fail2ban-client status 2>/dev/null | grep "Jail list" | \
                    sed 's/.*://;s/,/\n/g' | tr -d ' ' | while read -r jail; do
                    [ -z "$jail" ] && continue

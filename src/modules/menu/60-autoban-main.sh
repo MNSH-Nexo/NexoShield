@@ -22,23 +22,25 @@ _autoban_control() {
             3) tail -30 /var/log/auto-ban.log 2>/dev/null || warn "Log not found"
                press_enter ;;
             4) echo -e "  ${C}Currently banned IPs:${NC}"
-               [ -f /etc/antiddos/banned.list ] && cat /etc/antiddos/banned.list 2>/dev/null || \
-               iptables -L INPUT -n 2>/dev/null | grep DROP | \
-                   grep -oP '\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}' | head -30 | \
-                   while read -r ip; do echo -e "  ${R}$ip${NC}"; done
+               # The state file is the source of truth (BUG-051: the old
+               # fallback scraped iptables -L output and presented other
+               # tools' DROP rules as auto-bans).
+               if [ -s /etc/antiddos/banned.list ]; then
+                   cat /etc/antiddos/banned.list
+               else
+                   echo -e "  ${DIM}(none)${NC}"
+               fi
                press_enter ;;
             5) echo -e "  ${Y}Flushing all auto-ban blocks...${NC}"
-               # Delete by matching rule content (safe: line numbers shift after each delete)
-               while iptables -L INPUT -n 2>/dev/null | grep -q '"auto-ban"'; do
-                   iptables -D INPUT \
-                       "$(iptables -L INPUT -n --line-numbers 2>/dev/null | \
-                          grep '"auto-ban"' | awk '{print $1}' | head -1)" \
-                       2>/dev/null || break
-               done
-               [ -f /etc/antiddos/banned.list ] && : > /etc/antiddos/banned.list
-               [ -f /tmp/autoban_throttle ]     && : > /tmp/autoban_throttle
-               [ -f /tmp/autoban_watch ]        && : > /tmp/autoban_watch
-               ok "All auto-bans flushed"
+               # Delegates to the Anti-DDoS engine (BUG-008): comments
+               # never appear in `iptables -L` output, so the old
+               # grep-the-listing loop deleted nothing while reporting
+               # success.
+               if bash "$ANTIDDOS_SCRIPT" --flush-autobans 2>/dev/null; then
+                   ok "All auto-bans flushed"
+               else
+                   err "Flush failed"
+               fi
                press_enter ;;
             0) return ;;
         esac
@@ -53,11 +55,22 @@ while true; do
 
     # Show inline status for key items
     _PROXY_ST="$(systemctl is-active 3proxy 2>/dev/null)"
-    _DDOS_ST="$([ -f /etc/antiddos/state.conf ] && echo 'active' || echo 'inactive')"
+    # BUG-053: "Active" must mean the daemon is RUNNING - the old probe
+    # used state.conf's existence, which stays true after the daemon
+    # died or was stopped.
+    if systemctl is-active auto-ban >/dev/null 2>&1; then
+        _DDOS_ST='active'
+    elif [ -f /etc/antiddos/state.conf ]; then
+        _DDOS_ST='installed'
+    else
+        _DDOS_ST='inactive'
+    fi
     _NET_ST="$([ -f /etc/sysctl.d/99-vpn-optimized.conf ] && echo 'active' || echo 'inactive')"
 
     [ "$_PROXY_ST" = "active" ] && _P="${G}● Running${NC}" || _P="${Y}○ Not running${NC}"
-    [ "$_DDOS_ST"  = "active" ] && _D="${G}● Active${NC}"  || _D="${Y}○ Not installed${NC}"
+    if [ "$_DDOS_ST" = "active" ]; then _D="${G}● Active${NC}"
+    elif [ "$_DDOS_ST" = "installed" ]; then _D="${Y}○ Installed (stopped)${NC}"
+    else _D="${Y}○ Not installed${NC}"; fi
     [ "$_NET_ST"   = "active" ] && _N="${G}● Optimized${NC}" || _N="${Y}○ Default${NC}"
 
     echo -e "  ${C}1.${NC}  SOCKS5 Proxy         $_P"

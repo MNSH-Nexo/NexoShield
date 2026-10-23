@@ -18,7 +18,7 @@ _monitor_dashboard() {
     local MAIN_IF; MAIN_IF=$(ip route show default 2>/dev/null | awk '/default/{print $5}' | head -1)
     local CYCLE=0 NEW_BANS_SINCE=0 BAN_LOG=/var/log/auto-ban.log PREV_BAN_COUNT=0
     if [ -f "$BAN_LOG" ]; then
-        PREV_BAN_COUNT=$(grep -c "BANNED:" "$BAN_LOG" 2>/dev/null || echo 0)
+        PREV_BAN_COUNT=$(cnt "BANNED:" "$BAN_LOG")
         PREV_BAN_COUNT="${PREV_BAN_COUNT//[^0-9]/}"; PREV_BAN_COUNT="${PREV_BAN_COUNT:-0}"
     fi
     local PREV_RX=0 PREV_TX=0 PREV_TIME=0
@@ -30,7 +30,7 @@ _monitor_dashboard() {
         read -t 0.8 -n 1 K 2>/dev/null || true
         [ "$K" = "q" ] || [ "$K" = "Q" ] && break
         if [ "$K" = "r" ] || [ "$K" = "R" ]; then
-            PREV_BAN_COUNT=$(grep -c "BANNED:" "$BAN_LOG" 2>/dev/null || echo 0)
+            PREV_BAN_COUNT=$(cnt "BANNED:" "$BAN_LOG")
             PREV_BAN_COUNT="${PREV_BAN_COUNT//[^0-9]/}"; PREV_BAN_COUNT="${PREV_BAN_COUNT:-0}"
             NEW_BANS_SINCE=0; RESET_TIME=$(date '+%H:%M:%S'); CYCLE=0
         fi
@@ -49,11 +49,13 @@ _monitor_dashboard() {
         DP="${DP//[^0-9]/}"; DP="${DP:-0}"
         local ACTIVE_CONNS=0
         if [ -n "$PORT" ]; then
-            ACTIVE_CONNS=$(ss -tnp 2>/dev/null | grep -c ":$PORT " || echo 0)
+            ACTIVE_CONNS=$(ss -tnp state established 2>/dev/null | grep -c ":$PORT " || true)
+            ACTIVE_CONNS="${ACTIVE_CONNS:-0}"
             ACTIVE_CONNS="${ACTIVE_CONNS//[^0-9]/}"; ACTIVE_CONNS="${ACTIVE_CONNS:-0}"
         fi
         local TOTAL_CONNS=0
-        TOTAL_CONNS=$(ss -tn 2>/dev/null | grep -c ESTAB || echo 0)
+        TOTAL_CONNS=$(ss -tn 2>/dev/null | grep -c ESTAB || true)
+        TOTAL_CONNS="${TOTAL_CONNS:-0}"
         TOTAL_CONNS="${TOTAL_CONNS//[^0-9]/}"; TOTAL_CONNS="${TOTAL_CONNS:-0}"
 
         # ── Bandwidth ───────────────────────────────────────
@@ -79,7 +81,7 @@ _monitor_dashboard() {
         # ── Ban stats ───────────────────────────────────────
         local CUR_BAN_COUNT=0
         if [ -f "$BAN_LOG" ]; then
-            CUR_BAN_COUNT=$(grep -c "BANNED:" "$BAN_LOG" 2>/dev/null || echo 0)
+            CUR_BAN_COUNT=$(cnt "BANNED:" "$BAN_LOG")
             CUR_BAN_COUNT="${CUR_BAN_COUNT//[^0-9]/}"
             CUR_BAN_COUNT="${CUR_BAN_COUNT:-0}"
         fi
@@ -89,7 +91,8 @@ _monitor_dashboard() {
 
         # ── iptables drops ──────────────────────────────────
         local DROP_RULES=0 SYNPROXY_HIT=0
-        DROP_RULES=$(iptables -L INPUT -n 2>/dev/null | grep -c "^DROP" 2>/dev/null || echo 0)
+        DROP_RULES=$(iptables -S INPUT 2>/dev/null | grep -c -- "-j DROP" || true)
+        DROP_RULES="${DROP_RULES:-0}"
         DROP_RULES="${DROP_RULES//[^0-9]/}"; DROP_RULES="${DROP_RULES:-0}"
         if [ -f /proc/net/stat/synproxy ]; then
             SYNPROXY_HIT=$(awk 'NR>1{s+=$8}END{print s+0}' /proc/net/stat/synproxy 2>/dev/null || echo 0)

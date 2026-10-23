@@ -73,7 +73,7 @@ menu_security() {
             6) # Auto-ban status
                if systemctl is-active auto-ban >/dev/null 2>&1; then
                    echo -e "  ${G}● auto-ban: Running${NC}"
-                   BANS=$(grep -c "BANNED:" /var/log/auto-ban.log 2>/dev/null || echo 0)
+                   BANS=$(cnt "BANNED:" /var/log/auto-ban.log)
                    echo -e "  Total bans logged: ${Y}$BANS${NC}"
                    echo ""; tail -10 /var/log/auto-ban.log 2>/dev/null || true
                else
@@ -162,8 +162,22 @@ menu_system() {
             2) echo ""
                printf '%s' "  Update system packages? (y/N): " >/dev/tty; read -r _UC </dev/tty || _UC=""
                if [[ "$_UC" == "y" || "$_UC" == "Y" ]]; then
-                   command -v apt-get >/dev/null && apt-get update -y && apt-get upgrade -y || yum update -y
-                   ok "Update complete"
+                   # BUG-044: the old && / || chain ran yum on Debian
+                   # boxes when apt failed and printed "Update complete"
+                   # either way. Branch properly, dnf first on RHEL.
+                   if command -v apt-get >/dev/null 2>&1; then
+                       if apt-get update -y && apt-get upgrade -y; then
+                           ok "Update complete"
+                       else
+                           err "Package update FAILED"
+                       fi
+                   elif command -v dnf >/dev/null 2>&1; then
+                       dnf update -y && ok "Update complete" || err "Package update FAILED"
+                   elif command -v yum >/dev/null 2>&1; then
+                       yum update -y && ok "Update complete" || err "Package update FAILED"
+                   else
+                       err "No supported package manager found"
+                   fi
                else
                    echo -e "  ${DIM}Cancelled.${NC}"
                fi
@@ -173,7 +187,7 @@ menu_system() {
                find /var/log -name "*.gz" -mtime +3 -delete 2>/dev/null || true
                apt-get clean 2>/dev/null || true
                AFTER=$(df / 2>/dev/null | awk 'NR==2{print $3}' || echo 0)
-               ok "Freed: $(echo "scale=1; (${BEFORE:-0}-${AFTER:-0})/1024" | bc 2>/dev/null || echo '?') MB"
+               ok "Freed: $(awk -v b="${BEFORE:-0}" -v a="${AFTER:-0}" 'BEGIN{printf "%.1f", (b-a)/1024}') MB"
                press_enter ;;
             4) echo ""
                printf '%s' "  Reboot server now? (y/N): " >/dev/tty; read -r _RBC </dev/tty || _RBC=""
@@ -184,14 +198,22 @@ menu_system() {
                    echo -e "  ${DIM}Cancelled.${NC}"; press_enter
                fi ;;
             5) BACKUP="/root/proxy-manager-backup-$(date +%Y%m%d_%H%M%S).tar.gz"
-               tar -czf "$BACKUP" \
+               # BUG-052: the archive contains the proxy password
+               # (/etc/3proxy/users.cfg) - warn, verify the archive,
+               # and only claim success when it actually worked.
+               warn "This backup includes proxy credentials - store it somewhere private."
+               if tar -czf "$BACKUP" \
                    /etc/3proxy/ \
                    /etc/antiddos/ \
                    /etc/fail2ban/jail.d/ \
                    /etc/sysctl.d/ \
                    /opt/proxy-manager/ \
-                   2>/dev/null || true
-               ok "Backup saved: $BACKUP"
+                   2>/dev/null && tar -tzf "$BACKUP" >/dev/null 2>&1; then
+                   ok "Backup saved: $BACKUP ($(du -h "$BACKUP" 2>/dev/null | cut -f1))"
+               else
+                   err "Backup FAILED - no archive was created"
+                   rm -f "$BACKUP"
+               fi
                press_enter ;;
             0) return ;;
         esac
