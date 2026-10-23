@@ -55,7 +55,9 @@ install_proxy() {
         # Pinned sha256 of the 3proxy 0.9.4 source tarball. Empty = skip the
         # check (not recommended). Fill from a trusted download with:
         #   sha256sum 3proxy.tar.gz
-        T3PROXY_SHA256=""
+        # Hash computed 2026-10-23 from the official upstream release:
+        #   https://github.com/3proxy/3proxy/archive/refs/tags/0.9.4.tar.gz
+        T3PROXY_SHA256="b497f74d6cc7ee58ff824457427acc02c6f7a102e483816fbb1b2494942ef983"
         if run_spinner "Downloading 3proxy source" wget -O 3proxy.tar.gz \
             https://github.com/3proxy/3proxy/archive/refs/tags/0.9.4.tar.gz; then
             if [ -n "$T3PROXY_SHA256" ]; then

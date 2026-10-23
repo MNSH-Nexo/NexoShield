@@ -78,6 +78,7 @@ Most findings are instances of eight recurring design mistakes:
 - **Where:** `3proxy/40-install.sh:45-51`
 - **Evidence:** `wget …/3proxy/archive/refs/tags/0.9.4.tar.gz` → `make` → installed to `/usr/local/bin/3proxy`, run as root (BUG-018). No sha256/signature anywhere (grep-verified).
 - **Impact:** A compromised release asset or TLS middlebox turns into a root daemon. This is the fallback path whenever the apt install fails.
+- **Status 2026-10-23:** pin filled — `T3PROXY_SHA256=b497f74d…2ef983` (sha256 of the official `0.9.4.tar.gz` from github.com/3proxy/3proxy, downloaded and checksum-verified; tarball extracts to `3proxy-0.9.4`, README identifies it as upstream 3proxy). The installer now aborts on mismatch instead of compiling blind. Note: upstream has since released 0.9.5 with a security fix (strcpy crash) — consider bumping the pinned version in a follow-up.
 
 ---
 
