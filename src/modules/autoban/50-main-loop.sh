@@ -70,6 +70,7 @@ self_guard() {
             iptables -D $_rule 2>/dev/null && \
                 log " SELF-GUARD: removed DROP rule hitting own IP $_sip"
         done < <(iptables -S INPUT 2>/dev/null | grep -E -- "-s ${_esc}(/32)?[[:space:]]" | grep -- '-j DROP' | sed 's/^-A /INPUT /')
+        state_del_ip "$BANNED_LIST" "$_sip"
     done
     # IPv6 self sweep (Wave 9): the same hard guarantee for v6
     local _sip6
@@ -238,13 +239,21 @@ while true; do
         # 'parent 1:' delete, and never a competing add — an added release
         # filter would out-prio the throttle band and permanently defeat
         # re-throttling of this IP, plus it would accumulate on the iface).
+        # R-2 (deep review 2026-10-23): release only once the
+        # reputation has genuinely recovered. A single quiet sample
+        # used to release the filter AND wipe the score
+        # (clear_reputation), so a pulsing source - hot 40s, quiet 3s -
+        # erased its history every cycle. Quiet recovery is the
+        # sweep's job now; the entry is left for it to finish.
+        _REL_SCORE=$(state_get_field "$SCORE_FILE" "$ip" 2)
+        _REL_SCORE="${_REL_SCORE//[^0-9]/}"; _REL_SCORE="${_REL_SCORE:-100}"
+        [ "$_REL_SCORE" -lt "$SCORE_THROTTLE" ] && continue
         _RELEASE_PRIO=$(state_get_field "$THROTTLE_LIST" "$ip" 2)
         [ -n "$_RELEASE_PRIO" ] && \
             tc filter del dev "$IF" parent 1: prio "$_RELEASE_PRIO" 2>/dev/null || true
         state_del_ip "$THROTTLE_LIST" "$ip"
         state_del_ip "$WATCH_LIST" "$ip"
-        clear_reputation "$ip"
-        log " AUTO-RELEASE: $ip (calmed down) → normal class (1:20)"
+        log " AUTO-RELEASE: $ip (calmed down, score $_REL_SCORE) → normal class (1:20)"
     done < "$THROTTLE_LIST" 2>/dev/null || true
 
     # ── Subnet /24 botnet detection ──────────────────────────

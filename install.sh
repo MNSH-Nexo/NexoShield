@@ -3,7 +3,7 @@ exec bash <(tr -d '\r' < "$0" | tail -n +3) "$@"
 #!/bin/bash
 # ── GENERATED FILE ─ built by tools/build.py from src/ ─ do not edit directly; edit the sources and rebuild ──
 # ============================================================
-#  Proxy Manager - Auto Installer  v3.5.0
+#  Proxy Manager - Auto Installer  v3.6.0
 #  One file, one command, everything ready
 #
 #  Install:
@@ -28,7 +28,7 @@ exec bash <(tr -d '\r' < "$0" | tail -n +3) "$@"
 # ============================================================
 set -euo pipefail
 
-VERSION="3.5.0"
+VERSION="3.6.0"
 INSTALL_DIR="/opt/proxy-manager"
 BIN_LINK="/usr/local/bin/proxy"
 LOG="/var/log/proxy-manager-install.log"
@@ -1874,7 +1874,7 @@ TARGET_FILE="/etc/sysctl.d/99-vpn-optimized.conf"
 SNAPSHOT_DIR="/var/lib/vpn-sysctl-snapshots"
 LOG_FILE="/var/log/vpn-sysctl-optimizer.log"
 LOCK_FILE="/var/run/vpn-sysctl.lock"
-SCRIPT_VERSION="3.5.0"
+SCRIPT_VERSION="3.6.0"
 
 [ "$EUID" -ne 0 ] && echo -e "${RED}Root required${NC}" && exit 1
 
@@ -2465,7 +2465,7 @@ cat > "$INSTALL_DIR/.proxy-menu.sh.nxnew" << 'MENU_SCRIPT'
 # SC2094 - atomic state writes via tmp-file + rename, which the
 # checker flags as same-file pipelines. Both classes were audited
 # site-by-site during the fix waves (docs/FIX-PLAN.md).
-VERSION="3.5.0"
+VERSION="3.6.0"
 INSTALL_DIR="/opt/proxy-manager"
 _BSRC="${BASH_SOURCE[0]:-}"
 if [ -n "$_BSRC" ] && [ "$_BSRC" != "/dev/stdin" ] && [[ "$_BSRC" != /dev/fd/* ]]; then
@@ -3444,7 +3444,7 @@ cat > "$INSTALL_DIR/.antiddos.sh.nxnew" << 'ANTIDDOS_SCRIPT'
 # checker flags as same-file pipelines. Both classes were audited
 # site-by-site during the fix waves (docs/FIX-PLAN.md).
 # ============================================================
-#  Anti-DDoS Protection Manager v3.5.0
+#  Anti-DDoS Protection Manager v3.6.0
 #
 #  Layers:
 #    1. Kernel (sysctl hardening + tight conntrack timeouts)
@@ -3468,7 +3468,7 @@ set -euo pipefail
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 CYAN='\033[0;36m'; WHITE='\033[1;37m'; DIM='\033[2m'; BOLD='\033[1m'; NC='\033[0m'
 
-SCRIPT_VERSION="3.5.0"
+SCRIPT_VERSION="3.6.0"
 LOG_FILE="/var/log/antiddos.log"
 STATE_FILE="/etc/antiddos/state.conf"
 BANNED_LIST="/etc/antiddos/banned.list"
@@ -4878,6 +4878,13 @@ throttle_ip() {
 hard_throttle_ip() {
     local ip="$1"
     is_exempt "$ip" && return 0
+    # R-7 (deep review): already hard-throttled = nothing to do. The
+    # old code deleted + re-added the filter on EVERY scoring cycle -
+    # filter churn, a burned prio per cycle, log spam.
+    if state_has_ip "$THROTTLE_LIST" "$ip" && \
+        [ "$(state_get_field "$THROTTLE_LIST" "$ip" 4)" = "hard" ]; then
+        return 0
+    fi
     # Drop any earlier throttle entry for this IP so the tc filter list stays
     # consistent and no stale prio is left behind (its filter would still match).
     local _OLD
@@ -4949,7 +4956,14 @@ _throttle6() {  # <ip> <soft|hard>
     local ip="$1" band="${2:-soft}" flow="1:30"
     [ "$band" = "hard" ] && flow="1:40"
     is_exempt6 "$ip" && return 0
-    state_has_ip "$THROTTLE_LIST" "$ip" && return 0
+    # R-7: same-band = no-op; soft->hard upgrades by replacing the
+    # filter (the old blanket state check made v6 upgrades impossible).
+    if state_has_ip "$THROTTLE_LIST" "$ip"; then
+        [ "$(state_get_field "$THROTTLE_LIST" "$ip" 4)" = "$band" ] && return 0
+        local _op; _op=$(state_get_field "$THROTTLE_LIST" "$ip" 2)
+        [ -n "$_op" ] && tc filter del dev "$IF" parent 1: protocol ip6 prio "$_op" 2>/dev/null || true
+        state_del_ip "$THROTTLE_LIST" "$ip"
+    fi
     tc_class_exists "$flow" || flow="1:30"
     if ! tc_class_exists "$flow"; then
         log " THROTTLE SKIP (v6): $ip - no tc classes on $IF (autoban-only mode)"
@@ -5255,7 +5269,9 @@ ban_subnet() {
                 */*) _EIP="${_ENTRY%%/*}" ;;
                 *)   _EIP="$_ENTRY" ;;
             esac
-            if [ "$(echo "$_EIP" | grep -oP '^\d+\.\d+\.\d+' 2>/dev/null)" = "$subnet" ]; then
+            _ECIDR="$_ENTRY"; case "$_ECIDR" in */*) ;; *) _ECIDR="${_ECIDR}/32" ;; esac
+            if ip_in_cidr "${subnet}.0" "$_ECIDR" 2>/dev/null || \
+               ip_in_cidr "$_EIP" "${subnet}.0/24" 2>/dev/null; then
                 log " SUBNET SKIP: $cidr overlaps whitelisted $_ENTRY"
                 return 0
             fi
@@ -5263,7 +5279,11 @@ ban_subnet() {
     fi
     # Already banned?
     iptables -C INPUT -s "$cidr" -m comment --comment "subnet-ban" -j DROP 2>/dev/null && return 0
-    iptables -I INPUT -s "$cidr" -m comment --comment "subnet-ban" -j DROP 2>/dev/null || true
+    # Record state only for a rule that actually landed (BUG-024 rule).
+    if ! iptables -I INPUT -s "$cidr" -m comment --comment "subnet-ban" -j DROP 2>/dev/null; then
+        log " SUBNET BAN FAILED: $cidr - iptables refused the rule; state NOT recorded"
+        return 1
+    fi
     echo "$cidr $(date +%s) $((BAN_HOURS * 3600))" >> "$BANNED_LIST"
     log " SUBNET BAN: $cidr | botnet distributed attack detected | unban: ${BAN_HOURS}h"
 }
@@ -5360,6 +5380,7 @@ self_guard() {
             iptables -D $_rule 2>/dev/null && \
                 log " SELF-GUARD: removed DROP rule hitting own IP $_sip"
         done < <(iptables -S INPUT 2>/dev/null | grep -E -- "-s ${_esc}(/32)?[[:space:]]" | grep -- '-j DROP' | sed 's/^-A /INPUT /')
+        state_del_ip "$BANNED_LIST" "$_sip"
     done
     # IPv6 self sweep (Wave 9): the same hard guarantee for v6
     local _sip6
@@ -5528,13 +5549,21 @@ while true; do
         # 'parent 1:' delete, and never a competing add — an added release
         # filter would out-prio the throttle band and permanently defeat
         # re-throttling of this IP, plus it would accumulate on the iface).
+        # R-2 (deep review 2026-10-23): release only once the
+        # reputation has genuinely recovered. A single quiet sample
+        # used to release the filter AND wipe the score
+        # (clear_reputation), so a pulsing source - hot 40s, quiet 3s -
+        # erased its history every cycle. Quiet recovery is the
+        # sweep's job now; the entry is left for it to finish.
+        _REL_SCORE=$(state_get_field "$SCORE_FILE" "$ip" 2)
+        _REL_SCORE="${_REL_SCORE//[^0-9]/}"; _REL_SCORE="${_REL_SCORE:-100}"
+        [ "$_REL_SCORE" -lt "$SCORE_THROTTLE" ] && continue
         _RELEASE_PRIO=$(state_get_field "$THROTTLE_LIST" "$ip" 2)
         [ -n "$_RELEASE_PRIO" ] && \
             tc filter del dev "$IF" parent 1: prio "$_RELEASE_PRIO" 2>/dev/null || true
         state_del_ip "$THROTTLE_LIST" "$ip"
         state_del_ip "$WATCH_LIST" "$ip"
-        clear_reputation "$ip"
-        log " AUTO-RELEASE: $ip (calmed down) → normal class (1:20)"
+        log " AUTO-RELEASE: $ip (calmed down, score $_REL_SCORE) → normal class (1:20)"
     done < "$THROTTLE_LIST" 2>/dev/null || true
 
     # ── Subnet /24 botnet detection ──────────────────────────
@@ -5658,13 +5687,29 @@ setup_tc() {
     tc qdisc show dev "$MAIN_IF" 2>/dev/null | head -1 > /etc/antiddos/tc-qdisc-before.txt || true
     tc qdisc del dev "$MAIN_IF" root 2>/dev/null || true
 
+    # R-21 (deep review 2026-10-23): HTB only shapes when its rates
+    # are the real bottleneck. The tree was hardcoded to 1 Gbit - on a
+    # 200 Mbit VPS the qdisc never engages and the "100 Mbit throttle"
+    # is fiction. Scale the tree to the detected link speed, keeping
+    # the designed ratios (default S/2, throttle S/10, hard S/20);
+    # at 1 Gbit the values are exactly the historical ones.
+    local LINK_MBPS=1000 _spd=""
+    _spd=$(cat "/sys/class/net/$MAIN_IF/speed" 2>/dev/null || echo "")
+    case "$_spd" in ''|*[!0-9]*) _spd="" ;; esac
+    if [ -n "$_spd" ] && [ "$_spd" -ge 50 ] && [ "$_spd" -lt 1000 ]; then
+        LINK_MBPS="$_spd"
+        info "tc: link speed ${LINK_MBPS}Mbps - shaping tree scaled to match"
+    fi
+    local R_ROOT="${LINK_MBPS}mbit" R_DEF="$(( LINK_MBPS / 2 ))mbit" \
+          R_SOFT="$(( LINK_MBPS / 10 ))mbit" R_HARD="$(( LINK_MBPS / 20 ))mbit"
+
     # HTB root — default class 1:20 (normal non-CF)
     tc qdisc add dev "$MAIN_IF" root handle 1: htb default 20
-    tc class add dev "$MAIN_IF" parent 1: classid 1:1  htb rate 1gbit ceil 1gbit
-    tc class add dev "$MAIN_IF" parent 1:1 classid 1:10 htb rate 1gbit  ceil 1gbit  burst 25Mb    # CF unlimited
-    tc class add dev "$MAIN_IF" parent 1:1 classid 1:20 htb rate 500mbit ceil 500mbit burst 6400Kb # normal
-    tc class add dev "$MAIN_IF" parent 1:1 classid 1:30 htb rate 100mbit ceil 100mbit burst 1280Kb # throttled
-    tc class add dev "$MAIN_IF" parent 1:1 classid 1:40 htb rate 50mbit  ceil 50mbit  burst 640Kb  # hard-throttled
+    tc class add dev "$MAIN_IF" parent 1: classid 1:1  htb rate $R_ROOT ceil $R_ROOT
+    tc class add dev "$MAIN_IF" parent 1:1 classid 1:10 htb rate $R_ROOT  ceil $R_ROOT  burst 25Mb    # CF unlimited
+    tc class add dev "$MAIN_IF" parent 1:1 classid 1:20 htb rate $R_DEF ceil $R_DEF burst 6400Kb # normal
+    tc class add dev "$MAIN_IF" parent 1:1 classid 1:30 htb rate $R_SOFT ceil $R_SOFT burst 1280Kb # throttled
+    tc class add dev "$MAIN_IF" parent 1:1 classid 1:40 htb rate $R_HARD  ceil $R_HARD  burst 640Kb  # hard-throttled
 
     # BUG-001 fix: this qdisc sits on EGRESS. A client's packets leave
     # TOWARDS the client, so the client is the DESTINATION. All filters
@@ -5709,7 +5754,7 @@ setup_tc() {
         warn "Tunneled (WARP) traffic egresses via the tunnel device and is NOT shaped; inbound anti-DDoS (iptables) still applies."
     fi
 
-    success "tc: CF=unlimited, others=500Mbps, throttled=100Mbps"
+    success "tc: CF=unlimited ($R_ROOT), others=$R_DEF, throttled=$R_SOFT, hard=$R_HARD"
 
     # Save to persistent script
     cat > /opt/proxy-manager/tc-setup.sh << 'TCEOF'
@@ -5770,12 +5815,25 @@ if [ -f /etc/antiddos/throttled.list ]; then
     while read -r TIP TPRIO TTS TBAND; do
         [ -z "$TIP" ] && continue
         TFLOW=1:30; [ "$TBAND" = "hard" ] && TFLOW=1:40
-        tc filter add dev "$IF" parent 1: protocol ip prio $TPRIO \
-            u32 match ip dst "$TIP/32" flowid $TFLOW 2>/dev/null || true
+        case "$TIP" in
+            *:*) tc filter add dev "$IF" parent 1: protocol ip6 prio $TPRIO \
+                     u32 match ip6 dst "$TIP" flowid $TFLOW 2>/dev/null || true ;;
+            *)   tc filter add dev "$IF" parent 1: protocol ip prio $TPRIO \
+                     u32 match ip dst "$TIP/32" flowid $TFLOW 2>/dev/null || true ;;
+        esac
     done < /etc/antiddos/throttled.list
 fi
 TCEOF
     chmod +x /opt/proxy-manager/tc-setup.sh
+    # R-21: the persistent script must use the same scaled rates.
+    if [ "$LINK_MBPS" -lt 1000 ]; then
+        sed -i -E \
+            -e "s/rate 1gbit[[:space:]]+ceil 1gbit/rate ${R_ROOT} ceil ${R_ROOT}/g" \
+            -e "s/rate 500mbit[[:space:]]+ceil 500mbit/rate ${R_DEF} ceil ${R_DEF}/g" \
+            -e "s/rate 100mbit[[:space:]]+ceil 100mbit/rate ${R_SOFT} ceil ${R_SOFT}/g" \
+            -e "s/rate 50mbit[[:space:]]+ceil 50mbit/rate ${R_HARD} ceil ${R_HARD}/g" \
+            /opt/proxy-manager/tc-setup.sh
+    fi
 
     # systemd service for tc persistence
     cat > /etc/systemd/system/tc-proxy-limit.service << EOF

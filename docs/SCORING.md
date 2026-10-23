@@ -56,6 +56,21 @@ SCORE: 203.0.113.7 | 87->74 (d-13) | churn=21.60/min sust=4.10/min syn=0.00/min 
 Any ban can be answered with *which* term, *how large*, over *what*
 window — from the daemon log alone.
 
+## Known limitations (by design, reviewed 2026-10-23)
+
+- **Turnover blindness.** The churn term derives the new-connection
+  rate from *concurrency deltas* between samples. A source holding a
+  perfectly steady concurrency with high turnover (open/close churn)
+  shows ~zero delta; it is then governed only by the sustained term,
+  the SYN-share term, and the kernel layers (SYN hashlimit, per-IP
+  connlimit, http_req_rate). True arrival counting needs conntrack
+  event tracking, whose per-cycle cost on a box under attack is
+  exactly what this daemon is designed to avoid.
+- **Top-100 sampler.** Each cycle scores the 100 heaviest talkers;
+  lighter sources are covered by subnet aggregation and kernel rules.
+- **One IP = one reputation.** Many humans behind a single NAT share
+  a score; the admin whitelist is the intended remedy.
+
 ## Verification
 
 `tests/unit/test-scoring-v2.sh` proves: continuity at the old 24/25

@@ -78,6 +78,13 @@ throttle_ip() {
 hard_throttle_ip() {
     local ip="$1"
     is_exempt "$ip" && return 0
+    # R-7 (deep review): already hard-throttled = nothing to do. The
+    # old code deleted + re-added the filter on EVERY scoring cycle -
+    # filter churn, a burned prio per cycle, log spam.
+    if state_has_ip "$THROTTLE_LIST" "$ip" && \
+        [ "$(state_get_field "$THROTTLE_LIST" "$ip" 4)" = "hard" ]; then
+        return 0
+    fi
     # Drop any earlier throttle entry for this IP so the tc filter list stays
     # consistent and no stale prio is left behind (its filter would still match).
     local _OLD
@@ -149,7 +156,14 @@ _throttle6() {  # <ip> <soft|hard>
     local ip="$1" band="${2:-soft}" flow="1:30"
     [ "$band" = "hard" ] && flow="1:40"
     is_exempt6 "$ip" && return 0
-    state_has_ip "$THROTTLE_LIST" "$ip" && return 0
+    # R-7: same-band = no-op; soft->hard upgrades by replacing the
+    # filter (the old blanket state check made v6 upgrades impossible).
+    if state_has_ip "$THROTTLE_LIST" "$ip"; then
+        [ "$(state_get_field "$THROTTLE_LIST" "$ip" 4)" = "$band" ] && return 0
+        local _op; _op=$(state_get_field "$THROTTLE_LIST" "$ip" 2)
+        [ -n "$_op" ] && tc filter del dev "$IF" parent 1: protocol ip6 prio "$_op" 2>/dev/null || true
+        state_del_ip "$THROTTLE_LIST" "$ip"
+    fi
     tc_class_exists "$flow" || flow="1:30"
     if ! tc_class_exists "$flow"; then
         log " THROTTLE SKIP (v6): $ip - no tc classes on $IF (autoban-only mode)"

@@ -29,7 +29,9 @@ ban_subnet() {
                 */*) _EIP="${_ENTRY%%/*}" ;;
                 *)   _EIP="$_ENTRY" ;;
             esac
-            if [ "$(echo "$_EIP" | grep -oP '^\d+\.\d+\.\d+' 2>/dev/null)" = "$subnet" ]; then
+            _ECIDR="$_ENTRY"; case "$_ECIDR" in */*) ;; *) _ECIDR="${_ECIDR}/32" ;; esac
+            if ip_in_cidr "${subnet}.0" "$_ECIDR" 2>/dev/null || \
+               ip_in_cidr "$_EIP" "${subnet}.0/24" 2>/dev/null; then
                 log " SUBNET SKIP: $cidr overlaps whitelisted $_ENTRY"
                 return 0
             fi
@@ -37,7 +39,11 @@ ban_subnet() {
     fi
     # Already banned?
     iptables -C INPUT -s "$cidr" -m comment --comment "subnet-ban" -j DROP 2>/dev/null && return 0
-    iptables -I INPUT -s "$cidr" -m comment --comment "subnet-ban" -j DROP 2>/dev/null || true
+    # Record state only for a rule that actually landed (BUG-024 rule).
+    if ! iptables -I INPUT -s "$cidr" -m comment --comment "subnet-ban" -j DROP 2>/dev/null; then
+        log " SUBNET BAN FAILED: $cidr - iptables refused the rule; state NOT recorded"
+        return 1
+    fi
     echo "$cidr $(date +%s) $((BAN_HOURS * 3600))" >> "$BANNED_LIST"
     log " SUBNET BAN: $cidr | botnet distributed attack detected | unban: ${BAN_HOURS}h"
 }

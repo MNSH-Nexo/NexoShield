@@ -13,13 +13,29 @@ setup_tc() {
     tc qdisc show dev "$MAIN_IF" 2>/dev/null | head -1 > /etc/antiddos/tc-qdisc-before.txt || true
     tc qdisc del dev "$MAIN_IF" root 2>/dev/null || true
 
+    # R-21 (deep review 2026-10-23): HTB only shapes when its rates
+    # are the real bottleneck. The tree was hardcoded to 1 Gbit - on a
+    # 200 Mbit VPS the qdisc never engages and the "100 Mbit throttle"
+    # is fiction. Scale the tree to the detected link speed, keeping
+    # the designed ratios (default S/2, throttle S/10, hard S/20);
+    # at 1 Gbit the values are exactly the historical ones.
+    local LINK_MBPS=1000 _spd=""
+    _spd=$(cat "/sys/class/net/$MAIN_IF/speed" 2>/dev/null || echo "")
+    case "$_spd" in ''|*[!0-9]*) _spd="" ;; esac
+    if [ -n "$_spd" ] && [ "$_spd" -ge 50 ] && [ "$_spd" -lt 1000 ]; then
+        LINK_MBPS="$_spd"
+        info "tc: link speed ${LINK_MBPS}Mbps - shaping tree scaled to match"
+    fi
+    local R_ROOT="${LINK_MBPS}mbit" R_DEF="$(( LINK_MBPS / 2 ))mbit" \
+          R_SOFT="$(( LINK_MBPS / 10 ))mbit" R_HARD="$(( LINK_MBPS / 20 ))mbit"
+
     # HTB root — default class 1:20 (normal non-CF)
     tc qdisc add dev "$MAIN_IF" root handle 1: htb default 20
-    tc class add dev "$MAIN_IF" parent 1: classid 1:1  htb rate 1gbit ceil 1gbit
-    tc class add dev "$MAIN_IF" parent 1:1 classid 1:10 htb rate 1gbit  ceil 1gbit  burst 25Mb    # CF unlimited
-    tc class add dev "$MAIN_IF" parent 1:1 classid 1:20 htb rate 500mbit ceil 500mbit burst 6400Kb # normal
-    tc class add dev "$MAIN_IF" parent 1:1 classid 1:30 htb rate 100mbit ceil 100mbit burst 1280Kb # throttled
-    tc class add dev "$MAIN_IF" parent 1:1 classid 1:40 htb rate 50mbit  ceil 50mbit  burst 640Kb  # hard-throttled
+    tc class add dev "$MAIN_IF" parent 1: classid 1:1  htb rate $R_ROOT ceil $R_ROOT
+    tc class add dev "$MAIN_IF" parent 1:1 classid 1:10 htb rate $R_ROOT  ceil $R_ROOT  burst 25Mb    # CF unlimited
+    tc class add dev "$MAIN_IF" parent 1:1 classid 1:20 htb rate $R_DEF ceil $R_DEF burst 6400Kb # normal
+    tc class add dev "$MAIN_IF" parent 1:1 classid 1:30 htb rate $R_SOFT ceil $R_SOFT burst 1280Kb # throttled
+    tc class add dev "$MAIN_IF" parent 1:1 classid 1:40 htb rate $R_HARD  ceil $R_HARD  burst 640Kb  # hard-throttled
 
     # BUG-001 fix: this qdisc sits on EGRESS. A client's packets leave
     # TOWARDS the client, so the client is the DESTINATION. All filters
@@ -64,7 +80,7 @@ setup_tc() {
         warn "Tunneled (WARP) traffic egresses via the tunnel device and is NOT shaped; inbound anti-DDoS (iptables) still applies."
     fi
 
-    success "tc: CF=unlimited, others=500Mbps, throttled=100Mbps"
+    success "tc: CF=unlimited ($R_ROOT), others=$R_DEF, throttled=$R_SOFT, hard=$R_HARD"
 
     # Save to persistent script
     cat > /opt/proxy-manager/tc-setup.sh << 'TCEOF'
@@ -112,12 +128,25 @@ if [ -f /etc/antiddos/throttled.list ]; then
     while read -r TIP TPRIO TTS TBAND; do
         [ -z "$TIP" ] && continue
         TFLOW=1:30; [ "$TBAND" = "hard" ] && TFLOW=1:40
-        tc filter add dev "$IF" parent 1: protocol ip prio $TPRIO \
-            u32 match ip dst "$TIP/32" flowid $TFLOW 2>/dev/null || true
+        case "$TIP" in
+            *:*) tc filter add dev "$IF" parent 1: protocol ip6 prio $TPRIO \
+                     u32 match ip6 dst "$TIP" flowid $TFLOW 2>/dev/null || true ;;
+            *)   tc filter add dev "$IF" parent 1: protocol ip prio $TPRIO \
+                     u32 match ip dst "$TIP/32" flowid $TFLOW 2>/dev/null || true ;;
+        esac
     done < /etc/antiddos/throttled.list
 fi
 TCEOF
     chmod +x /opt/proxy-manager/tc-setup.sh
+    # R-21: the persistent script must use the same scaled rates.
+    if [ "$LINK_MBPS" -lt 1000 ]; then
+        sed -i -E \
+            -e "s/rate 1gbit[[:space:]]+ceil 1gbit/rate ${R_ROOT} ceil ${R_ROOT}/g" \
+            -e "s/rate 500mbit[[:space:]]+ceil 500mbit/rate ${R_DEF} ceil ${R_DEF}/g" \
+            -e "s/rate 100mbit[[:space:]]+ceil 100mbit/rate ${R_SOFT} ceil ${R_SOFT}/g" \
+            -e "s/rate 50mbit[[:space:]]+ceil 50mbit/rate ${R_HARD} ceil ${R_HARD}/g" \
+            /opt/proxy-manager/tc-setup.sh
+    fi
 
     # systemd service for tc persistence
     cat > /etc/systemd/system/tc-proxy-limit.service << EOF
