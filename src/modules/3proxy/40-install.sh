@@ -11,13 +11,21 @@ install_proxy() {
         # slow one. Probe is quick (timeout on the test only); the install
         # itself below is NEVER time-limited. If no mirror responds, keep the
         # system's existing apt sources.
+        # BUG-016: rewriting the system's apt sources is OPT-IN
+        # (NX_APT_MIRROR=1). It used to happen silently on every install
+        # - including pointing a production box at third-party mirrors
+        # over plain HTTP.
         MIRROR=""
-        [ -n "$CODENAME" ] && MIRROR=$(pick_apt_mirror "$OS" "$CODENAME")
-        if [ -n "$MIRROR" ]; then
-            info "Using apt mirror: $MIRROR"
-            configure_apt_mirror "$OS" "$CODENAME" "$MIRROR"
+        if [ "${NX_APT_MIRROR:-0}" = "1" ]; then
+            [ -n "$CODENAME" ] && MIRROR=$(pick_apt_mirror "$OS" "$CODENAME")
+            if [ -n "$MIRROR" ]; then
+                info "Using apt mirror: $MIRROR"
+                configure_apt_mirror "$OS" "$CODENAME" "$MIRROR"
+            else
+                info "No faster mirror reachable - using system apt sources"
+            fi
         else
-            info "No faster mirror reachable - using system apt sources"
+            info "Using system apt sources (set NX_APT_MIRROR=1 to auto-pick a fast mirror)"
         fi
         run_spinner "Updating package lists" apt-get update -y || true
         run_spinner "Installing dependencies" apt-get install -y \
@@ -27,7 +35,9 @@ install_proxy() {
     elif [[ "$OS" == "centos" || "$OS" == "rhel" || \
             "$OS" == "rocky" || "$OS" == "almalinux" || \
             "$OS" == "fedora" ]]; then
-        run_spinner "Installing dependencies" yum install -y \
+        # BUG-044: yum is a dead stub on RHEL 9+/Fedora - prefer dnf.
+        RH_PKG=$(command -v dnf 2>/dev/null || command -v yum 2>/dev/null || echo yum)
+        run_spinner "Installing dependencies" "$RH_PKG" install -y \
             wget curl iptables iproute logrotate gcc make iproute-tc tcpdump || {
             echo -e "${YELLOW}Some packages failed, continuing...${NC}"
         }
@@ -86,6 +96,12 @@ install_proxy() {
         TRIED=$((TRIED + 1))
         echo -e "Trying: ${CYAN}$PORT${NC}"
     done
+    # BUG-061: fail fast - the loop used to give up after 20 tries and
+    # still write a config bound to an occupied port.
+    if ss -tuln 2>/dev/null | grep -qE ":$PORT\\b"; then
+        echo -e "${RED}No free port found after 20 attempts (last tried: $PORT). Aborting - nothing was written.${NC}" >&2
+        return 1
+    fi
 
     echo -e "${YELLOW}[4/7] Security settings...${NC}"
     read -t 30 -rp "Max connections per IP (default: 20): " MAX_CONN < /dev/tty 2>/dev/null || MAX_CONN=""
@@ -100,17 +116,43 @@ install_proxy() {
     CONN_TIMEOUT=${CONN_TIMEOUT:-60}
     [[ "$CONN_TIMEOUT" =~ ^[0-9]+$ ]] || CONN_TIMEOUT=60
 
-    PROXY_USER=$(tr -dc 'a-z' </dev/urandom 2>/dev/null | head -c 8 || echo "proxyuser")
-    PROXY_PASS=$(tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c 16)
+    # BUG-026: an update/reinstall must NOT rotate the proxy
+    # credentials - every existing client would break. Preserve them;
+    # rotation is the explicit --change-pass action.
+    PROXY_USER=""; PROXY_PASS=""
+    if [ -f "$PROXY_USERS" ]; then
+        PROXY_USER=$(grep -oP '(?<=^users )\S+(?=:CL:)' "$PROXY_USERS" 2>/dev/null | head -1 || true)
+        PROXY_PASS=$(grep -oP '(?<=:CL:)\S+' "$PROXY_USERS" 2>/dev/null | head -1 || true)
+        if [ -n "$PROXY_USER" ] && [ -n "$PROXY_PASS" ]; then
+            echo -e "${GREEN}Existing proxy credentials preserved (rotate with --change-pass).${NC}"
+        else
+            PROXY_USER=""; PROXY_PASS=""
+        fi
+    fi
     if [ -z "$PROXY_PASS" ]; then
-        echo -e "${RED}Failed to generate a secure proxy password (/dev/urandom unavailable). Aborting install.${NC}" >&2
-        return 1
+        PROXY_USER=$(tr -dc 'a-z' </dev/urandom 2>/dev/null | head -c 8 || echo "proxyuser")
+        PROXY_PASS=$(tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c 16)
+        if [ -z "$PROXY_PASS" ]; then
+            echo -e "${RED}Failed to generate a secure proxy password (/dev/urandom unavailable). Aborting install.${NC}" >&2
+            return 1
+        fi
     fi
 
     mkdir -p /etc/3proxy "$PROXY_LOG_DIR"
+    # BUG-018: the proxy runs as a dedicated unprivileged user (it was
+    # User=root with proxy credentials and binding logic - any 3proxy
+    # exploit was instant root).
+    if ! id nexoproxy >/dev/null 2>&1; then
+        useradd --system --no-create-home --shell /usr/sbin/nologin nexoproxy 2>/dev/null || \
+            useradd --system --no-create-home --shell /bin/false nexoproxy 2>/dev/null || true
+    fi
+    chown nexoproxy:nexoproxy "$PROXY_LOG_DIR" 2>/dev/null || true
     chmod 750 "$PROXY_LOG_DIR"
+    chgrp nexoproxy /etc/3proxy 2>/dev/null || true
+    chmod 750 /etc/3proxy
     echo "users $PROXY_USER:CL:$PROXY_PASS" > "$PROXY_USERS"
-    chmod 600 "$PROXY_USERS"
+    chgrp nexoproxy "$PROXY_USERS" 2>/dev/null || true
+    chmod 640 "$PROXY_USERS"
 
     echo -e "${YELLOW}[5/7] Writing config...${NC}"
     cat > "$PROXY_CONF" << EOF
@@ -127,6 +169,7 @@ timeouts 1 5 30 $CONN_TIMEOUT 180 1800 15 60
 maxconn $MAX_TOTAL_CONN
 # Block private ranges (prevent SSRF)
 deny * * 127.0.0.0/8
+deny * * 0.0.0.0/8
 deny * * 10.0.0.0/8
 deny * * 172.16.0.0/12
 deny * * 192.168.0.0/16
@@ -136,7 +179,8 @@ auth strong
 allow $PROXY_USER
 socks -p$PORT -i0.0.0.0 -e0.0.0.0 -n$MAX_CONN
 EOF
-    chmod 600 "$PROXY_CONF"
+    chgrp nexoproxy "$PROXY_CONF" 2>/dev/null || true
+    chmod 640 "$PROXY_CONF"
 
     cat > "$SERVICE_FILE" << EOF
 [Unit]
@@ -144,7 +188,16 @@ Description=3proxy SOCKS5 Proxy Server
 After=network.target
 [Service]
 Type=simple
-User=root
+User=nexoproxy
+Group=nexoproxy
+# Low ports are not needed (default 1080); kept for custom port < 1024.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=$PROXY_LOG_DIR
+ProtectHome=true
 LimitNOFILE=65535
 LimitNPROC=65535
 ExecStart=$PROXY_BIN $PROXY_CONF

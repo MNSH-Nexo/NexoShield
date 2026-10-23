@@ -11,15 +11,19 @@ uninstall_proxy() {
     # Also stop any apt-installed 3proxy
     systemctl stop    3proxy.service 2>/dev/null || true
 
-    # ── Stop & disable autoban ────────────────────────────
-    systemctl stop    auto-ban  2>/dev/null || true
-    systemctl disable auto-ban  2>/dev/null || true
-    systemctl stop    auto-ban.service 2>/dev/null || true
-    pkill -f "auto-ban.sh" 2>/dev/null || true
+    # BUG-037: the auto-ban daemon belongs to the Anti-DDoS module, NOT
+    # to 3proxy. It is not stopped, killed or removed here - uninstall
+    # Anti-DDoS separately (antiddos.sh --remove) if you want it gone.
 
     # ── Stop & disable tc service ─────────────────────────
-    systemctl stop    tc-proxy-limit  2>/dev/null || true
-    systemctl disable tc-proxy-limit  2>/dev/null || true
+    # The tc setup is shared with Anti-DDoS; only remove it when the
+    # Anti-DDoS module is not installed (BUG-015).
+    if [ ! -f /etc/antiddos/state.conf ]; then
+        systemctl stop    tc-proxy-limit  2>/dev/null || true
+        systemctl disable tc-proxy-limit  2>/dev/null || true
+    else
+        echo -e "${CYAN}Anti-DDoS is installed - leaving shared tc setup in place.${NC}"
+    fi
 
     # ── Detect port before removing config ────────────────
     PORT=$(get_current_port 2>/dev/null || true)
@@ -92,12 +96,14 @@ uninstall_proxy() {
     done
 
     # ── Remove tc bandwidth shaping ───────────────────────
-    MAIN_IF=$(ip route show default 2>/dev/null | awk '/default/{print $5}' | head -1)
-    MAIN_IF=${MAIN_IF:-eth0}
-    tc qdisc del dev "$MAIN_IF" root 2>/dev/null || true
-    rm -f /etc/systemd/system/tc-proxy-limit.service
-    rm -f /etc/network/if-up.d/tc-proxy-limit
-    rm -f /opt/proxy-manager/tc-setup.sh
+    if [ ! -f /etc/antiddos/state.conf ]; then
+        MAIN_IF=$(ip route show default 2>/dev/null | awk '/default/{print $5}' | head -1)
+        MAIN_IF=${MAIN_IF:-eth0}
+        tc qdisc del dev "$MAIN_IF" root 2>/dev/null || true
+        rm -f /etc/systemd/system/tc-proxy-limit.service
+        rm -f /etc/network/if-up.d/tc-proxy-limit
+        rm -f /opt/proxy-manager/tc-setup.sh
+    fi
 
     # ── Remove fail2ban jails for 3proxy ─────────────────
     rm -f /etc/fail2ban/jail.d/3proxy-ddos.conf   2>/dev/null || true
@@ -106,14 +112,23 @@ uninstall_proxy() {
     rm -f /etc/fail2ban/filter.d/3proxy.conf      2>/dev/null || true
     command -v fail2ban-client >/dev/null 2>&1 && {
         fail2ban-client stop  3proxy-ddos 2>/dev/null || true
-        fail2ban-client unban --all       2>/dev/null || true
+        # BUG-060: NO "unban --all" here - it released EVERY fail2ban
+        # ban on the box (sshd brute-forcers included), not just ours.
         systemctl reload fail2ban 2>/dev/null || true
     }
 
+    # ── Restore apt sources if the mirror was opted into (BUG-016) ──
+    if [ -f /etc/apt/sources.list.bak ]; then
+        mv /etc/apt/sources.list.bak /etc/apt/sources.list 2>/dev/null || true
+        for _bak in /etc/apt/sources.list.d/*.bak; do
+            [ -e "$_bak" ] && mv "$_bak" "${_bak%.bak}" 2>/dev/null || true
+        done
+        echo -e "${GREEN}Original apt sources restored from backup.${NC}"
+    fi
+
     # ── Remove systemd service files ─────────────────────
     rm -f "$SERVICE_FILE"
-    rm -f /etc/systemd/system/auto-ban.service
-    rm -f /etc/systemd/system/tc-proxy-limit.service
+    [ -f /etc/antiddos/state.conf ] || rm -f /etc/systemd/system/tc-proxy-limit.service
 
     # ── Remove binary ─────────────────────────────────────
     # Only remove our binary — don't touch apt-installed one if it differs
@@ -127,10 +142,11 @@ uninstall_proxy() {
     rm -rf /etc/3proxy
     rm -rf "$PROXY_LOG_DIR"
     rm -f  /etc/logrotate.d/3proxy
-    rm -rf /etc/antiddos
-    rm -rf /var/lib/antiddos
-    rm -f  /var/log/antiddos.log
-    rm -f  /tmp/autoban_watch /tmp/autoban_throttle /tmp/autoban_banned 2>/dev/null || true
+    # BUG-015: /etc/antiddos, /var/lib/antiddos, the daemon log and its
+    # state files belong to the Anti-DDoS module and are NOT touched.
+    # Remove the nexoproxy user only if nothing else uses it.
+    id nexoproxy >/dev/null 2>&1 && \
+        userdel nexoproxy 2>/dev/null || true
 
     # ── Reload systemd ────────────────────────────────────
     systemctl daemon-reload 2>/dev/null || true

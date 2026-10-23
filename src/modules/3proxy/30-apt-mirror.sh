@@ -33,14 +33,14 @@ pick_apt_mirror() {
     local os="$1" code="$2"
     local -a cands=()
     if [ "$os" = ubuntu ]; then
-        cands=( "http://archive.ubuntu.com/ubuntu" "http://mirrors.aliyun.com/ubuntu" \
-                "https://mirrors.tuna.tsinghua.edu.cn/ubuntu" "http://mirrors.ustc.edu.cn/ubuntu" \
-                "http://mirrors.cloud.aliyuncs.com/ubuntu" "https://mirrors.huaweicloud.com/ubuntu" \
-                "http://mirrors.zju.edu.cn/ubuntu" )
+        cands=( "https://archive.ubuntu.com/ubuntu" "https://mirrors.aliyun.com/ubuntu" \
+                "https://mirrors.tuna.tsinghua.edu.cn/ubuntu" "https://mirrors.ustc.edu.cn/ubuntu" \
+                "https://mirrors.cloud.aliyuncs.com/ubuntu" "https://mirrors.huaweicloud.com/ubuntu" \
+                "https://mirrors.zju.edu.cn/ubuntu" )
     else
-        cands=( "http://deb.debian.org/debian" "http://mirrors.aliyun.com/debian" \
-                "https://mirrors.tuna.tsinghua.edu.cn/debian" "http://mirrors.ustc.edu.cn/debian" \
-                "https://mirrors.huaweicloud.com/debian" "http://mirrors.cloud.aliyuncs.com/debian" )
+        cands=( "https://deb.debian.org/debian" "https://mirrors.aliyun.com/debian" \
+                "https://mirrors.tuna.tsinghua.edu.cn/debian" "https://mirrors.ustc.edu.cn/debian" \
+                "https://mirrors.huaweicloud.com/debian" "https://mirrors.cloud.aliyuncs.com/debian" )
     fi
     local best="" best_ms=99999 m t0 ms
     for m in "${cands[@]}"; do

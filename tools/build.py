@@ -124,7 +124,11 @@ def build():
             parts.append(BANNER)
             parts.append(f"# {title}")
             parts.append(BANNER)
-        parts.append(f'cat > "$INSTALL_DIR/{filename}" << \'{delim}\'')
+        # BUG-025: write to a staging name; the outro verifies every
+        # staged script (bash -n), backs up the previous versions and
+        # only then swaps them into place - an interrupted or truncated
+        # write can no longer leave a half-written live install.
+        parts.append(f'cat > "$INSTALL_DIR/.{filename}.nxnew" << \'{delim}\'')
         body = assemble_module(filename)
         if filename == "antiddos.sh":
             assert "@@AUTOBAN_BODY@@" in body

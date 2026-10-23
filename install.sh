@@ -832,7 +832,7 @@ info "Creating files..."
 # ══════════════════════════════════════════════════════════
 # File 1: 3proxy-socks5.sh
 # ══════════════════════════════════════════════════════════
-cat > "$INSTALL_DIR/3proxy-socks5.sh" << 'PROXY_SCRIPT'
+cat > "$INSTALL_DIR/.3proxy-socks5.sh.nxnew" << 'PROXY_SCRIPT'
 #!/bin/bash
 # ============================================================
 #  3proxy SOCKS5 Manager
@@ -1194,14 +1194,14 @@ pick_apt_mirror() {
     local os="$1" code="$2"
     local -a cands=()
     if [ "$os" = ubuntu ]; then
-        cands=( "http://archive.ubuntu.com/ubuntu" "http://mirrors.aliyun.com/ubuntu" \
-                "https://mirrors.tuna.tsinghua.edu.cn/ubuntu" "http://mirrors.ustc.edu.cn/ubuntu" \
-                "http://mirrors.cloud.aliyuncs.com/ubuntu" "https://mirrors.huaweicloud.com/ubuntu" \
-                "http://mirrors.zju.edu.cn/ubuntu" )
+        cands=( "https://archive.ubuntu.com/ubuntu" "https://mirrors.aliyun.com/ubuntu" \
+                "https://mirrors.tuna.tsinghua.edu.cn/ubuntu" "https://mirrors.ustc.edu.cn/ubuntu" \
+                "https://mirrors.cloud.aliyuncs.com/ubuntu" "https://mirrors.huaweicloud.com/ubuntu" \
+                "https://mirrors.zju.edu.cn/ubuntu" )
     else
-        cands=( "http://deb.debian.org/debian" "http://mirrors.aliyun.com/debian" \
-                "https://mirrors.tuna.tsinghua.edu.cn/debian" "http://mirrors.ustc.edu.cn/debian" \
-                "https://mirrors.huaweicloud.com/debian" "http://mirrors.cloud.aliyuncs.com/debian" )
+        cands=( "https://deb.debian.org/debian" "https://mirrors.aliyun.com/debian" \
+                "https://mirrors.tuna.tsinghua.edu.cn/debian" "https://mirrors.ustc.edu.cn/debian" \
+                "https://mirrors.huaweicloud.com/debian" "https://mirrors.cloud.aliyuncs.com/debian" )
     fi
     local best="" best_ms=99999 m t0 ms
     for m in "${cands[@]}"; do
@@ -1243,13 +1243,21 @@ install_proxy() {
         # slow one. Probe is quick (timeout on the test only); the install
         # itself below is NEVER time-limited. If no mirror responds, keep the
         # system's existing apt sources.
+        # BUG-016: rewriting the system's apt sources is OPT-IN
+        # (NX_APT_MIRROR=1). It used to happen silently on every install
+        # - including pointing a production box at third-party mirrors
+        # over plain HTTP.
         MIRROR=""
-        [ -n "$CODENAME" ] && MIRROR=$(pick_apt_mirror "$OS" "$CODENAME")
-        if [ -n "$MIRROR" ]; then
-            info "Using apt mirror: $MIRROR"
-            configure_apt_mirror "$OS" "$CODENAME" "$MIRROR"
+        if [ "${NX_APT_MIRROR:-0}" = "1" ]; then
+            [ -n "$CODENAME" ] && MIRROR=$(pick_apt_mirror "$OS" "$CODENAME")
+            if [ -n "$MIRROR" ]; then
+                info "Using apt mirror: $MIRROR"
+                configure_apt_mirror "$OS" "$CODENAME" "$MIRROR"
+            else
+                info "No faster mirror reachable - using system apt sources"
+            fi
         else
-            info "No faster mirror reachable - using system apt sources"
+            info "Using system apt sources (set NX_APT_MIRROR=1 to auto-pick a fast mirror)"
         fi
         run_spinner "Updating package lists" apt-get update -y || true
         run_spinner "Installing dependencies" apt-get install -y \
@@ -1259,7 +1267,9 @@ install_proxy() {
     elif [[ "$OS" == "centos" || "$OS" == "rhel" || \
             "$OS" == "rocky" || "$OS" == "almalinux" || \
             "$OS" == "fedora" ]]; then
-        run_spinner "Installing dependencies" yum install -y \
+        # BUG-044: yum is a dead stub on RHEL 9+/Fedora - prefer dnf.
+        RH_PKG=$(command -v dnf 2>/dev/null || command -v yum 2>/dev/null || echo yum)
+        run_spinner "Installing dependencies" "$RH_PKG" install -y \
             wget curl iptables iproute logrotate gcc make iproute-tc tcpdump || {
             echo -e "${YELLOW}Some packages failed, continuing...${NC}"
         }
@@ -1318,6 +1328,12 @@ install_proxy() {
         TRIED=$((TRIED + 1))
         echo -e "Trying: ${CYAN}$PORT${NC}"
     done
+    # BUG-061: fail fast - the loop used to give up after 20 tries and
+    # still write a config bound to an occupied port.
+    if ss -tuln 2>/dev/null | grep -qE ":$PORT\\b"; then
+        echo -e "${RED}No free port found after 20 attempts (last tried: $PORT). Aborting - nothing was written.${NC}" >&2
+        return 1
+    fi
 
     echo -e "${YELLOW}[4/7] Security settings...${NC}"
     read -t 30 -rp "Max connections per IP (default: 20): " MAX_CONN < /dev/tty 2>/dev/null || MAX_CONN=""
@@ -1332,17 +1348,43 @@ install_proxy() {
     CONN_TIMEOUT=${CONN_TIMEOUT:-60}
     [[ "$CONN_TIMEOUT" =~ ^[0-9]+$ ]] || CONN_TIMEOUT=60
 
-    PROXY_USER=$(tr -dc 'a-z' </dev/urandom 2>/dev/null | head -c 8 || echo "proxyuser")
-    PROXY_PASS=$(tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c 16)
+    # BUG-026: an update/reinstall must NOT rotate the proxy
+    # credentials - every existing client would break. Preserve them;
+    # rotation is the explicit --change-pass action.
+    PROXY_USER=""; PROXY_PASS=""
+    if [ -f "$PROXY_USERS" ]; then
+        PROXY_USER=$(grep -oP '(?<=^users )\S+(?=:CL:)' "$PROXY_USERS" 2>/dev/null | head -1 || true)
+        PROXY_PASS=$(grep -oP '(?<=:CL:)\S+' "$PROXY_USERS" 2>/dev/null | head -1 || true)
+        if [ -n "$PROXY_USER" ] && [ -n "$PROXY_PASS" ]; then
+            echo -e "${GREEN}Existing proxy credentials preserved (rotate with --change-pass).${NC}"
+        else
+            PROXY_USER=""; PROXY_PASS=""
+        fi
+    fi
     if [ -z "$PROXY_PASS" ]; then
-        echo -e "${RED}Failed to generate a secure proxy password (/dev/urandom unavailable). Aborting install.${NC}" >&2
-        return 1
+        PROXY_USER=$(tr -dc 'a-z' </dev/urandom 2>/dev/null | head -c 8 || echo "proxyuser")
+        PROXY_PASS=$(tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c 16)
+        if [ -z "$PROXY_PASS" ]; then
+            echo -e "${RED}Failed to generate a secure proxy password (/dev/urandom unavailable). Aborting install.${NC}" >&2
+            return 1
+        fi
     fi
 
     mkdir -p /etc/3proxy "$PROXY_LOG_DIR"
+    # BUG-018: the proxy runs as a dedicated unprivileged user (it was
+    # User=root with proxy credentials and binding logic - any 3proxy
+    # exploit was instant root).
+    if ! id nexoproxy >/dev/null 2>&1; then
+        useradd --system --no-create-home --shell /usr/sbin/nologin nexoproxy 2>/dev/null || \
+            useradd --system --no-create-home --shell /bin/false nexoproxy 2>/dev/null || true
+    fi
+    chown nexoproxy:nexoproxy "$PROXY_LOG_DIR" 2>/dev/null || true
     chmod 750 "$PROXY_LOG_DIR"
+    chgrp nexoproxy /etc/3proxy 2>/dev/null || true
+    chmod 750 /etc/3proxy
     echo "users $PROXY_USER:CL:$PROXY_PASS" > "$PROXY_USERS"
-    chmod 600 "$PROXY_USERS"
+    chgrp nexoproxy "$PROXY_USERS" 2>/dev/null || true
+    chmod 640 "$PROXY_USERS"
 
     echo -e "${YELLOW}[5/7] Writing config...${NC}"
     cat > "$PROXY_CONF" << EOF
@@ -1359,6 +1401,7 @@ timeouts 1 5 30 $CONN_TIMEOUT 180 1800 15 60
 maxconn $MAX_TOTAL_CONN
 # Block private ranges (prevent SSRF)
 deny * * 127.0.0.0/8
+deny * * 0.0.0.0/8
 deny * * 10.0.0.0/8
 deny * * 172.16.0.0/12
 deny * * 192.168.0.0/16
@@ -1368,7 +1411,8 @@ auth strong
 allow $PROXY_USER
 socks -p$PORT -i0.0.0.0 -e0.0.0.0 -n$MAX_CONN
 EOF
-    chmod 600 "$PROXY_CONF"
+    chgrp nexoproxy "$PROXY_CONF" 2>/dev/null || true
+    chmod 640 "$PROXY_CONF"
 
     cat > "$SERVICE_FILE" << EOF
 [Unit]
@@ -1376,7 +1420,16 @@ Description=3proxy SOCKS5 Proxy Server
 After=network.target
 [Service]
 Type=simple
-User=root
+User=nexoproxy
+Group=nexoproxy
+# Low ports are not needed (default 1080); kept for custom port < 1024.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=$PROXY_LOG_DIR
+ProtectHome=true
 LimitNOFILE=65535
 LimitNPROC=65535
 ExecStart=$PROXY_BIN $PROXY_CONF
@@ -1473,15 +1526,19 @@ uninstall_proxy() {
     # Also stop any apt-installed 3proxy
     systemctl stop    3proxy.service 2>/dev/null || true
 
-    # ── Stop & disable autoban ────────────────────────────
-    systemctl stop    auto-ban  2>/dev/null || true
-    systemctl disable auto-ban  2>/dev/null || true
-    systemctl stop    auto-ban.service 2>/dev/null || true
-    pkill -f "auto-ban.sh" 2>/dev/null || true
+    # BUG-037: the auto-ban daemon belongs to the Anti-DDoS module, NOT
+    # to 3proxy. It is not stopped, killed or removed here - uninstall
+    # Anti-DDoS separately (antiddos.sh --remove) if you want it gone.
 
     # ── Stop & disable tc service ─────────────────────────
-    systemctl stop    tc-proxy-limit  2>/dev/null || true
-    systemctl disable tc-proxy-limit  2>/dev/null || true
+    # The tc setup is shared with Anti-DDoS; only remove it when the
+    # Anti-DDoS module is not installed (BUG-015).
+    if [ ! -f /etc/antiddos/state.conf ]; then
+        systemctl stop    tc-proxy-limit  2>/dev/null || true
+        systemctl disable tc-proxy-limit  2>/dev/null || true
+    else
+        echo -e "${CYAN}Anti-DDoS is installed - leaving shared tc setup in place.${NC}"
+    fi
 
     # ── Detect port before removing config ────────────────
     PORT=$(get_current_port 2>/dev/null || true)
@@ -1554,12 +1611,14 @@ uninstall_proxy() {
     done
 
     # ── Remove tc bandwidth shaping ───────────────────────
-    MAIN_IF=$(ip route show default 2>/dev/null | awk '/default/{print $5}' | head -1)
-    MAIN_IF=${MAIN_IF:-eth0}
-    tc qdisc del dev "$MAIN_IF" root 2>/dev/null || true
-    rm -f /etc/systemd/system/tc-proxy-limit.service
-    rm -f /etc/network/if-up.d/tc-proxy-limit
-    rm -f /opt/proxy-manager/tc-setup.sh
+    if [ ! -f /etc/antiddos/state.conf ]; then
+        MAIN_IF=$(ip route show default 2>/dev/null | awk '/default/{print $5}' | head -1)
+        MAIN_IF=${MAIN_IF:-eth0}
+        tc qdisc del dev "$MAIN_IF" root 2>/dev/null || true
+        rm -f /etc/systemd/system/tc-proxy-limit.service
+        rm -f /etc/network/if-up.d/tc-proxy-limit
+        rm -f /opt/proxy-manager/tc-setup.sh
+    fi
 
     # ── Remove fail2ban jails for 3proxy ─────────────────
     rm -f /etc/fail2ban/jail.d/3proxy-ddos.conf   2>/dev/null || true
@@ -1568,14 +1627,23 @@ uninstall_proxy() {
     rm -f /etc/fail2ban/filter.d/3proxy.conf      2>/dev/null || true
     command -v fail2ban-client >/dev/null 2>&1 && {
         fail2ban-client stop  3proxy-ddos 2>/dev/null || true
-        fail2ban-client unban --all       2>/dev/null || true
+        # BUG-060: NO "unban --all" here - it released EVERY fail2ban
+        # ban on the box (sshd brute-forcers included), not just ours.
         systemctl reload fail2ban 2>/dev/null || true
     }
 
+    # ── Restore apt sources if the mirror was opted into (BUG-016) ──
+    if [ -f /etc/apt/sources.list.bak ]; then
+        mv /etc/apt/sources.list.bak /etc/apt/sources.list 2>/dev/null || true
+        for _bak in /etc/apt/sources.list.d/*.bak; do
+            [ -e "$_bak" ] && mv "$_bak" "${_bak%.bak}" 2>/dev/null || true
+        done
+        echo -e "${GREEN}Original apt sources restored from backup.${NC}"
+    fi
+
     # ── Remove systemd service files ─────────────────────
     rm -f "$SERVICE_FILE"
-    rm -f /etc/systemd/system/auto-ban.service
-    rm -f /etc/systemd/system/tc-proxy-limit.service
+    [ -f /etc/antiddos/state.conf ] || rm -f /etc/systemd/system/tc-proxy-limit.service
 
     # ── Remove binary ─────────────────────────────────────
     # Only remove our binary — don't touch apt-installed one if it differs
@@ -1589,10 +1657,11 @@ uninstall_proxy() {
     rm -rf /etc/3proxy
     rm -rf "$PROXY_LOG_DIR"
     rm -f  /etc/logrotate.d/3proxy
-    rm -rf /etc/antiddos
-    rm -rf /var/lib/antiddos
-    rm -f  /var/log/antiddos.log
-    rm -f  /tmp/autoban_watch /tmp/autoban_throttle /tmp/autoban_banned 2>/dev/null || true
+    # BUG-015: /etc/antiddos, /var/lib/antiddos, the daemon log and its
+    # state files belong to the Anti-DDoS module and are NOT touched.
+    # Remove the nexoproxy user only if nothing else uses it.
+    id nexoproxy >/dev/null 2>&1 && \
+        userdel nexoproxy 2>/dev/null || true
 
     # ── Reload systemd ────────────────────────────────────
     systemctl daemon-reload 2>/dev/null || true
@@ -1613,11 +1682,10 @@ show_info() {
     _INFO_PASS=$(grep '^PASS=' /etc/3proxy/install.info 2>/dev/null | cut -d= -f2- || echo "?")
     _INFO_PORT=$(grep '^PORT=' /etc/3proxy/install.info 2>/dev/null | cut -d= -f2- || echo "?")
     SERVER_IP=$(get_server_ip)
-    SERVER_IPV6=$(get_server_ipv6)
     sep
     echo -e "  ${CYAN}Connection info:${NC}"; sep
     echo -e "  socks5://${_INFO_USER:-?}:${_INFO_PASS:-?}@$SERVER_IP:${_INFO_PORT:-?}"
-    [ -n "$SERVER_IPV6" ] && echo -e "  socks5://${_INFO_USER:-?}:${_INFO_PASS:-?}@[$SERVER_IPV6]:${_INFO_PORT:-?}"
+    # (No IPv6 form: 3proxy binds 0.0.0.0 only - BUG-059.)
     sep
 }
 
@@ -1750,7 +1818,7 @@ PROXY_SCRIPT
 # ══════════════════════════════════════════════════════════
 # File 2: optimize-sysctl.sh
 # ══════════════════════════════════════════════════════════
-cat > "$INSTALL_DIR/optimize-sysctl.sh" << 'SYSCTL_SCRIPT'
+cat > "$INSTALL_DIR/.optimize-sysctl.sh.nxnew" << 'SYSCTL_SCRIPT'
 #!/bin/bash
 set -uo pipefail
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -2291,7 +2359,7 @@ SYSCTL_SCRIPT
 # ══════════════════════════════════════════════════════════
 # File 3: proxy-menu.sh (main menu)
 # ══════════════════════════════════════════════════════════
-cat > "$INSTALL_DIR/proxy-menu.sh" << 'MENU_SCRIPT'
+cat > "$INSTALL_DIR/.proxy-menu.sh.nxnew" << 'MENU_SCRIPT'
 #!/bin/bash
 VERSION="3.4.12"
 INSTALL_DIR="/opt/proxy-manager"
@@ -3264,7 +3332,7 @@ MENU_SCRIPT
 # ══════════════════════════════════════════════════════════
 # File 4: antiddos.sh
 # ══════════════════════════════════════════════════════════
-cat > "$INSTALL_DIR/antiddos.sh" << 'ANTIDDOS_SCRIPT'
+cat > "$INSTALL_DIR/.antiddos.sh.nxnew" << 'ANTIDDOS_SCRIPT'
 #!/bin/bash
 # ============================================================
 #  Anti-DDoS Protection Manager v3.4.12
@@ -4097,7 +4165,7 @@ setup_autoban() {
         fi
     fi
 
-    cat > "$AUTOBAN_SCRIPT" << 'AUTOBAN_EOF'
+    cat > "$AUTOBAN_SCRIPT.nxnew" << 'AUTOBAN_EOF'
 #!/bin/bash
 # ============================================================
 #  Smart Throttle+Ban — Anti-DDoS Layer 4
@@ -5044,6 +5112,14 @@ while true; do
 done
 AUTOBAN_EOF
 
+    # Staged activation (BUG-025): never truncate the live daemon script
+    if ! bash -n "$AUTOBAN_SCRIPT.nxnew" 2>/dev/null; then
+        rm -f "$AUTOBAN_SCRIPT.nxnew"
+        error "generated auto-ban script failed its syntax check - keeping the previous one"
+        return 1
+    fi
+    [ -f "$AUTOBAN_SCRIPT" ] && cp -a "$AUTOBAN_SCRIPT" "$AUTOBAN_SCRIPT.prev" 2>/dev/null || true
+    mv "$AUTOBAN_SCRIPT.nxnew" "$AUTOBAN_SCRIPT"
     chmod +x "$AUTOBAN_SCRIPT"
 
     # Create systemd service
@@ -5832,6 +5908,24 @@ while true; do
     esac
 done
 ANTIDDOS_SCRIPT
+
+# ── Activate staged module scripts (BUG-025) ───────────────
+# Each module was written to a staging name. Verify ALL of them first;
+# if any is broken, keep the previous install untouched and abort.
+for _NXF in 3proxy-socks5.sh optimize-sysctl.sh proxy-menu.sh antiddos.sh; do
+    _NXSTAGED="$INSTALL_DIR/.$_NXF.nxnew"
+    if [ ! -s "$_NXSTAGED" ] || ! bash -n "$_NXSTAGED" 2>/dev/null; then
+        err "Staged script $_NXF is missing or invalid - previous install left untouched."
+        rm -f "$INSTALL_DIR"/.*.nxnew
+        exit 1
+    fi
+done
+for _NXF in 3proxy-socks5.sh optimize-sysctl.sh proxy-menu.sh antiddos.sh; do
+    [ -f "$INSTALL_DIR/$_NXF" ] && \
+        cp -a "$INSTALL_DIR/$_NXF" "$INSTALL_DIR/$_NXF.prev" 2>/dev/null || true
+    mv "$INSTALL_DIR/.$_NXF.nxnew" "$INSTALL_DIR/$_NXF"
+done
+ok "Module scripts verified and activated (previous versions kept as *.prev)"
 
 # ── Permissions ───────────────────────────────────────────
 chmod +x "$INSTALL_DIR/3proxy-socks5.sh" \

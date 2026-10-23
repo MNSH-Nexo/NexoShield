@@ -114,6 +114,27 @@ those waves land.
   regression tests run the shipped regexes against sample log lines
   with Python's re (fail2ban's engine): 8/8. Wave 1's ignoreip
   generation re-verified. `make check` + `make test` green.
+- Wave 6 — DONE. BUG-018: 3proxy runs as a dedicated `nexoproxy`
+  system user under a sandboxed unit (NoNewPrivileges, ProtectSystem
+  strict + ReadWritePaths for the log dir, capability bounding set =
+  CAP_NET_BIND_SERVICE only); config/users files are group-readable
+  by that user. BUG-026: reinstall/update preserves the existing
+  proxy credentials — rotation is only via --change-pass. BUG-015/
+  037/060: proxy uninstall no longer stops or kills the auto-ban
+  daemon, no longer deletes /etc/antiddos or /var/lib/antiddos, no
+  longer runs a global `fail2ban-client unban --all`, and only
+  removes the shared tc setup when Anti-DDoS is not installed.
+  BUG-035: SSRF deny list completed with 0.0.0.0/8. BUG-061: the port
+  picker fails fast when no free port is found instead of writing a
+  config bound to an occupied port. BUG-016: apt-mirror rewriting is
+  opt-in (NX_APT_MIRROR=1), candidates are HTTPS-only, and uninstall
+  restores the original apt sources from their backups. BUG-025:
+  module scripts (and the generated auto-ban daemon script) are
+  written to staging names, syntax-verified, previous versions kept
+  as *.prev, then swapped into place. BUG-044: dnf preferred over
+  the dead yum stub. BUG-059: the non-working IPv6 socks URL is no
+  longer printed. Tests: wave-6 regression guards 19/19; suites
+  green.
 
 **Inputs:** `docs/BUGS.md` — 68 audited findings (BUG-001…068) plus the
 maintainer's field reports FR-1 (whitelist must exempt from *everything*),

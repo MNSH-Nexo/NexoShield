@@ -7,11 +7,10 @@ show_info() {
     _INFO_PASS=$(grep '^PASS=' /etc/3proxy/install.info 2>/dev/null | cut -d= -f2- || echo "?")
     _INFO_PORT=$(grep '^PORT=' /etc/3proxy/install.info 2>/dev/null | cut -d= -f2- || echo "?")
     SERVER_IP=$(get_server_ip)
-    SERVER_IPV6=$(get_server_ipv6)
     sep
     echo -e "  ${CYAN}Connection info:${NC}"; sep
     echo -e "  socks5://${_INFO_USER:-?}:${_INFO_PASS:-?}@$SERVER_IP:${_INFO_PORT:-?}"
-    [ -n "$SERVER_IPV6" ] && echo -e "  socks5://${_INFO_USER:-?}:${_INFO_PASS:-?}@[$SERVER_IPV6]:${_INFO_PORT:-?}"
+    # (No IPv6 form: 3proxy binds 0.0.0.0 only - BUG-059.)
     sep
 }
 
