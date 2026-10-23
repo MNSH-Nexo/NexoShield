@@ -191,7 +191,17 @@ is_user_whitelisted() {
 refresh_self_ips() {
     local _ip _o _found
     local _new4=() _new6=()
-    while IFS= read -r _ip; do [ -n "$_ip" ] && _new4+=("$_ip"); done < <(list_self_ips)
+    # E-6: on hosts where a public-IP cache exists (cloud/NAT), keep
+    # it fresh - a reallocated public address must become immune
+    # without a reinstall. Metadata is link-local and fast; hosts
+    # without a cache never pay for the probes.
+    if [ -f "$NX_PUBLIC_IPS_FILE" ]; then
+        nx_metadata_public_ips 2>/dev/null | sort -u > "$NX_PUBLIC_IPS_FILE.nxnew" && \
+            [ -s "$NX_PUBLIC_IPS_FILE.nxnew" ] && \
+            mv "$NX_PUBLIC_IPS_FILE.nxnew" "$NX_PUBLIC_IPS_FILE" || \
+            rm -f "$NX_PUBLIC_IPS_FILE.nxnew"
+    fi
+    while IFS= read -r _ip; do [ -n "$_ip" ] && _new4+=("$_ip"); done < <(list_self_ips_all)
     while IFS= read -r _ip; do [ -n "$_ip" ] && _new6+=("$_ip"); done < <(list_self_ips6)
     for _ip in "${_new4[@]}"; do
         _found=0

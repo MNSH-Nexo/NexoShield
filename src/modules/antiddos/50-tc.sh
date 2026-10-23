@@ -62,7 +62,7 @@ setup_tc() {
         tc filter add dev "$MAIN_IF" parent 1: protocol ip prio $HANDLE \
             u32 match ip dst "$SIP/32" flowid 1:10 2>/dev/null || true
         HANDLE=$((HANDLE + 1))
-    done < <(list_self_ips | grep -v '^127\.0\.0\.1$')
+    done < <(list_self_ips_all | grep -v '^127\.0\.0\.1$')
 
     # User whitelist → class 1:10 (unlimited, same as CF/self)
     if [ -f "$WHITELIST_FILE" ]; then

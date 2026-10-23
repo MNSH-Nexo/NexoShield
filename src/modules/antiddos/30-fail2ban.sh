@@ -82,7 +82,7 @@ EOF
     # just Cloudflare - the server's own IPs and the admin whitelist too.
     while IFS= read -r _F2B_SELF; do
         [ -n "$_F2B_SELF" ] && _F2B_IGNORE="$_F2B_IGNORE $_F2B_SELF/32"
-    done < <(list_self_ips)
+    done < <(list_self_ips_all)
     # E-1 (exemption audit): the server's own IPv6 addresses belong in
     # ignoreip too - only ::1 was covered, so fail2ban could ban the
     # server's own global v6 (e.g. via the sshd jail).

@@ -213,7 +213,7 @@ exempt_check() {
     echo "Exemption check for $ip:"
     local cf=no self=no wl=no
     for _e in "${CF_RANGES[@]}"; do nx_ip_in_cidr "$ip" "$_e" && { cf=yes; break; }; done
-    list_self_ips 2>/dev/null | grep -qxF "$ip" && self=yes
+    list_self_ips_all 2>/dev/null | grep -qxF "$ip" && self=yes
     if [ -f "$WHITELIST_FILE" ]; then
         while IFS= read -r _e; do
             _e="${_e%%#*}"; _e="${_e// /}"

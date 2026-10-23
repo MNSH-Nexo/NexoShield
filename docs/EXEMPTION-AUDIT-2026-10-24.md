@@ -67,3 +67,52 @@ assertions, daemon level, with positive controls) and
 - The daemon's score sampler still *observes* exempt IPs; only
   enforcement is gated. Scores for exempt IPs are inert (every
   action path re-checks exemption).
+
+## Addendum — E-6: NAT / cloud public-IP discovery (v3.7.1)
+
+Field verification on an Azure VM (2026-10-24) confirmed the NAT
+residual below: the interface carried only 172.16.0.4 while the
+server's public address (65.52.x.x) existed solely in Azure's NAT,
+so `--exempt-check` correctly-but-unhelpfully reported it "not
+exempt". The owner directed that such servers be detected too.
+
+`src/lib/self-ips.sh` now discovers the public IPv4:
+
+- **Metadata first** (link-local, no internet): Azure IMDS
+  (first two addresses of the primary NIC), AWS IMDS (token, then
+  plain), GCP, DigitalOcean, Hetzner — 2s timeouts.
+- **External echo as last resort** (install-time only): ipify,
+  checkip.amazonaws.com, ifconfig.me — 3s timeouts.
+- **Hard validation** (`nx_is_public_ipv4`): every candidate must
+  be a globally routable address — RFC1918, CGNAT, loopback,
+  link-local, documentation (TEST-NET-1/2/3), benchmarking and
+  multicast answers are rejected, so a spoofed or broken metadata
+  reply can never widen the immune set.
+- Results cache to `/etc/antiddos/public-ips.list`; a failed
+  discovery never wipes a good cache. `list_self_ips_all()` (local
+  + cached) is now the self feed for the kernel ACCEPT steps, the
+  snapshots, the fail2ban builder, `--exempt-check`, the 3proxy
+  steps, tc, and the daemon (startup + refresh). On hosts with a
+  cache, the daemon re-runs *metadata* discovery on its ~5-minute
+  refresh, so a reallocated cloud public IP becomes immune without
+  a reinstall; hosts without a cache never pay for the probes.
+- Proof: `tests/unit/test-public-ip-discovery.sh` (33 assertions:
+  validator truth table, per-provider stubbed discovery, private
+  answer rejection, cache survival).
+
+Residual, still by design: a NAT server with no metadata service
+*and* no outbound internet cannot self-discover (the admin
+whitelist remains the manual path), and IPv6 needs no equivalent —
+v6 is routed, not NATed, in practice; a global v6 is on an
+interface and `list_self_ips6` already sees it.
+
+Field note (same day, the Azure VM above): Azure IMDS can report
+`publicIpAddress: ""` even for a VM that is publicly reachable -
+metadata alone is *not* sufficient, which is why the echo fallback
+exists and why all three echo services were cross-checked against
+the connected address during verification. For such hosts the
+install-time cache is authoritative: the daemon's refresh re-runs
+metadata only (an echo-discovered address is kept, not refreshed),
+so if the provider later reallocates the public IP, re-running
+the installer (or one `--exempt-check` after a manual whitelist
+add) re-discovers it.

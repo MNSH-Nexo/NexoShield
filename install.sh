@@ -3,7 +3,7 @@ exec bash <(tr -d '\r' < "$0" | tail -n +3) "$@"
 #!/bin/bash
 # ── GENERATED FILE ─ built by tools/build.py from src/ ─ do not edit directly; edit the sources and rebuild ──
 # ============================================================
-#  Proxy Manager - Auto Installer  v3.7.0
+#  Proxy Manager - Auto Installer  v3.7.1
 #  One file, one command, everything ready
 #
 #  Install:
@@ -28,7 +28,7 @@ exec bash <(tr -d '\r' < "$0" | tail -n +3) "$@"
 # ============================================================
 set -euo pipefail
 
-VERSION="3.7.0"
+VERSION="3.7.1"
 INSTALL_DIR="/opt/proxy-manager"
 BIN_LINK="/usr/local/bin/proxy"
 LOG="/var/log/proxy-manager-install.log"
@@ -911,6 +911,123 @@ list_self_ips6() {
     } | sort -u | grep -v '^$'
 }
 
+# ── Public-IP discovery for NAT / cloud servers ─────────────────
+# On cloud VMs (Azure, most NAT setups) the server's public IPv4
+# exists only in the provider's NAT - it is on NO interface, so
+# list_self_ips can never see it, yet it is unmistakably one of the
+# server's own addresses (FR-2). Discovery asks the cloud metadata
+# service (link-local, no internet involved); only when no metadata
+# service answers does it fall back to an external echo service.
+# Every candidate passes nx_is_public_ipv4: metadata/echo replies
+# are untrusted input, and a private/documentation/garbage answer
+# must never widen the immune set.
+NX_PUBLIC_IPS_FILE="${NX_PUBLIC_IPS_FILE:-/etc/antiddos/public-ips.list}"
+
+nx_is_public_ipv4() {
+    local ip="${1:-}" o1 o2 o3 o4 extra _o
+    case "$ip" in *[!0-9.]*) return 1 ;; esac
+    IFS='.' read -r o1 o2 o3 o4 extra <<< "$ip"
+    [ -z "${extra:-}" ] || return 1
+    for _o in "$o1" "$o2" "$o3" "$o4"; do
+        case "$_o" in ''|*[!0-9]*) return 1 ;; esac
+        [ "${#_o}" -le 3 ] || return 1
+        (( 10#$_o <= 255 )) || return 1
+    done
+    case "$o1" in
+        0|10|127) return 1 ;;
+        100) [ "$o2" -ge 64 ] && [ "$o2" -le 127 ] && return 1 ;;
+        169) [ "$o2" = 254 ] && return 1 ;;
+        172) [ "$o2" -ge 16 ] && [ "$o2" -le 31 ] && return 1 ;;
+        192) [ "$o2" = 168 ] && return 1
+             { [ "$o2" = 0 ] && { [ "$o3" = 0 ] || [ "$o3" = 2 ]; }; } && return 1 ;;
+        198) case "$o2" in 18|19|51) return 1 ;; esac ;;
+        203) { [ "$o2" = 0 ] && [ "$o3" = 113 ]; } && return 1 ;;
+    esac
+    [ "$o1" -ge 224 ] && return 1
+    return 0
+}
+
+nx_metadata_public_ips() {
+    command -v curl >/dev/null 2>&1 || return 0
+    local _ip _tok _base="http://169.254.169.254"
+    # Azure IMDS (first two addresses on the primary NIC)
+    for _idx in 0 1; do
+        _ip=$(curl -s -m 2 -H "Metadata: true" \
+            "$_base/metadata/instance/network/interface/0/ipv4/ipAddress/$_idx/publicIpAddress?api-version=2021-02-01&format=text" 2>/dev/null)
+        nx_is_public_ipv4 "$_ip" && echo "$_ip"
+    done
+    # AWS EC2 IMDS (token first, plain fallback)
+    _tok=$(curl -s -m 2 -X PUT -H "X-aws-ec2-metadata-token-ttl-seconds: 60" \
+        "$_base/latest/api/token" 2>/dev/null)
+    if [ -n "$_tok" ]; then
+        _ip=$(curl -s -m 2 -H "X-aws-ec2-metadata-token: $_tok" \
+            "$_base/latest/meta-data/public-ipv4" 2>/dev/null)
+    else
+        _ip=$(curl -s -m 2 "$_base/latest/meta-data/public-ipv4" 2>/dev/null)
+    fi
+    nx_is_public_ipv4 "$_ip" && echo "$_ip"
+    # GCP
+    _ip=$(curl -s -m 2 -H "Metadata-Flavor: Google" \
+        "http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/access-configs/0/external-ip" 2>/dev/null)
+    nx_is_public_ipv4 "$_ip" && echo "$_ip"
+    # DigitalOcean
+    _ip=$(curl -s -m 2 "$_base/metadata/v1/interfaces/public/0/ipv4/address" 2>/dev/null)
+    nx_is_public_ipv4 "$_ip" && echo "$_ip"
+    # Hetzner Cloud
+    _ip=$(curl -s -m 2 "$_base/hetzner/v1/metadata/public-ipv4" 2>/dev/null)
+    nx_is_public_ipv4 "$_ip" && echo "$_ip"
+    return 0
+}
+
+nx_external_public_ip() {
+    command -v curl >/dev/null 2>&1 || return 0
+    local _ip _url
+    for _url in "https://api.ipify.org" "https://checkip.amazonaws.com" "https://ifconfig.me/ip"; do
+        _ip=$(curl -s -m 3 "$_url" 2>/dev/null | tr -d ' \r\n')
+        nx_is_public_ipv4 "$_ip" && { echo "$_ip"; return 0; }
+    done
+    return 0
+}
+
+# Echo the server's public IPv4s that are NOT on any interface
+# (metadata first; external echo only as a last resort).
+discover_public_ips() {
+    local _found _ip
+    _found=$(nx_metadata_public_ips | sort -u)
+    [ -z "$_found" ] && _found=$(nx_external_public_ip)
+    for _ip in $_found; do
+        list_self_ips | grep -qxF "$_ip" || echo "$_ip"
+    done
+}
+
+# Refresh the cache file; a failed/empty discovery NEVER wipes a
+# previously discovered set (an offline reinstall must not disarm
+# the immunity). Prints the discovered addresses when any exist.
+nx_refresh_public_ips_cache() {
+    local _found
+    _found=$(discover_public_ips)
+    if [ -n "$_found" ]; then
+        mkdir -p "$(dirname "$NX_PUBLIC_IPS_FILE")" 2>/dev/null || true
+        printf '%s\n' "$_found" > "$NX_PUBLIC_IPS_FILE.tmp" 2>/dev/null && \
+            mv "$NX_PUBLIC_IPS_FILE.tmp" "$NX_PUBLIC_IPS_FILE" 2>/dev/null || true
+        printf '%s\n' "$_found"
+    elif [ -f "$NX_PUBLIC_IPS_FILE" ]; then
+        cat "$NX_PUBLIC_IPS_FILE"
+    fi
+}
+
+# list_self_ips_all - interface addresses PLUS the cached
+# discovered public IPs. This is the feed every enforcement layer
+# uses for "the server's own addresses" (FR-2 complete: local,
+# private, secondary AND NAT-public).
+list_self_ips_all() {
+    { list_self_ips
+      if [ -r "$NX_PUBLIC_IPS_FILE" ]; then
+          grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' "$NX_PUBLIC_IPS_FILE" 2>/dev/null
+      fi
+    } | sort -u | grep -v '^$'
+}
+
 get_server_ip() {
     curl -s -4 --max-time 5 https://api.ipify.org 2>/dev/null || \
     curl -s -4 --max-time 5 https://ifconfig.me 2>/dev/null || \
@@ -966,7 +1083,7 @@ setup_tc() {
         tc filter add dev "$IF" parent 1: protocol ip prio $HANDLE \
             u32 match ip dst "$SIP/32" flowid 1:10 2>/dev/null || true
         HANDLE=$((HANDLE + 1))
-    done < <(list_self_ips)
+    done < <(list_self_ips_all)
 
     # User whitelist → class 1:10 (unlimited, same as CF/self)
     if [ -f "/etc/antiddos/whitelist.list" ]; then
@@ -1120,7 +1237,7 @@ setup_iptables_for_port() {
         [ -z "$SIP" ] && continue
         iptables -D INPUT -p tcp --dport "$PORT" -s "$SIP/32" \
             -m comment --comment "3proxy_self_allow" -j ACCEPT 2>/dev/null || true
-    done < <(list_self_ips)
+    done < <(list_self_ips_all)
     # Remove old rate-limit rules by enumeration (BUG-014: the hitcount
     # depends on MAX_CONN at create time - *3 now, *2 in old versions -
     # so a fixed spec delete can miss the real rule; the recent-rule name
@@ -1151,7 +1268,7 @@ setup_iptables_for_port() {
         [ -z "$SIP" ] && continue
         iptables -A INPUT -p tcp --dport "$PORT" -s "$SIP/32" \
             -m comment --comment "3proxy_self_allow" -j ACCEPT 2>/dev/null || true
-    done < <(list_self_ips)
+    done < <(list_self_ips_all)
 
     # ── Step 2b: User whitelist → ACCEPT (FR-1: exempt means exempt
     # in EVERY layer, including this port's rate limits) ──────
@@ -1621,7 +1738,7 @@ uninstall_proxy() {
             [ -z "$SIP" ] && continue
             iptables -D INPUT -p tcp --dport "$PORT" -s "$SIP/32" \
                 -m comment --comment "3proxy_self_allow" -j ACCEPT 2>/dev/null || true
-        done < <(list_self_ips)
+        done < <(list_self_ips_all)
         # Rate-limit rules for this port - by enumeration (BUG-014: the
         # hitcount was MAX_CONN*3 at create, not a fixed 60)
         local _rn
@@ -1886,7 +2003,7 @@ TARGET_FILE="/etc/sysctl.d/99-vpn-optimized.conf"
 SNAPSHOT_DIR="/var/lib/vpn-sysctl-snapshots"
 LOG_FILE="/var/log/vpn-sysctl-optimizer.log"
 LOCK_FILE="/var/run/vpn-sysctl.lock"
-SCRIPT_VERSION="3.7.0"
+SCRIPT_VERSION="3.7.1"
 
 [ "$EUID" -ne 0 ] && echo -e "${RED}Root required${NC}" && exit 1
 
@@ -2477,7 +2594,7 @@ cat > "$INSTALL_DIR/.proxy-menu.sh.nxnew" << 'MENU_SCRIPT'
 # SC2094 - atomic state writes via tmp-file + rename, which the
 # checker flags as same-file pipelines. Both classes were audited
 # site-by-site during the fix waves (docs/FIX-PLAN.md).
-VERSION="3.7.0"
+VERSION="3.7.1"
 INSTALL_DIR="/opt/proxy-manager"
 _BSRC="${BASH_SOURCE[0]:-}"
 if [ -n "$_BSRC" ] && [ "$_BSRC" != "/dev/stdin" ] && [[ "$_BSRC" != /dev/fd/* ]]; then
@@ -3582,7 +3699,7 @@ cat > "$INSTALL_DIR/.antiddos.sh.nxnew" << 'ANTIDDOS_SCRIPT'
 # checker flags as same-file pipelines. Both classes were audited
 # site-by-site during the fix waves (docs/FIX-PLAN.md).
 # ============================================================
-#  Anti-DDoS Protection Manager v3.7.0
+#  Anti-DDoS Protection Manager v3.7.1
 #
 #  Layers:
 #    1. Kernel (sysctl hardening + tight conntrack timeouts)
@@ -3606,7 +3723,7 @@ set -euo pipefail
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 CYAN='\033[0;36m'; WHITE='\033[1;37m'; DIM='\033[2m'; BOLD='\033[1m'; NC='\033[0m'
 
-SCRIPT_VERSION="3.7.0"
+SCRIPT_VERSION="3.7.1"
 LOG_FILE="/var/log/antiddos.log"
 STATE_FILE="/etc/antiddos/state.conf"
 BANNED_LIST="/etc/antiddos/banned.list"
@@ -3618,6 +3735,7 @@ AUTOBAN_SCRIPT="/opt/proxy-manager/auto-ban.sh"
 AUTOBAN_SERVICE="/etc/systemd/system/auto-ban.service"
 WHITELIST_FILE="/etc/antiddos/whitelist.list"
 SELF_IPS_FILE="/etc/antiddos/self-ips.list"
+PUBLIC_IPS_FILE="/etc/antiddos/public-ips.list"
 EXEMPT_FILE="/etc/antiddos/exempt.list"
 
 [ "$EUID" -ne 0 ] && echo -e "${RED}Root required${NC}" && exit 1
@@ -3684,6 +3802,123 @@ list_self_ips() {
 list_self_ips6() {
     { ip -6 addr show 2>/dev/null | grep -oP '(?<=inet6 )[0-9a-fA-F:]+'
       echo "::1"
+    } | sort -u | grep -v '^$'
+}
+
+# ── Public-IP discovery for NAT / cloud servers ─────────────────
+# On cloud VMs (Azure, most NAT setups) the server's public IPv4
+# exists only in the provider's NAT - it is on NO interface, so
+# list_self_ips can never see it, yet it is unmistakably one of the
+# server's own addresses (FR-2). Discovery asks the cloud metadata
+# service (link-local, no internet involved); only when no metadata
+# service answers does it fall back to an external echo service.
+# Every candidate passes nx_is_public_ipv4: metadata/echo replies
+# are untrusted input, and a private/documentation/garbage answer
+# must never widen the immune set.
+NX_PUBLIC_IPS_FILE="${NX_PUBLIC_IPS_FILE:-/etc/antiddos/public-ips.list}"
+
+nx_is_public_ipv4() {
+    local ip="${1:-}" o1 o2 o3 o4 extra _o
+    case "$ip" in *[!0-9.]*) return 1 ;; esac
+    IFS='.' read -r o1 o2 o3 o4 extra <<< "$ip"
+    [ -z "${extra:-}" ] || return 1
+    for _o in "$o1" "$o2" "$o3" "$o4"; do
+        case "$_o" in ''|*[!0-9]*) return 1 ;; esac
+        [ "${#_o}" -le 3 ] || return 1
+        (( 10#$_o <= 255 )) || return 1
+    done
+    case "$o1" in
+        0|10|127) return 1 ;;
+        100) [ "$o2" -ge 64 ] && [ "$o2" -le 127 ] && return 1 ;;
+        169) [ "$o2" = 254 ] && return 1 ;;
+        172) [ "$o2" -ge 16 ] && [ "$o2" -le 31 ] && return 1 ;;
+        192) [ "$o2" = 168 ] && return 1
+             { [ "$o2" = 0 ] && { [ "$o3" = 0 ] || [ "$o3" = 2 ]; }; } && return 1 ;;
+        198) case "$o2" in 18|19|51) return 1 ;; esac ;;
+        203) { [ "$o2" = 0 ] && [ "$o3" = 113 ]; } && return 1 ;;
+    esac
+    [ "$o1" -ge 224 ] && return 1
+    return 0
+}
+
+nx_metadata_public_ips() {
+    command -v curl >/dev/null 2>&1 || return 0
+    local _ip _tok _base="http://169.254.169.254"
+    # Azure IMDS (first two addresses on the primary NIC)
+    for _idx in 0 1; do
+        _ip=$(curl -s -m 2 -H "Metadata: true" \
+            "$_base/metadata/instance/network/interface/0/ipv4/ipAddress/$_idx/publicIpAddress?api-version=2021-02-01&format=text" 2>/dev/null)
+        nx_is_public_ipv4 "$_ip" && echo "$_ip"
+    done
+    # AWS EC2 IMDS (token first, plain fallback)
+    _tok=$(curl -s -m 2 -X PUT -H "X-aws-ec2-metadata-token-ttl-seconds: 60" \
+        "$_base/latest/api/token" 2>/dev/null)
+    if [ -n "$_tok" ]; then
+        _ip=$(curl -s -m 2 -H "X-aws-ec2-metadata-token: $_tok" \
+            "$_base/latest/meta-data/public-ipv4" 2>/dev/null)
+    else
+        _ip=$(curl -s -m 2 "$_base/latest/meta-data/public-ipv4" 2>/dev/null)
+    fi
+    nx_is_public_ipv4 "$_ip" && echo "$_ip"
+    # GCP
+    _ip=$(curl -s -m 2 -H "Metadata-Flavor: Google" \
+        "http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/access-configs/0/external-ip" 2>/dev/null)
+    nx_is_public_ipv4 "$_ip" && echo "$_ip"
+    # DigitalOcean
+    _ip=$(curl -s -m 2 "$_base/metadata/v1/interfaces/public/0/ipv4/address" 2>/dev/null)
+    nx_is_public_ipv4 "$_ip" && echo "$_ip"
+    # Hetzner Cloud
+    _ip=$(curl -s -m 2 "$_base/hetzner/v1/metadata/public-ipv4" 2>/dev/null)
+    nx_is_public_ipv4 "$_ip" && echo "$_ip"
+    return 0
+}
+
+nx_external_public_ip() {
+    command -v curl >/dev/null 2>&1 || return 0
+    local _ip _url
+    for _url in "https://api.ipify.org" "https://checkip.amazonaws.com" "https://ifconfig.me/ip"; do
+        _ip=$(curl -s -m 3 "$_url" 2>/dev/null | tr -d ' \r\n')
+        nx_is_public_ipv4 "$_ip" && { echo "$_ip"; return 0; }
+    done
+    return 0
+}
+
+# Echo the server's public IPv4s that are NOT on any interface
+# (metadata first; external echo only as a last resort).
+discover_public_ips() {
+    local _found _ip
+    _found=$(nx_metadata_public_ips | sort -u)
+    [ -z "$_found" ] && _found=$(nx_external_public_ip)
+    for _ip in $_found; do
+        list_self_ips | grep -qxF "$_ip" || echo "$_ip"
+    done
+}
+
+# Refresh the cache file; a failed/empty discovery NEVER wipes a
+# previously discovered set (an offline reinstall must not disarm
+# the immunity). Prints the discovered addresses when any exist.
+nx_refresh_public_ips_cache() {
+    local _found
+    _found=$(discover_public_ips)
+    if [ -n "$_found" ]; then
+        mkdir -p "$(dirname "$NX_PUBLIC_IPS_FILE")" 2>/dev/null || true
+        printf '%s\n' "$_found" > "$NX_PUBLIC_IPS_FILE.tmp" 2>/dev/null && \
+            mv "$NX_PUBLIC_IPS_FILE.tmp" "$NX_PUBLIC_IPS_FILE" 2>/dev/null || true
+        printf '%s\n' "$_found"
+    elif [ -f "$NX_PUBLIC_IPS_FILE" ]; then
+        cat "$NX_PUBLIC_IPS_FILE"
+    fi
+}
+
+# list_self_ips_all - interface addresses PLUS the cached
+# discovered public IPs. This is the feed every enforcement layer
+# uses for "the server's own addresses" (FR-2 complete: local,
+# private, secondary AND NAT-public).
+list_self_ips_all() {
+    { list_self_ips
+      if [ -r "$NX_PUBLIC_IPS_FILE" ]; then
+          grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' "$NX_PUBLIC_IPS_FILE" 2>/dev/null
+      fi
     } | sort -u | grep -v '^$'
 }
 
@@ -3979,6 +4214,15 @@ apply_iptables() {
         ipt_ins INPUT -s "$CF" -m comment --comment "cf_whitelist" -j ACCEPT
     done
 
+    # NAT/cloud public-IP discovery (E-6): on cloud VMs the public
+    # address lives only in the provider's NAT - ask the metadata
+    # service (echo fallback) and cache it, so the self set below
+    # covers it too. A failed discovery keeps the previous cache.
+    if nx_refresh_public_ips_cache >/dev/null 2>&1; then
+        [ -s "$PUBLIC_IPS_FILE" ] && \
+            info "Public-IP discovery: $(tr '\n' ' ' < "$PUBLIC_IPS_FILE")"
+    fi
+
     # ── Step 4: Server own IPs → ACCEPT ──────────────
     # E-4: get_server_ips is display-grade (public only) - private and
     # secondary self addresses were missing here, so traffic from the
@@ -3987,7 +4231,7 @@ apply_iptables() {
     while IFS= read -r SIP; do
         [ -z "$SIP" ] && continue
         ipt_ins INPUT -s "$SIP/32" -m comment --comment "self_whitelist" -j ACCEPT
-    done < <(list_self_ips | grep -v '^127\.0\.0\.1$')
+    done < <(list_self_ips_all | grep -v '^127\.0\.0\.1$')
 
     # ── Step 4b: User whitelist → ACCEPT (before ALL limits) ──
     mkdir -p /etc/antiddos
@@ -4004,9 +4248,9 @@ apply_iptables() {
     # ── Step 4c: Canonical exempt-set snapshot (D1) ──
     # One file every layer can consult: CF ranges + ALL self IPs + the
     # admin whitelist. Also snapshot the self IPs on their own (FR-2).
-    list_self_ips > "$SELF_IPS_FILE" 2>/dev/null || true
+    list_self_ips_all > "$SELF_IPS_FILE" 2>/dev/null || true
     { printf '%s\n' "${CF_RANGES[@]}"
-      list_self_ips
+      list_self_ips_all
       if [ -f "$WHITELIST_FILE" ]; then
           while IFS= read -r _EX; do
               _EX="${_EX%%#*}"; _EX="${_EX// /}"
@@ -4030,7 +4274,7 @@ apply_iptables() {
             [ -z "$SIP" ] && continue
             iptables -t raw -C PREROUTING -s "$SIP/32" -j ACCEPT 2>/dev/null || \
             iptables -t raw -A PREROUTING -s "$SIP/32" -j ACCEPT
-        done < <(list_self_ips | grep -v '^127\.0\.0\.1$')
+        done < <(list_self_ips_all | grep -v '^127\.0\.0\.1$')
         # Also whitelist user whitelist in raw (SYNPROXY never touches them)
         if [ -f "$WHITELIST_FILE" ]; then
             while IFS= read -r WIP; do
@@ -4412,7 +4656,7 @@ EOF
     # just Cloudflare - the server's own IPs and the admin whitelist too.
     while IFS= read -r _F2B_SELF; do
         [ -n "$_F2B_SELF" ] && _F2B_IGNORE="$_F2B_IGNORE $_F2B_SELF/32"
-    done < <(list_self_ips)
+    done < <(list_self_ips_all)
     # E-1 (exemption audit): the server's own IPv6 addresses belong in
     # ignoreip too - only ::1 was covered, so fail2ban could ban the
     # server's own global v6 (e.g. via the sshd jail).
@@ -4726,15 +4970,133 @@ list_self_ips6() {
     } | sort -u | grep -v '^$'
 }
 
+# ── Public-IP discovery for NAT / cloud servers ─────────────────
+# On cloud VMs (Azure, most NAT setups) the server's public IPv4
+# exists only in the provider's NAT - it is on NO interface, so
+# list_self_ips can never see it, yet it is unmistakably one of the
+# server's own addresses (FR-2). Discovery asks the cloud metadata
+# service (link-local, no internet involved); only when no metadata
+# service answers does it fall back to an external echo service.
+# Every candidate passes nx_is_public_ipv4: metadata/echo replies
+# are untrusted input, and a private/documentation/garbage answer
+# must never widen the immune set.
+NX_PUBLIC_IPS_FILE="${NX_PUBLIC_IPS_FILE:-/etc/antiddos/public-ips.list}"
+
+nx_is_public_ipv4() {
+    local ip="${1:-}" o1 o2 o3 o4 extra _o
+    case "$ip" in *[!0-9.]*) return 1 ;; esac
+    IFS='.' read -r o1 o2 o3 o4 extra <<< "$ip"
+    [ -z "${extra:-}" ] || return 1
+    for _o in "$o1" "$o2" "$o3" "$o4"; do
+        case "$_o" in ''|*[!0-9]*) return 1 ;; esac
+        [ "${#_o}" -le 3 ] || return 1
+        (( 10#$_o <= 255 )) || return 1
+    done
+    case "$o1" in
+        0|10|127) return 1 ;;
+        100) [ "$o2" -ge 64 ] && [ "$o2" -le 127 ] && return 1 ;;
+        169) [ "$o2" = 254 ] && return 1 ;;
+        172) [ "$o2" -ge 16 ] && [ "$o2" -le 31 ] && return 1 ;;
+        192) [ "$o2" = 168 ] && return 1
+             { [ "$o2" = 0 ] && { [ "$o3" = 0 ] || [ "$o3" = 2 ]; }; } && return 1 ;;
+        198) case "$o2" in 18|19|51) return 1 ;; esac ;;
+        203) { [ "$o2" = 0 ] && [ "$o3" = 113 ]; } && return 1 ;;
+    esac
+    [ "$o1" -ge 224 ] && return 1
+    return 0
+}
+
+nx_metadata_public_ips() {
+    command -v curl >/dev/null 2>&1 || return 0
+    local _ip _tok _base="http://169.254.169.254"
+    # Azure IMDS (first two addresses on the primary NIC)
+    for _idx in 0 1; do
+        _ip=$(curl -s -m 2 -H "Metadata: true" \
+            "$_base/metadata/instance/network/interface/0/ipv4/ipAddress/$_idx/publicIpAddress?api-version=2021-02-01&format=text" 2>/dev/null)
+        nx_is_public_ipv4 "$_ip" && echo "$_ip"
+    done
+    # AWS EC2 IMDS (token first, plain fallback)
+    _tok=$(curl -s -m 2 -X PUT -H "X-aws-ec2-metadata-token-ttl-seconds: 60" \
+        "$_base/latest/api/token" 2>/dev/null)
+    if [ -n "$_tok" ]; then
+        _ip=$(curl -s -m 2 -H "X-aws-ec2-metadata-token: $_tok" \
+            "$_base/latest/meta-data/public-ipv4" 2>/dev/null)
+    else
+        _ip=$(curl -s -m 2 "$_base/latest/meta-data/public-ipv4" 2>/dev/null)
+    fi
+    nx_is_public_ipv4 "$_ip" && echo "$_ip"
+    # GCP
+    _ip=$(curl -s -m 2 -H "Metadata-Flavor: Google" \
+        "http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/access-configs/0/external-ip" 2>/dev/null)
+    nx_is_public_ipv4 "$_ip" && echo "$_ip"
+    # DigitalOcean
+    _ip=$(curl -s -m 2 "$_base/metadata/v1/interfaces/public/0/ipv4/address" 2>/dev/null)
+    nx_is_public_ipv4 "$_ip" && echo "$_ip"
+    # Hetzner Cloud
+    _ip=$(curl -s -m 2 "$_base/hetzner/v1/metadata/public-ipv4" 2>/dev/null)
+    nx_is_public_ipv4 "$_ip" && echo "$_ip"
+    return 0
+}
+
+nx_external_public_ip() {
+    command -v curl >/dev/null 2>&1 || return 0
+    local _ip _url
+    for _url in "https://api.ipify.org" "https://checkip.amazonaws.com" "https://ifconfig.me/ip"; do
+        _ip=$(curl -s -m 3 "$_url" 2>/dev/null | tr -d ' \r\n')
+        nx_is_public_ipv4 "$_ip" && { echo "$_ip"; return 0; }
+    done
+    return 0
+}
+
+# Echo the server's public IPv4s that are NOT on any interface
+# (metadata first; external echo only as a last resort).
+discover_public_ips() {
+    local _found _ip
+    _found=$(nx_metadata_public_ips | sort -u)
+    [ -z "$_found" ] && _found=$(nx_external_public_ip)
+    for _ip in $_found; do
+        list_self_ips | grep -qxF "$_ip" || echo "$_ip"
+    done
+}
+
+# Refresh the cache file; a failed/empty discovery NEVER wipes a
+# previously discovered set (an offline reinstall must not disarm
+# the immunity). Prints the discovered addresses when any exist.
+nx_refresh_public_ips_cache() {
+    local _found
+    _found=$(discover_public_ips)
+    if [ -n "$_found" ]; then
+        mkdir -p "$(dirname "$NX_PUBLIC_IPS_FILE")" 2>/dev/null || true
+        printf '%s\n' "$_found" > "$NX_PUBLIC_IPS_FILE.tmp" 2>/dev/null && \
+            mv "$NX_PUBLIC_IPS_FILE.tmp" "$NX_PUBLIC_IPS_FILE" 2>/dev/null || true
+        printf '%s\n' "$_found"
+    elif [ -f "$NX_PUBLIC_IPS_FILE" ]; then
+        cat "$NX_PUBLIC_IPS_FILE"
+    fi
+}
+
+# list_self_ips_all - interface addresses PLUS the cached
+# discovered public IPs. This is the feed every enforcement layer
+# uses for "the server's own addresses" (FR-2 complete: local,
+# private, secondary AND NAT-public).
+list_self_ips_all() {
+    { list_self_ips
+      if [ -r "$NX_PUBLIC_IPS_FILE" ]; then
+          grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' "$NX_PUBLIC_IPS_FILE" 2>/dev/null
+      fi
+    } | sort -u | grep -v '^$'
+}
+
 mkdir -p /etc/antiddos
 touch "$LOG" && chmod 600 "$LOG"
 touch "$BANNED_LIST" "$WATCH_LIST" "$THROTTLE_LIST" 2>/dev/null || true
 
-# Collect all server IPs at startup (never ban these)
+# Collect all server IPs at startup (never ban these): interface
+# addresses PLUS any cached NAT/cloud public IPs (E-6).
 SELF_IPS=()
 while IFS= read -r sip; do
     [ -n "$sip" ] && SELF_IPS+=("$sip")
-done < <(list_self_ips)
+done < <(list_self_ips_all)
 
 # IPv6 self addresses (Wave 9): the same hard immunity as IPv4 (FR-2).
 SELF6_IPS=()
@@ -4949,7 +5311,17 @@ is_user_whitelisted() {
 refresh_self_ips() {
     local _ip _o _found
     local _new4=() _new6=()
-    while IFS= read -r _ip; do [ -n "$_ip" ] && _new4+=("$_ip"); done < <(list_self_ips)
+    # E-6: on hosts where a public-IP cache exists (cloud/NAT), keep
+    # it fresh - a reallocated public address must become immune
+    # without a reinstall. Metadata is link-local and fast; hosts
+    # without a cache never pay for the probes.
+    if [ -f "$NX_PUBLIC_IPS_FILE" ]; then
+        nx_metadata_public_ips 2>/dev/null | sort -u > "$NX_PUBLIC_IPS_FILE.nxnew" && \
+            [ -s "$NX_PUBLIC_IPS_FILE.nxnew" ] && \
+            mv "$NX_PUBLIC_IPS_FILE.nxnew" "$NX_PUBLIC_IPS_FILE" || \
+            rm -f "$NX_PUBLIC_IPS_FILE.nxnew"
+    fi
+    while IFS= read -r _ip; do [ -n "$_ip" ] && _new4+=("$_ip"); done < <(list_self_ips_all)
     while IFS= read -r _ip; do [ -n "$_ip" ] && _new6+=("$_ip"); done < <(list_self_ips6)
     for _ip in "${_new4[@]}"; do
         _found=0
@@ -5939,7 +6311,7 @@ setup_tc() {
         tc filter add dev "$MAIN_IF" parent 1: protocol ip prio $HANDLE \
             u32 match ip dst "$SIP/32" flowid 1:10 2>/dev/null || true
         HANDLE=$((HANDLE + 1))
-    done < <(list_self_ips | grep -v '^127\.0\.0\.1$')
+    done < <(list_self_ips_all | grep -v '^127\.0\.0\.1$')
 
     # User whitelist → class 1:10 (unlimited, same as CF/self)
     if [ -f "$WHITELIST_FILE" ]; then
@@ -6593,7 +6965,7 @@ exempt_check() {
     echo "Exemption check for $ip:"
     local cf=no self=no wl=no
     for _e in "${CF_RANGES[@]}"; do nx_ip_in_cidr "$ip" "$_e" && { cf=yes; break; }; done
-    list_self_ips 2>/dev/null | grep -qxF "$ip" && self=yes
+    list_self_ips_all 2>/dev/null | grep -qxF "$ip" && self=yes
     if [ -f "$WHITELIST_FILE" ]; then
         while IFS= read -r _e; do
             _e="${_e%%#*}"; _e="${_e// /}"

@@ -139,6 +139,15 @@ apply_iptables() {
         ipt_ins INPUT -s "$CF" -m comment --comment "cf_whitelist" -j ACCEPT
     done
 
+    # NAT/cloud public-IP discovery (E-6): on cloud VMs the public
+    # address lives only in the provider's NAT - ask the metadata
+    # service (echo fallback) and cache it, so the self set below
+    # covers it too. A failed discovery keeps the previous cache.
+    if nx_refresh_public_ips_cache >/dev/null 2>&1; then
+        [ -s "$PUBLIC_IPS_FILE" ] && \
+            info "Public-IP discovery: $(tr '\n' ' ' < "$PUBLIC_IPS_FILE")"
+    fi
+
     # ── Step 4: Server own IPs → ACCEPT ──────────────
     # E-4: get_server_ips is display-grade (public only) - private and
     # secondary self addresses were missing here, so traffic from the
@@ -147,7 +156,7 @@ apply_iptables() {
     while IFS= read -r SIP; do
         [ -z "$SIP" ] && continue
         ipt_ins INPUT -s "$SIP/32" -m comment --comment "self_whitelist" -j ACCEPT
-    done < <(list_self_ips | grep -v '^127\.0\.0\.1$')
+    done < <(list_self_ips_all | grep -v '^127\.0\.0\.1$')
 
     # ── Step 4b: User whitelist → ACCEPT (before ALL limits) ──
     mkdir -p /etc/antiddos
@@ -164,9 +173,9 @@ apply_iptables() {
     # ── Step 4c: Canonical exempt-set snapshot (D1) ──
     # One file every layer can consult: CF ranges + ALL self IPs + the
     # admin whitelist. Also snapshot the self IPs on their own (FR-2).
-    list_self_ips > "$SELF_IPS_FILE" 2>/dev/null || true
+    list_self_ips_all > "$SELF_IPS_FILE" 2>/dev/null || true
     { printf '%s\n' "${CF_RANGES[@]}"
-      list_self_ips
+      list_self_ips_all
       if [ -f "$WHITELIST_FILE" ]; then
           while IFS= read -r _EX; do
               _EX="${_EX%%#*}"; _EX="${_EX// /}"
@@ -190,7 +199,7 @@ apply_iptables() {
             [ -z "$SIP" ] && continue
             iptables -t raw -C PREROUTING -s "$SIP/32" -j ACCEPT 2>/dev/null || \
             iptables -t raw -A PREROUTING -s "$SIP/32" -j ACCEPT
-        done < <(list_self_ips | grep -v '^127\.0\.0\.1$')
+        done < <(list_self_ips_all | grep -v '^127\.0\.0\.1$')
         # Also whitelist user whitelist in raw (SYNPROXY never touches them)
         if [ -f "$WHITELIST_FILE" ]; then
             while IFS= read -r WIP; do

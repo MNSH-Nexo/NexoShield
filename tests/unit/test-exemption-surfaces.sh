@@ -25,6 +25,7 @@ printf '%s\n' "198.51.100.7" "2001:db8:beef::99" "2001:db8:cafe::/48" > "$WHITEL
 CF_RANGES=("173.245.48.0/20")
 CF6_RANGES=("2606:4700::/32")
 list_self_ips()  { printf '%s\n' "203.0.113.10" "10.0.0.5"; }
+list_self_ips_all() { list_self_ips; }
 list_self_ips6() { printf '%s\n' "2001:db8:aaaa::10" "fe80::1"; }
 log() { :; }
 
@@ -65,6 +66,7 @@ echo "$OUT" | grep -q "server own IP     : yes" && ok || bad "exempt-check: self
 extract_fn src/modules/autoban/10-ip-utils.sh refresh_self_ips "$TMP/fns2.sh" || { echo "FAIL extract refresh"; exit 1; }
 extract_fn src/modules/autoban/10-ip-utils.sh is_self_ip "$TMP/fns2.sh" || { echo "FAIL extract is_self_ip"; exit 1; }
 SELF_IPS=("203.0.113.10"); SELF6_IPS=("2001:db8:aaaa::10")
+NX_PUBLIC_IPS_FILE="$TMP/no-cloud-cache"   # no cache file: metadata branch off
 . "$TMP/fns2.sh"
 list_self_ips()  { printf '%s\n' "203.0.113.10" "192.0.2.55"; }
 list_self_ips6() { printf '%s\n' "2001:db8:aaaa::10" "2001:db8:aaaa::20"; }

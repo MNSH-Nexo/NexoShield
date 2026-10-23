@@ -40,7 +40,7 @@ setup_tc() {
         tc filter add dev "$IF" parent 1: protocol ip prio $HANDLE \
             u32 match ip dst "$SIP/32" flowid 1:10 2>/dev/null || true
         HANDLE=$((HANDLE + 1))
-    done < <(list_self_ips)
+    done < <(list_self_ips_all)
 
     # User whitelist → class 1:10 (unlimited, same as CF/self)
     if [ -f "/etc/antiddos/whitelist.list" ]; then

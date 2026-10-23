@@ -26,6 +26,7 @@ WHITELIST_FILE="$TMP/whitelist.list"
 F2B_JAIL_DIR="$TMP/no-fail2ban"
 printf '%s\n' "5.5.5.5" "6.6.6.0/24" "# comment" "" > "$WHITELIST_FILE"
 list_self_ips() { printf '%s\n' "9.9.9.9" "127.0.0.1"; }
+list_self_ips_all() { list_self_ips; }
 
 # shellcheck disable=SC1091
 . "$TMP/fns.sh"

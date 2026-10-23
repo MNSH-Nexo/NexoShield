@@ -114,11 +114,12 @@ mkdir -p /etc/antiddos
 touch "$LOG" && chmod 600 "$LOG"
 touch "$BANNED_LIST" "$WATCH_LIST" "$THROTTLE_LIST" 2>/dev/null || true
 
-# Collect all server IPs at startup (never ban these)
+# Collect all server IPs at startup (never ban these): interface
+# addresses PLUS any cached NAT/cloud public IPs (E-6).
 SELF_IPS=()
 while IFS= read -r sip; do
     [ -n "$sip" ] && SELF_IPS+=("$sip")
-done < <(list_self_ips)
+done < <(list_self_ips_all)
 
 # IPv6 self addresses (Wave 9): the same hard immunity as IPv4 (FR-2).
 SELF6_IPS=()
