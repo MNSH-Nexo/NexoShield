@@ -88,6 +88,7 @@ IF=${IF:-eth0}
 
 # Cloudflare ranges (NEVER touched)
 # @include lib/cloudflare-loader.sh
+# @include lib/cloudflare6-loader.sh
 # @include lib/self-ips.sh
 
 mkdir -p /etc/antiddos
@@ -99,6 +100,12 @@ SELF_IPS=()
 while IFS= read -r sip; do
     [ -n "$sip" ] && SELF_IPS+=("$sip")
 done < <(list_self_ips)
+
+# IPv6 self addresses (Wave 9): the same hard immunity as IPv4 (FR-2).
+SELF6_IPS=()
+while IFS= read -r sip6; do
+    [ -n "$sip6" ] && SELF6_IPS+=("$sip6")
+done < <(list_self_ips6)
 
 # BUG-020: precompute Cloudflare network integers ONCE. is_cf_ip() then
 # costs zero forks per check (previously up to ~1,500 per call: 753 ranges

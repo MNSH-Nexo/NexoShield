@@ -68,6 +68,13 @@ printf "%s\n" "${CF_RANGES[@]}" > /etc/antiddos/cloudflare-ipv4.list
 mkdir -p "$INSTALL_DIR/data"
 printf "%s\n" "${CF_RANGES[@]}" > "$INSTALL_DIR/data/cloudflare-ipv4.list"
 
+# ── Cloudflare IPv6 ranges (single source: src/data/cloudflare-ipv6.list) ──
+CF6_RANGES=(
+@@CF6_ENTRIES@@
+)
+printf "%s\n" "${CF6_RANGES[@]}" > /etc/antiddos/cloudflare-ipv6.list
+printf "%s\n" "${CF6_RANGES[@]}" > "$INSTALL_DIR/data/cloudflare-ipv6.list"
+
 touch "$LOG" && chmod 600 "$LOG"
 
 # ─────────────────────────────────────────────────────────

@@ -32,6 +32,13 @@ setup_tc() {
         HANDLE=$((HANDLE + 1))
     done
 
+    # CF IPv6 → class 1:10 (Wave 9: protocol ip6 / match ip6 dst)
+    for CF6 in "${CF6_RANGES[@]}"; do
+        tc filter add dev "$MAIN_IF" parent 1: protocol ip6 prio $HANDLE \
+            u32 match ip6 dst "$CF6" flowid 1:10 2>/dev/null || true
+        HANDLE=$((HANDLE + 1))
+    done
+
     # Server own IPs → class 1:10
     while IFS= read -r SIP; do
         [ -z "$SIP" ] && continue
@@ -78,6 +85,14 @@ for CF in "${CF_RANGES[@]}"; do
     tc filter add dev "$IF" parent 1: protocol ip prio $H \
         u32 match ip dst "$CF" flowid 1:10 2>/dev/null || true; H=$((H+1))
 done
+# CF IPv6 ranges (Wave 9), loaded from the runtime data file
+if [ -f /etc/antiddos/cloudflare-ipv6.list ]; then
+    while IFS= read -r CF6; do
+        [ -z "$CF6" ] && continue
+        tc filter add dev "$IF" parent 1: protocol ip6 prio $H \
+            u32 match ip6 dst "$CF6" flowid 1:10 2>/dev/null || true; H=$((H+1))
+    done < /etc/antiddos/cloudflare-ipv6.list
+fi
 for SIP in $(ip -4 addr show 2>/dev/null | grep 'inet ' | \
     grep -v '127\.\|10\.\|192\.168\.' | awk '{print $2}' | cut -d/ -f1); do
     tc filter add dev "$IF" parent 1: protocol ip prio $H \
@@ -146,6 +161,8 @@ setup_persistence() {
 #!/bin/bash
 RULES="/etc/antiddos/iptables-antiddos.rules"
 [ -f "$RULES" ] && iptables-restore < "$RULES" 2>/dev/null || true
+[ -f /etc/antiddos/ip6tables-antiddos.rules ] && \
+    ip6tables-restore < /etc/antiddos/ip6tables-antiddos.rules 2>/dev/null || true
 [ -f /etc/sysctl.d/98-antiddos-hardening.conf ] && \
     sysctl -p /etc/sysctl.d/98-antiddos-hardening.conf >/dev/null 2>&1 || true
 EOF

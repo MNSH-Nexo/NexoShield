@@ -117,6 +117,11 @@ remove_rules() {
     nx_delete_matching filter INPUT "$RULE_PAT"
     nx_delete_matching filter FORWARD "$RULE_PAT"
 
+    # IPv6 cleanup (Wave 9): same pattern set against ip6tables
+    nx_delete_matching6 INPUT "$RULE_PAT"
+    nx_delete_matching6 FORWARD "$RULE_PAT"
+    rm -f /etc/antiddos/ip6tables-antiddos.rules 2>/dev/null || true
+
     # raw table: delete ONLY our own ACCEPTs - those whose source is a CF
     # range, a self IP or a whitelist entry. The old loop's bare "ACCEPT"
     # token deleted other software's raw PREROUTING rules (BUG-031).

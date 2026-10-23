@@ -821,6 +821,19 @@ printf "%s\n" "${CF_RANGES[@]}" > /etc/antiddos/cloudflare-ipv4.list
 mkdir -p "$INSTALL_DIR/data"
 printf "%s\n" "${CF_RANGES[@]}" > "$INSTALL_DIR/data/cloudflare-ipv4.list"
 
+# ── Cloudflare IPv6 ranges (single source: src/data/cloudflare-ipv6.list) ──
+CF6_RANGES=(
+    "2400:cb00::/32"
+    "2606:4700::/32"
+    "2803:f800::/32"
+    "2405:b500::/32"
+    "2405:8100::/32"
+    "2a06:98c0::/29"
+    "2c0f:f8b0::/32"
+)
+printf "%s\n" "${CF6_RANGES[@]}" > /etc/antiddos/cloudflare-ipv6.list
+printf "%s\n" "${CF6_RANGES[@]}" > "$INSTALL_DIR/data/cloudflare-ipv6.list"
+
 touch "$LOG" && chmod 600 "$LOG"
 
 # ─────────────────────────────────────────────────────────
@@ -3490,6 +3503,7 @@ EXEMPT_FILE="/etc/antiddos/exempt.list"
 # silently never landed. (iptables-save/-restore are separate binaries
 # and are not affected by this wrapper.)
 iptables() { command iptables -w 5 "$@"; }
+ip6tables() { command ip6tables -w 5 "$@"; }
 
 mkdir -p /etc/antiddos
 touch "$LOG_FILE" && chmod 600 "$LOG_FILE"
@@ -3517,6 +3531,14 @@ if [ -f /etc/antiddos/cloudflare-ipv4.list ]; then
 else
     echo "WARN: /etc/antiddos/cloudflare-ipv4.list missing - CF whitelist empty" >&2
 fi
+# ── Cloudflare IPv6 ranges (loaded from shared data file) ──
+CF6_RANGES=()
+if [ -f /etc/antiddos/cloudflare-ipv6.list ]; then
+    while IFS= read -r _cfl6; do
+        _cfl6="${_cfl6//[[:space:]]/}"
+        [ -n "$_cfl6" ] && CF6_RANGES+=("$_cfl6")
+    done < /etc/antiddos/cloudflare-ipv6.list
+fi
 
 # Get all server's own public IPs (auto-whitelist)
 get_server_ips() {
@@ -3528,6 +3550,13 @@ get_server_ips() {
 list_self_ips() {
     { ip -4 addr show 2>/dev/null | grep -oP '(?<=inet )\d+\.\d+\.\d+\.\d+'
       hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'
+    } | sort -u | grep -v '^$'
+}
+
+# list_self_ips6 - every local IPv6 address (incl. ::1), one per line.
+list_self_ips6() {
+    { ip -6 addr show 2>/dev/null | grep -oP '(?<=inet6 )[0-9a-fA-F:]+'
+      echo "::1"
     } | sort -u | grep -v '^$'
 }
 
@@ -4062,6 +4091,108 @@ apply_iptables() {
     save_static_rules "$IPTABLES_SAVE_FILE"
     chmod 600 "$IPTABLES_SAVE_FILE"
     success "iptables rules saved"
+
+    # IPv6 mirror of this design (Wave 9)
+    apply_ip6tables
+}
+
+# ════════════════════════════════════════════════
+# IPv6 mirror of the INPUT design (Wave 9). Same layer order as IPv4:
+# exempt ACCEPTs -> request policing -> ESTABLISHED -> flood limits ->
+# connlimit -> scan drops. Skipped cleanly when no IPv6 stack exists.
+# ════════════════════════════════════════════════
+apply_ip6tables() {
+    command -v ip6tables >/dev/null 2>&1 || { info "ip6tables unavailable - IPv6 rules skipped"; return 0; }
+    ip6tables -L INPUT >/dev/null 2>&1 || { info "IPv6 stack unavailable - IPv6 rules skipped"; return 0; }
+    info "Applying IPv6 firewall rules (mirror of the IPv4 design)..."
+    ipt6_add() { ip6tables -C "$@" 2>/dev/null || ip6tables -A "$@" 2>/dev/null || true; }
+
+    ipt6_add INPUT -i lo -j ACCEPT
+
+    # Exempt set snapshot (CF v6 + self v6 + whitelist v6 entries)
+    : > /etc/antiddos/exempt6.list 2>/dev/null || true
+    local _r6 _s6 _w6
+    for _r6 in "${CF6_RANGES[@]}"; do
+        ipt6_add INPUT -s "$_r6" -j ACCEPT
+        echo "$_r6" >> /etc/antiddos/exempt6.list
+    done
+    while IFS= read -r _s6; do
+        [ -z "$_s6" ] && continue
+        ipt6_add INPUT -s "$_s6/128" -j ACCEPT
+        echo "$_s6" >> /etc/antiddos/exempt6.list
+    done < <(list_self_ips6)
+    if [ -f "$WHITELIST_FILE" ]; then
+        while IFS= read -r _w6; do
+            _w6="${_w6%%#*}"; _w6="${_w6// /}"
+            case "$_w6" in *:*) : ;; *) continue ;; esac
+            [ -z "$_w6" ] && continue
+            ipt6_add INPUT -s "$_w6" -j ACCEPT
+            echo "$_w6" >> /etc/antiddos/exempt6.list
+        done < "$WHITELIST_FILE"
+    fi
+
+    # Request-rate policing BEFORE the established accept (same BUG-002
+    # lesson as IPv4: below it, this rule could never fire)
+    ipt6_add INPUT -p tcp -m multiport --dports 80,443 \
+        -m hashlimit --hashlimit-name http_req_rate6 --hashlimit-mode srcip \
+        --hashlimit 300/min --hashlimit-burst 100 -j DROP
+
+    ipt6_add INPUT -m conntrack --ctstate INVALID -j DROP
+    ipt6_add INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+
+    # Flood limits
+    ipt6_add INPUT -p tcp --syn -m hashlimit --hashlimit-name syn_limit6 \
+        --hashlimit-mode srcip --hashlimit 200/sec --hashlimit-burst 400 -j DROP
+    ipt6_add INPUT -p udp -m hashlimit --hashlimit-name udp_limit6 \
+        --hashlimit-mode srcip --hashlimit 1000/sec --hashlimit-burst 2000 -j DROP
+    # ICMPv6: NDP must keep working (it is IPv6's ARP) - accept it,
+    # rate-limit echo requests, accept the rest.
+    ipt6_add INPUT -p icmpv6 --icmpv6-type 133 -j ACCEPT
+    ipt6_add INPUT -p icmpv6 --icmpv6-type 135 -j ACCEPT
+    ipt6_add INPUT -p icmpv6 --icmpv6-type 136 -j ACCEPT
+    ipt6_add INPUT -p icmpv6 --icmpv6-type echo-request \
+        -m hashlimit --hashlimit-name icmp_limit6 --hashlimit-mode srcip \
+        --hashlimit 50/sec --hashlimit-burst 100 -j DROP
+    ipt6_add INPUT -p icmpv6 -j ACCEPT
+
+    # Connection limit per host (mask 128) with the same LOG prefix the
+    # conn-flood fail2ban jail matches
+    ipt6_add INPUT -p tcp --syn -m connlimit --connlimit-above "$CONN_LIMIT_PER_IP" \
+        --connlimit-mask 128 -j LOG --log-prefix "[CONNLIMIT DROP] " --log-level 4
+    ipt6_add INPUT -p tcp --syn -m connlimit --connlimit-above "$CONN_LIMIT_PER_IP" \
+        --connlimit-mask 128 -m comment --comment "nx_connlimit" -j DROP
+
+    # Scan signatures: LOG ([NX-SCAN], feeds the portscan jail) + DROP
+    ipt6_add INPUT -p tcp --tcp-flags ALL NONE \
+        -m limit --limit 10/min --limit-burst 20 \
+        -j LOG --log-prefix "[NX-SCAN] " --log-level 4
+    ipt6_add INPUT -p tcp --tcp-flags ALL ALL \
+        -m limit --limit 10/min --limit-burst 20 \
+        -j LOG --log-prefix "[NX-SCAN] " --log-level 4
+    ipt6_add INPUT -p tcp --tcp-flags ALL FIN \
+        -m limit --limit 10/min --limit-burst 20 \
+        -j LOG --log-prefix "[NX-SCAN] " --log-level 4
+    ipt6_add INPUT -p tcp --tcp-flags ALL NONE -j DROP
+    ipt6_add INPUT -p tcp --tcp-flags ALL ALL -j DROP
+    ipt6_add INPUT -p tcp --tcp-flags ALL FIN -j DROP
+    ipt6_add INPUT -p tcp --tcp-flags SYN,FIN SYN,FIN -j DROP
+    ipt6_add INPUT -p tcp --tcp-flags SYN,RST SYN,RST -j DROP
+
+    ip6tables-save 2>/dev/null | nx_static_rules_filter > /etc/antiddos/ip6tables-antiddos.rules || true
+    chmod 600 /etc/antiddos/ip6tables-antiddos.rules 2>/dev/null || true
+    success "IPv6 rules applied + saved"
+}
+
+# Delete ip6tables rules by pattern (mirror of nx_delete_matching).
+nx_delete_matching6() {
+    local _c="$1" _p="$2" _n
+    command -v ip6tables >/dev/null 2>&1 || return 0
+    ip6tables -L "$_c" >/dev/null 2>&1 || return 0
+    while true; do
+        _n=$(ip6tables -S "$_c" 2>/dev/null | grep -nE "$_p" | head -1 | cut -d: -f1 || true)
+        [ -z "$_n" ] && break
+        ip6tables -D "$_c" $((_n - 1)) 2>/dev/null || break
+    done
 }
 
 # ════════════════════════════════════════════════
@@ -4156,6 +4287,10 @@ EOF
             [ -n "$_F2B_WL" ] && _F2B_IGNORE="$_F2B_IGNORE $_F2B_WL"
         done < "$WHITELIST_FILE"
     fi
+    # IPv6 (Wave 9): CF's v6 ranges join ignoreip too (they are few).
+    for _F2B_CF6 in "${CF6_RANGES[@]}"; do
+        _F2B_IGNORE="$_F2B_IGNORE $_F2B_CF6"
+    done
     _F2B_CF_N=0
     for _F2B_CF in "${CF_RANGES[@]}"; do
         _F2B_CF_N=$((_F2B_CF_N + 1))
@@ -4374,9 +4509,24 @@ if [ -f /etc/antiddos/cloudflare-ipv4.list ]; then
 else
     echo "WARN: /etc/antiddos/cloudflare-ipv4.list missing - CF whitelist empty" >&2
 fi
+# ── Cloudflare IPv6 ranges (loaded from shared data file) ──
+CF6_RANGES=()
+if [ -f /etc/antiddos/cloudflare-ipv6.list ]; then
+    while IFS= read -r _cfl6; do
+        _cfl6="${_cfl6//[[:space:]]/}"
+        [ -n "$_cfl6" ] && CF6_RANGES+=("$_cfl6")
+    done < /etc/antiddos/cloudflare-ipv6.list
+fi
 list_self_ips() {
     { ip -4 addr show 2>/dev/null | grep -oP '(?<=inet )\d+\.\d+\.\d+\.\d+'
       hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'
+    } | sort -u | grep -v '^$'
+}
+
+# list_self_ips6 - every local IPv6 address (incl. ::1), one per line.
+list_self_ips6() {
+    { ip -6 addr show 2>/dev/null | grep -oP '(?<=inet6 )[0-9a-fA-F:]+'
+      echo "::1"
     } | sort -u | grep -v '^$'
 }
 
@@ -4389,6 +4539,12 @@ SELF_IPS=()
 while IFS= read -r sip; do
     [ -n "$sip" ] && SELF_IPS+=("$sip")
 done < <(list_self_ips)
+
+# IPv6 self addresses (Wave 9): the same hard immunity as IPv4 (FR-2).
+SELF6_IPS=()
+while IFS= read -r sip6; do
+    [ -n "$sip6" ] && SELF6_IPS+=("$sip6")
+done < <(list_self_ips6)
 
 # BUG-020: precompute Cloudflare network integers ONCE. is_cf_ip() then
 # costs zero forks per check (previously up to ~1,500 per call: 753 ranges
@@ -4463,6 +4619,80 @@ is_cf_ip() {
     done
     return 1
 }
+
+# ── IPv6 (Wave 9) ───────────────────────────────────
+ip6tables() { command ip6tables -w 5 "$@"; }
+
+# ip6_in_cidr <ip> <cidr> — pure-awk membership test (no strtonum, so
+# it works under mawk too). Handles "::" compression, mixed case and
+# fully-expanded forms on either side.
+ip6_in_cidr() {
+    awk -v ip="$1" -v cidr="$2" '
+    function pad(h) { while (length(h) < 4) h = "0" h; return h }
+    function expand(a,    k,lp,rp,ln,rn,out,i) {
+        a = tolower(a)
+        k = index(a, "::")
+        if (k > 0) {
+            lp = substr(a, 1, k - 1); rp = substr(a, k + 2)
+            ln = (lp == "") ? 0 : split(lp, L, ":")
+            rn = (rp == "") ? 0 : split(rp, G, ":")
+            out = ""
+            for (i = 1; i <= ln; i++) out = out pad(L[i])
+            for (i = 1; i <= 8 - ln - rn; i++) out = out "0000"
+            for (i = 1; i <= rn; i++) out = out pad(G[i])
+            return out
+        }
+        split(a, P, ":"); out = ""
+        for (i = 1; i <= 8; i++) out = out pad(P[i])
+        return out
+    }
+    function hv(c) { return index("0123456789abcdef", c) - 1 }
+    BEGIN {
+        split(cidr, C, "/"); pfx = C[2] + 0
+        e1 = expand(ip); e2 = expand(C[1])
+        full = int(pfx / 4)
+        if (substr(e1, 1, full) != substr(e2, 1, full)) exit 1
+        rem = pfx % 4
+        if (rem > 0) {
+            # keep the top `rem` bits of the nibble (arithmetic, since
+            # mawk has no bitwise and() builtin)
+            keep = 2 ^ (4 - rem)
+            if (int(hv(substr(e1, full + 1, 1)) / keep) != int(hv(substr(e2, full + 1, 1)) / keep)) exit 1
+        }
+        exit 0
+    }' 2>/dev/null
+}
+
+is_cf6_ip() {
+    local _r6
+    for _r6 in "${CF6_RANGES[@]}"; do
+        ip6_in_cidr "$1" "$_r6" && return 0
+    done
+    return 1
+}
+
+is_exempt6() {
+    local ip="$1" _s6 _w6
+    is_cf6_ip "$ip" && return 0
+    for _s6 in "${SELF6_IPS[@]}"; do
+        ip6_in_cidr "$ip" "$_s6/128" && return 0
+    done
+    if [ -f "$WHITELIST_FILE" ]; then
+        while IFS= read -r _w6; do
+            _w6="${_w6%%#*}"; _w6="${_w6// /}"
+            case "$_w6" in *:*) : ;; *) continue ;; esac
+            [ -n "$_w6" ] && ip6_in_cidr "$ip" "$_w6" && return 0
+        done < "$WHITELIST_FILE"
+    fi
+    return 1
+}
+
+# Family-dispatching wrappers: the pipeline below speaks v4 names;
+# these route IPv6 peers to the v6 enforcers.
+is_exempt_any() { case "$1" in *:*) is_exempt6 "$1" ;; *) is_exempt "$1" ;; esac; }
+nx_ban() { case "$1" in *:*) ban_ip6 "$1" ;; *) ban_ip "$1" ;; esac; }
+nx_throttle() { case "$1" in *:*) throttle_ip6 "$1" ;; *) throttle_ip "$1" ;; esac; }
+nx_hard_throttle() { case "$1" in *:*) hard_throttle_ip6 "$1" ;; *) hard_throttle_ip "$1" ;; esac; }
 
 # subnet_overlaps_cf <a.b.c> — TRUE range-overlap test between a /24 and
 # every CF range (BUG-011: the old check tested only the .1 address, so
@@ -4565,9 +4795,16 @@ reapply_throttles() {
         flow=1:30; [ "$band" = "hard" ] && flow=1:40
         tc_class_exists "$flow" || flow=1:30
         tc_class_exists "$flow" || continue
-        tc filter del dev "$IF" parent 1: protocol ip prio "$prio" 2>/dev/null || true
-        tc filter add dev "$IF" parent 1: protocol ip prio "$prio" \
-            u32 match ip dst "$ip/32" flowid $flow 2>/dev/null || true
+        case "$ip" in
+            *:*)
+                tc filter del dev "$IF" parent 1: protocol ip6 prio "$prio" 2>/dev/null || true
+                tc filter add dev "$IF" parent 1: protocol ip6 prio "$prio" \
+                    u32 match ip6 dst "$ip" flowid $flow 2>/dev/null || true ;;
+            *)
+                tc filter del dev "$IF" parent 1: protocol ip prio "$prio" 2>/dev/null || true
+                tc filter add dev "$IF" parent 1: protocol ip prio "$prio" \
+                    u32 match ip dst "$ip/32" flowid $flow 2>/dev/null || true ;;
+        esac
     done < "$THROTTLE_LIST"
 }
 throttle_ip() {
@@ -4666,6 +4903,51 @@ ban_ip() {
 # ════════════════════════════════════════════════════════════
 
 # ensure SCORE_DIR exists and SCORE_FILE is readable
+
+# ── IPv6 enforcers (Wave 9): mirrors of the v4 functions ──
+_throttle6() {  # <ip> <soft|hard>
+    local ip="$1" band="${2:-soft}" flow="1:30"
+    [ "$band" = "hard" ] && flow="1:40"
+    is_exempt6 "$ip" && return 0
+    state_has_ip "$THROTTLE_LIST" "$ip" && return 0
+    tc_class_exists "$flow" || flow="1:30"
+    if ! tc_class_exists "$flow"; then
+        log " THROTTLE SKIP (v6): $ip - no tc classes on $IF (autoban-only mode)"
+        return 0
+    fi
+    local prio
+    prio=$(next_tc_prio)
+    if tc filter add dev "$IF" parent 1: protocol ip6 prio "$prio" \
+        u32 match ip6 dst "$ip" flowid $flow 2>/dev/null; then
+        echo "$ip $prio $(date +%s) $band" >> "$THROTTLE_LIST"
+        log " THROTTLED (v6): $ip -> $flow (prio $prio)"
+    else
+        log " THROTTLE FAILED (v6): $ip - tc refused the filter; state not recorded"
+    fi
+}
+throttle_ip6() { _throttle6 "$1" soft; }
+hard_throttle_ip6() { _throttle6 "$1" hard; }
+
+ban_ip6() {
+    local ip="$1" _s6
+    is_exempt6 "$ip" && return 0
+    # Self-IP choke guard (FR-2): refuse, always, no exceptions.
+    for _s6 in "${SELF6_IPS[@]}"; do
+        if ip6_in_cidr "$ip" "$_s6/128"; then
+            log " REFUSED: $ip is a server IPv6 address (self-IP immunity)"
+            return 0
+        fi
+    done
+    state_has_ip "$BANNED_LIST" "$ip" && return 0
+    local _PRIO
+    _PRIO=$(state_get_field "$THROTTLE_LIST" "$ip" 2)
+    [ -n "$_PRIO" ] && tc filter del dev "$IF" parent 1: protocol ip6 prio "$_PRIO" 2>/dev/null || true
+    state_del_ip "$THROTTLE_LIST" "$ip"
+    ip6tables -C INPUT -s "$ip" -m comment --comment "auto-ban" -j DROP 2>/dev/null || \
+        ip6tables -I INPUT -s "$ip" -m comment --comment "auto-ban" -j DROP 2>/dev/null || true
+    echo "$ip $(date +%s) $((BAN_HOURS * 3600))" >> "$BANNED_LIST"
+    log " BANNED (v6): $ip for ${BAN_HOURS}h"
+}
 score_init() {
     mkdir -p "$SCORE_DIR" 2>/dev/null || true
     touch "$SCORE_FILE" 2>/dev/null || true
@@ -4778,7 +5060,7 @@ reputation_sweep() {
 update_score() {
     local ip="$1" cur="$2" dt="$3"
     [ "$dt" -lt 1 ] && dt=1
-    is_exempt "$ip" && { clear_reputation "$ip"; return 0; }
+    is_exempt_any "$ip" && { clear_reputation "$ip"; return 0; }
     state_has_ip "$SCORE_FILE" "$ip" || echo "$ip 100 0 0 0" >> "$SCORE_FILE" 2>/dev/null || true
 
     load_reputation "$ip"
@@ -4850,18 +5132,18 @@ update_score() {
     if [ "$REP_SCORE" -lt "$SCORE_BAN" ]; then
         if ! state_has_ip "$BANNED_LIST" "$ip"; then
             log " REP-BAN: $ip | score $REP_SCORE (below $SCORE_BAN) → ban ${BAN_HOURS}h"
-            throttle_ip "$ip"
-            ban_ip "$ip"
+            nx_throttle "$ip"
+            nx_ban "$ip"
             # D3: the ban sets up its own release - when it expires, the
             # IP returns in PROBATION at PROBATION_SCORE (rep_on_unban
             # enforces the same transition on the expiry path).
             rep_on_ban "$ip"
         fi
     elif [ "$REP_SCORE" -lt "$SCORE_HARD" ]; then
-        hard_throttle_ip "$ip"
+        nx_hard_throttle "$ip"
         log " REP-HARD: $ip | score $REP_SCORE → 50Mbps"
     elif [ "$REP_SCORE" -lt "$SCORE_THROTTLE" ]; then
-        throttle_ip "$ip"
+        nx_throttle "$ip"
         log " REP-THROTTLE: $ip | score $REP_SCORE → 100Mbps"
     elif [ "$REP_SCORE" -lt "$SCORE_SUSPECT" ]; then
         # SUSPECT band: watch only, no bandwidth penalty. But ensure it is on
@@ -4951,6 +5233,7 @@ unban_expired() {
         if [ "$NOW" -gt "$EXPIRE" ]; then
             # Skip subnet bans — handled by unban_subnet_expired
             [[ "$ip" == *"/"* ]] && NEWLIST="${NEWLIST}${ip} ${ts} ${duration}\n" && continue
+            [[ "$ip" == *":"* ]] && ip6tables -D INPUT -s "$ip" -m comment --comment "auto-ban" -j DROP 2>/dev/null || true
             iptables -D INPUT -s "$ip" -m comment --comment "auto-ban" -j DROP \
                 2>/dev/null || true
             # D3 (FR-3): expiry is a probation release, never a return to
@@ -4980,6 +5263,7 @@ reconcile_bans() {
         duration="${duration//[^0-9]/}"; duration="${duration:-14400}"
         [ $(( ts + duration )) -le "$now" ] && continue
         case "$ip" in
+            *:*) ip6tables -C INPUT -s "$ip" -m comment --comment "auto-ban" -j DROP 2>/dev/null || ip6tables -I INPUT -s "$ip" -m comment --comment "auto-ban" -j DROP 2>/dev/null || true ;;
             */*) iptables -C INPUT -s "$ip" -m comment --comment "subnet-ban" -j DROP 2>/dev/null || \
                  iptables -I INPUT -s "$ip" -m comment --comment "subnet-ban" -j DROP 2>/dev/null || true ;;
             *)   iptables -C INPUT -s "$ip" -m comment --comment "auto-ban" -j DROP 2>/dev/null || \
@@ -5007,6 +5291,15 @@ self_guard() {
             iptables -D $_rule 2>/dev/null && \
                 log " SELF-GUARD: removed DROP rule hitting own IP $_sip"
         done < <(iptables -S INPUT 2>/dev/null | grep -E -- "-s ${_esc}(/32)?[[:space:]]" | grep -- '-j DROP' | sed 's/^-A /INPUT /')
+    done
+    # IPv6 self sweep (Wave 9): the same hard guarantee for v6
+    local _sip6
+    for _sip6 in "${SELF6_IPS[@]}"; do
+        if ip6tables -C INPUT -s "$_sip6" -j DROP 2>/dev/null; then
+            ip6tables -D INPUT -s "$_sip6" -j DROP 2>/dev/null || true
+            log " SELF-GUARD: removed DROP rule for own IPv6 $_sip6"
+        fi
+        state_del_ip "$BANNED_LIST" "$_sip6"
     done
     if [ -f "$THROTTLE_LIST" ]; then
         local _prio
@@ -5054,7 +5347,7 @@ while true; do
                if (lp !~ /^[0-9]+$/) next;
                if (lp >= 32768) next;
                print $5 }' | \
-        grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | \
+        { grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+'; grep -oE '\[[0-9a-fA-F:]+\]' | tr -d '[]'; } | \
         sort | uniq -c | sort -rn | head -100 || true)
     if [ -n "$SS_OUT" ]; then
         while IFS= read -r line; do
@@ -5071,7 +5364,7 @@ while true; do
         [ "${count:-0}" -lt "$CONN_THRESHOLD" ] && continue
 
         # Skip exempt IPs (CF + self)
-        is_exempt "$ip" && continue
+        is_exempt_any "$ip" && continue
 
         # Skip already banned
         state_has_ip "$BANNED_LIST" "$ip" && continue
@@ -5083,9 +5376,9 @@ while true; do
         # Immediate action if way over limit (≥ BAN_CONN_THRESHOLD conns)
         if [ "${count:-0}" -ge "$BAN_CONN_THRESHOLD" ]; then
             if ! state_has_ip "$THROTTLE_LIST" "$ip"; then
-                throttle_ip "$ip"
+                nx_throttle "$ip"
             fi
-            ban_ip "$ip"
+            nx_ban "$ip"
             rep_on_ban "$ip"
             state_del_ip "$WATCH_LIST" "$ip"
             log " INSTANT BAN: $ip | ${count} active connections (>=${BAN_CONN_THRESHOLD})"
@@ -5104,12 +5397,12 @@ while true; do
                 if state_has_ip "$THROTTLE_LIST" "$ip"; then
                     # Already throttled — now ban (ban_ip cleans the
                     # throttle filter + its state entry itself)
-                    ban_ip "$ip"
+                    nx_ban "$ip"
                     rep_on_ban "$ip"
                     state_del_ip "$WATCH_LIST" "$ip"
                 else
                     # Not yet throttled — throttle now
-                    throttle_ip "$ip"
+                    nx_throttle "$ip"
                     # Reset watch timer
                     state_del_ip "$WATCH_LIST" "$ip"
                     echo "$ip $(date +%s)" >> "$WATCH_LIST"
@@ -5139,7 +5432,7 @@ while true; do
     # CF + own IPs are always exempt; banned IPs stay banned until expiry.
     while IFS=' ' read -r ip ts; do
         [ -z "$ip" ] && continue
-        is_exempt "$ip" && continue
+        is_exempt_any "$ip" && continue
         state_has_ip "$BANNED_LIST" "$ip" && continue
         # Still hot → keep throttled, let scoring manage it.
         [ "${CONN_COUNT[$ip]:-0}" -ge "$CONN_THRESHOLD" ] && continue
@@ -5164,7 +5457,8 @@ while true; do
     for ip in "${!CONN_COUNT[@]}"; do
         # BUG-011: exempt traffic (CF/self/whitelist) never counts toward
         # a subnet ban - it used to inflate the totals.
-        is_exempt "$ip" && continue
+        is_exempt_any "$ip" && continue
+        case "$ip" in *:*) continue ;; esac
         subnet=$(echo "$ip" | grep -oP '^\d+\.\d+\.\d+')
         [ -z "$subnet" ] && continue
         SUBNET_COUNT["$subnet"]=$(( ${SUBNET_COUNT[$subnet]:-0} + ${CONN_COUNT[$ip]:-0} ))
@@ -5296,6 +5590,13 @@ setup_tc() {
         HANDLE=$((HANDLE + 1))
     done
 
+    # CF IPv6 → class 1:10 (Wave 9: protocol ip6 / match ip6 dst)
+    for CF6 in "${CF6_RANGES[@]}"; do
+        tc filter add dev "$MAIN_IF" parent 1: protocol ip6 prio $HANDLE \
+            u32 match ip6 dst "$CF6" flowid 1:10 2>/dev/null || true
+        HANDLE=$((HANDLE + 1))
+    done
+
     # Server own IPs → class 1:10
     while IFS= read -r SIP; do
         [ -z "$SIP" ] && continue
@@ -5355,6 +5656,14 @@ for CF in "${CF_RANGES[@]}"; do
     tc filter add dev "$IF" parent 1: protocol ip prio $H \
         u32 match ip dst "$CF" flowid 1:10 2>/dev/null || true; H=$((H+1))
 done
+# CF IPv6 ranges (Wave 9), loaded from the runtime data file
+if [ -f /etc/antiddos/cloudflare-ipv6.list ]; then
+    while IFS= read -r CF6; do
+        [ -z "$CF6" ] && continue
+        tc filter add dev "$IF" parent 1: protocol ip6 prio $H \
+            u32 match ip6 dst "$CF6" flowid 1:10 2>/dev/null || true; H=$((H+1))
+    done < /etc/antiddos/cloudflare-ipv6.list
+fi
 for SIP in $(ip -4 addr show 2>/dev/null | grep 'inet ' | \
     grep -v '127\.\|10\.\|192\.168\.' | awk '{print $2}' | cut -d/ -f1); do
     tc filter add dev "$IF" parent 1: protocol ip prio $H \
@@ -5423,6 +5732,8 @@ setup_persistence() {
 #!/bin/bash
 RULES="/etc/antiddos/iptables-antiddos.rules"
 [ -f "$RULES" ] && iptables-restore < "$RULES" 2>/dev/null || true
+[ -f /etc/antiddos/ip6tables-antiddos.rules ] && \
+    ip6tables-restore < /etc/antiddos/ip6tables-antiddos.rules 2>/dev/null || true
 [ -f /etc/sysctl.d/98-antiddos-hardening.conf ] && \
     sysctl -p /etc/sysctl.d/98-antiddos-hardening.conf >/dev/null 2>&1 || true
 EOF
@@ -5581,6 +5892,11 @@ remove_rules() {
     local RULE_PAT='hashlimit|SYNPROXY|connlimit|cf_whitelist|auto-ban|subnet-ban|self_whitelist|user_whitelist|nx_connlimit|--ctstate INVALID|--tcp-flags| -f -j DROP|! --syn|-i lo|--ctstate ESTABLISHED,RELATED -j ACCEPT'
     nx_delete_matching filter INPUT "$RULE_PAT"
     nx_delete_matching filter FORWARD "$RULE_PAT"
+
+    # IPv6 cleanup (Wave 9): same pattern set against ip6tables
+    nx_delete_matching6 INPUT "$RULE_PAT"
+    nx_delete_matching6 FORWARD "$RULE_PAT"
+    rm -f /etc/antiddos/ip6tables-antiddos.rules 2>/dev/null || true
 
     # raw table: delete ONLY our own ACCEPTs - those whose source is a CF
     # range, a self IP or a whitelist entry. The old loop's bare "ACCEPT"

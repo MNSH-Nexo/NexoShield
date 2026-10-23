@@ -174,6 +174,30 @@ those waves land.
   a sweep confirmed no dead duplicate function copies remain in the
   menu (the shared names are per-program print/lock helpers, by
   design). Tests: wave-8 regression guards 17/17; suites green.
+- Wave 9 — DONE (IPv6 full parity, Q1 default). New data + loader:
+  `src/data/cloudflare-ipv6.list` (the 7 official CF v6 ranges) and
+  `src/lib/cloudflare6-loader.sh`; the installer writes both v6 data
+  files. Anti-DDoS: `apply_ip6tables()` mirrors the IPv4 INPUT design
+  (exempt ACCEPTs → http_req_rate6 policing above the ESTABLISHED
+  accept → INVALID drop → SYN/UDP/ICMPv6 hashlimits with NDP kept
+  working → connlimit per /128 with the same [CONNLIMIT DROP] log
+  prefix → [NX-SCAN] logging + scan drops), saves static v6 rules,
+  restores them on boot, and full removal cleans them via
+  `nx_delete_matching6`. tc classifies CF v6 ranges to the unlimited
+  class (runtime + generated persistence script). fail2ban ignoreip
+  is dual-stack. Auto-ban daemon: the sampler counts IPv6 peers;
+  `ip6_in_cidr` is a mawk-safe pure-awk membership test (no strtonum,
+  no bitwise builtins); `is_exempt6` covers CF v6 + self v6 +
+  whitelist v6; `ban_ip6`/`throttle_ip6`/`hard_throttle_ip6` mirror
+  the v4 enforcers (same state files, same prio allocator, probation
+  lifecycle included) behind family-dispatch wrappers
+  (nx_ban/nx_throttle/nx_hard_throttle/is_exempt_any) used by every
+  pipeline call site; unban/reconcile/self_guard all handle v6; the
+  subnet engine stays IPv4-only by design. BUG-023/059/064 closed by
+  this parity (the sysctl IPv6 block already existed; it is no
+  longer the only v6 code in the product). Tests: ip6 membership
+  13/13 incl. /29 boundary and expanded/mixed-case forms; verify.py's
+  dedup needle tightened so the v6 loader doesn't false-positive it.
 
 **Inputs:** `docs/BUGS.md` — 68 audited findings (BUG-001…068) plus the
 maintainer's field reports FR-1 (whitelist must exempt from *everything*),

@@ -112,7 +112,7 @@ reputation_sweep() {
 update_score() {
     local ip="$1" cur="$2" dt="$3"
     [ "$dt" -lt 1 ] && dt=1
-    is_exempt "$ip" && { clear_reputation "$ip"; return 0; }
+    is_exempt_any "$ip" && { clear_reputation "$ip"; return 0; }
     state_has_ip "$SCORE_FILE" "$ip" || echo "$ip 100 0 0 0" >> "$SCORE_FILE" 2>/dev/null || true
 
     load_reputation "$ip"
@@ -184,18 +184,18 @@ update_score() {
     if [ "$REP_SCORE" -lt "$SCORE_BAN" ]; then
         if ! state_has_ip "$BANNED_LIST" "$ip"; then
             log " REP-BAN: $ip | score $REP_SCORE (below $SCORE_BAN) → ban ${BAN_HOURS}h"
-            throttle_ip "$ip"
-            ban_ip "$ip"
+            nx_throttle "$ip"
+            nx_ban "$ip"
             # D3: the ban sets up its own release - when it expires, the
             # IP returns in PROBATION at PROBATION_SCORE (rep_on_unban
             # enforces the same transition on the expiry path).
             rep_on_ban "$ip"
         fi
     elif [ "$REP_SCORE" -lt "$SCORE_HARD" ]; then
-        hard_throttle_ip "$ip"
+        nx_hard_throttle "$ip"
         log " REP-HARD: $ip | score $REP_SCORE → 50Mbps"
     elif [ "$REP_SCORE" -lt "$SCORE_THROTTLE" ]; then
-        throttle_ip "$ip"
+        nx_throttle "$ip"
         log " REP-THROTTLE: $ip | score $REP_SCORE → 100Mbps"
     elif [ "$REP_SCORE" -lt "$SCORE_SUSPECT" ]; then
         # SUSPECT band: watch only, no bandwidth penalty. But ensure it is on

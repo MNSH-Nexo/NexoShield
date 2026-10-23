@@ -35,9 +35,16 @@ reapply_throttles() {
         flow=1:30; [ "$band" = "hard" ] && flow=1:40
         tc_class_exists "$flow" || flow=1:30
         tc_class_exists "$flow" || continue
-        tc filter del dev "$IF" parent 1: protocol ip prio "$prio" 2>/dev/null || true
-        tc filter add dev "$IF" parent 1: protocol ip prio "$prio" \
-            u32 match ip dst "$ip/32" flowid $flow 2>/dev/null || true
+        case "$ip" in
+            *:*)
+                tc filter del dev "$IF" parent 1: protocol ip6 prio "$prio" 2>/dev/null || true
+                tc filter add dev "$IF" parent 1: protocol ip6 prio "$prio" \
+                    u32 match ip6 dst "$ip" flowid $flow 2>/dev/null || true ;;
+            *)
+                tc filter del dev "$IF" parent 1: protocol ip prio "$prio" 2>/dev/null || true
+                tc filter add dev "$IF" parent 1: protocol ip prio "$prio" \
+                    u32 match ip dst "$ip/32" flowid $flow 2>/dev/null || true ;;
+        esac
     done < "$THROTTLE_LIST"
 }
 throttle_ip() {
@@ -136,3 +143,48 @@ ban_ip() {
 # ════════════════════════════════════════════════════════════
 
 # ensure SCORE_DIR exists and SCORE_FILE is readable
+
+# ── IPv6 enforcers (Wave 9): mirrors of the v4 functions ──
+_throttle6() {  # <ip> <soft|hard>
+    local ip="$1" band="${2:-soft}" flow="1:30"
+    [ "$band" = "hard" ] && flow="1:40"
+    is_exempt6 "$ip" && return 0
+    state_has_ip "$THROTTLE_LIST" "$ip" && return 0
+    tc_class_exists "$flow" || flow="1:30"
+    if ! tc_class_exists "$flow"; then
+        log " THROTTLE SKIP (v6): $ip - no tc classes on $IF (autoban-only mode)"
+        return 0
+    fi
+    local prio
+    prio=$(next_tc_prio)
+    if tc filter add dev "$IF" parent 1: protocol ip6 prio "$prio" \
+        u32 match ip6 dst "$ip" flowid $flow 2>/dev/null; then
+        echo "$ip $prio $(date +%s) $band" >> "$THROTTLE_LIST"
+        log " THROTTLED (v6): $ip -> $flow (prio $prio)"
+    else
+        log " THROTTLE FAILED (v6): $ip - tc refused the filter; state not recorded"
+    fi
+}
+throttle_ip6() { _throttle6 "$1" soft; }
+hard_throttle_ip6() { _throttle6 "$1" hard; }
+
+ban_ip6() {
+    local ip="$1" _s6
+    is_exempt6 "$ip" && return 0
+    # Self-IP choke guard (FR-2): refuse, always, no exceptions.
+    for _s6 in "${SELF6_IPS[@]}"; do
+        if ip6_in_cidr "$ip" "$_s6/128"; then
+            log " REFUSED: $ip is a server IPv6 address (self-IP immunity)"
+            return 0
+        fi
+    done
+    state_has_ip "$BANNED_LIST" "$ip" && return 0
+    local _PRIO
+    _PRIO=$(state_get_field "$THROTTLE_LIST" "$ip" 2)
+    [ -n "$_PRIO" ] && tc filter del dev "$IF" parent 1: protocol ip6 prio "$_PRIO" 2>/dev/null || true
+    state_del_ip "$THROTTLE_LIST" "$ip"
+    ip6tables -C INPUT -s "$ip" -m comment --comment "auto-ban" -j DROP 2>/dev/null || \
+        ip6tables -I INPUT -s "$ip" -m comment --comment "auto-ban" -j DROP 2>/dev/null || true
+    echo "$ip $(date +%s) $((BAN_HOURS * 3600))" >> "$BANNED_LIST"
+    log " BANNED (v6): $ip for ${BAN_HOURS}h"
+}

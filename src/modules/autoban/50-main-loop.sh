@@ -12,6 +12,7 @@ unban_expired() {
         if [ "$NOW" -gt "$EXPIRE" ]; then
             # Skip subnet bans — handled by unban_subnet_expired
             [[ "$ip" == *"/"* ]] && NEWLIST="${NEWLIST}${ip} ${ts} ${duration}\n" && continue
+            [[ "$ip" == *":"* ]] && ip6tables -D INPUT -s "$ip" -m comment --comment "auto-ban" -j DROP 2>/dev/null || true
             iptables -D INPUT -s "$ip" -m comment --comment "auto-ban" -j DROP \
                 2>/dev/null || true
             # D3 (FR-3): expiry is a probation release, never a return to
@@ -41,6 +42,7 @@ reconcile_bans() {
         duration="${duration//[^0-9]/}"; duration="${duration:-14400}"
         [ $(( ts + duration )) -le "$now" ] && continue
         case "$ip" in
+            *:*) ip6tables -C INPUT -s "$ip" -m comment --comment "auto-ban" -j DROP 2>/dev/null || ip6tables -I INPUT -s "$ip" -m comment --comment "auto-ban" -j DROP 2>/dev/null || true ;;
             */*) iptables -C INPUT -s "$ip" -m comment --comment "subnet-ban" -j DROP 2>/dev/null || \
                  iptables -I INPUT -s "$ip" -m comment --comment "subnet-ban" -j DROP 2>/dev/null || true ;;
             *)   iptables -C INPUT -s "$ip" -m comment --comment "auto-ban" -j DROP 2>/dev/null || \
@@ -68,6 +70,15 @@ self_guard() {
             iptables -D $_rule 2>/dev/null && \
                 log " SELF-GUARD: removed DROP rule hitting own IP $_sip"
         done < <(iptables -S INPUT 2>/dev/null | grep -E -- "-s ${_esc}(/32)?[[:space:]]" | grep -- '-j DROP' | sed 's/^-A /INPUT /')
+    done
+    # IPv6 self sweep (Wave 9): the same hard guarantee for v6
+    local _sip6
+    for _sip6 in "${SELF6_IPS[@]}"; do
+        if ip6tables -C INPUT -s "$_sip6" -j DROP 2>/dev/null; then
+            ip6tables -D INPUT -s "$_sip6" -j DROP 2>/dev/null || true
+            log " SELF-GUARD: removed DROP rule for own IPv6 $_sip6"
+        fi
+        state_del_ip "$BANNED_LIST" "$_sip6"
     done
     if [ -f "$THROTTLE_LIST" ]; then
         local _prio
@@ -115,7 +126,7 @@ while true; do
                if (lp !~ /^[0-9]+$/) next;
                if (lp >= 32768) next;
                print $5 }' | \
-        grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | \
+        { grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+'; grep -oE '\[[0-9a-fA-F:]+\]' | tr -d '[]'; } | \
         sort | uniq -c | sort -rn | head -100 || true)
     if [ -n "$SS_OUT" ]; then
         while IFS= read -r line; do
@@ -132,7 +143,7 @@ while true; do
         [ "${count:-0}" -lt "$CONN_THRESHOLD" ] && continue
 
         # Skip exempt IPs (CF + self)
-        is_exempt "$ip" && continue
+        is_exempt_any "$ip" && continue
 
         # Skip already banned
         state_has_ip "$BANNED_LIST" "$ip" && continue
@@ -144,9 +155,9 @@ while true; do
         # Immediate action if way over limit (≥ BAN_CONN_THRESHOLD conns)
         if [ "${count:-0}" -ge "$BAN_CONN_THRESHOLD" ]; then
             if ! state_has_ip "$THROTTLE_LIST" "$ip"; then
-                throttle_ip "$ip"
+                nx_throttle "$ip"
             fi
-            ban_ip "$ip"
+            nx_ban "$ip"
             rep_on_ban "$ip"
             state_del_ip "$WATCH_LIST" "$ip"
             log " INSTANT BAN: $ip | ${count} active connections (>=${BAN_CONN_THRESHOLD})"
@@ -165,12 +176,12 @@ while true; do
                 if state_has_ip "$THROTTLE_LIST" "$ip"; then
                     # Already throttled — now ban (ban_ip cleans the
                     # throttle filter + its state entry itself)
-                    ban_ip "$ip"
+                    nx_ban "$ip"
                     rep_on_ban "$ip"
                     state_del_ip "$WATCH_LIST" "$ip"
                 else
                     # Not yet throttled — throttle now
-                    throttle_ip "$ip"
+                    nx_throttle "$ip"
                     # Reset watch timer
                     state_del_ip "$WATCH_LIST" "$ip"
                     echo "$ip $(date +%s)" >> "$WATCH_LIST"
@@ -200,7 +211,7 @@ while true; do
     # CF + own IPs are always exempt; banned IPs stay banned until expiry.
     while IFS=' ' read -r ip ts; do
         [ -z "$ip" ] && continue
-        is_exempt "$ip" && continue
+        is_exempt_any "$ip" && continue
         state_has_ip "$BANNED_LIST" "$ip" && continue
         # Still hot → keep throttled, let scoring manage it.
         [ "${CONN_COUNT[$ip]:-0}" -ge "$CONN_THRESHOLD" ] && continue
@@ -225,7 +236,8 @@ while true; do
     for ip in "${!CONN_COUNT[@]}"; do
         # BUG-011: exempt traffic (CF/self/whitelist) never counts toward
         # a subnet ban - it used to inflate the totals.
-        is_exempt "$ip" && continue
+        is_exempt_any "$ip" && continue
+        case "$ip" in *:*) continue ;; esac
         subnet=$(echo "$ip" | grep -oP '^\d+\.\d+\.\d+')
         [ -z "$subnet" ] && continue
         SUBNET_COUNT["$subnet"]=$(( ${SUBNET_COUNT[$subnet]:-0} + ${CONN_COUNT[$ip]:-0} ))

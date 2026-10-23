@@ -16,7 +16,7 @@ extract_fn() { # src fn out
     sed -n "${start},$((start + end - 1))p" "$1" >> "$3"
 }
 : > "$TMP/fns.sh"
-for fn in state_has_ip state_get_field state_del_ip; do
+for fn in state_has_ip state_get_field state_del_ip is_exempt_any nx_ban nx_throttle nx_hard_throttle; do
     extract_fn src/modules/autoban/10-ip-utils.sh "$fn" "$TMP/fns.sh" || { echo "FAIL extract $fn"; exit 1; }
 done
 for fn in score_init load_reputation save_reputation clear_reputation rep_on_ban rep_on_unban update_score reputation_sweep; do

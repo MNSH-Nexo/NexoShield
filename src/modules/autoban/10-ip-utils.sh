@@ -58,6 +58,80 @@ is_cf_ip() {
     return 1
 }
 
+# ── IPv6 (Wave 9) ───────────────────────────────────
+ip6tables() { command ip6tables -w 5 "$@"; }
+
+# ip6_in_cidr <ip> <cidr> — pure-awk membership test (no strtonum, so
+# it works under mawk too). Handles "::" compression, mixed case and
+# fully-expanded forms on either side.
+ip6_in_cidr() {
+    awk -v ip="$1" -v cidr="$2" '
+    function pad(h) { while (length(h) < 4) h = "0" h; return h }
+    function expand(a,    k,lp,rp,ln,rn,out,i) {
+        a = tolower(a)
+        k = index(a, "::")
+        if (k > 0) {
+            lp = substr(a, 1, k - 1); rp = substr(a, k + 2)
+            ln = (lp == "") ? 0 : split(lp, L, ":")
+            rn = (rp == "") ? 0 : split(rp, G, ":")
+            out = ""
+            for (i = 1; i <= ln; i++) out = out pad(L[i])
+            for (i = 1; i <= 8 - ln - rn; i++) out = out "0000"
+            for (i = 1; i <= rn; i++) out = out pad(G[i])
+            return out
+        }
+        split(a, P, ":"); out = ""
+        for (i = 1; i <= 8; i++) out = out pad(P[i])
+        return out
+    }
+    function hv(c) { return index("0123456789abcdef", c) - 1 }
+    BEGIN {
+        split(cidr, C, "/"); pfx = C[2] + 0
+        e1 = expand(ip); e2 = expand(C[1])
+        full = int(pfx / 4)
+        if (substr(e1, 1, full) != substr(e2, 1, full)) exit 1
+        rem = pfx % 4
+        if (rem > 0) {
+            # keep the top `rem` bits of the nibble (arithmetic, since
+            # mawk has no bitwise and() builtin)
+            keep = 2 ^ (4 - rem)
+            if (int(hv(substr(e1, full + 1, 1)) / keep) != int(hv(substr(e2, full + 1, 1)) / keep)) exit 1
+        }
+        exit 0
+    }' 2>/dev/null
+}
+
+is_cf6_ip() {
+    local _r6
+    for _r6 in "${CF6_RANGES[@]}"; do
+        ip6_in_cidr "$1" "$_r6" && return 0
+    done
+    return 1
+}
+
+is_exempt6() {
+    local ip="$1" _s6 _w6
+    is_cf6_ip "$ip" && return 0
+    for _s6 in "${SELF6_IPS[@]}"; do
+        ip6_in_cidr "$ip" "$_s6/128" && return 0
+    done
+    if [ -f "$WHITELIST_FILE" ]; then
+        while IFS= read -r _w6; do
+            _w6="${_w6%%#*}"; _w6="${_w6// /}"
+            case "$_w6" in *:*) : ;; *) continue ;; esac
+            [ -n "$_w6" ] && ip6_in_cidr "$ip" "$_w6" && return 0
+        done < "$WHITELIST_FILE"
+    fi
+    return 1
+}
+
+# Family-dispatching wrappers: the pipeline below speaks v4 names;
+# these route IPv6 peers to the v6 enforcers.
+is_exempt_any() { case "$1" in *:*) is_exempt6 "$1" ;; *) is_exempt "$1" ;; esac; }
+nx_ban() { case "$1" in *:*) ban_ip6 "$1" ;; *) ban_ip "$1" ;; esac; }
+nx_throttle() { case "$1" in *:*) throttle_ip6 "$1" ;; *) throttle_ip "$1" ;; esac; }
+nx_hard_throttle() { case "$1" in *:*) hard_throttle_ip6 "$1" ;; *) hard_throttle_ip "$1" ;; esac; }
+
 # subnet_overlaps_cf <a.b.c> — TRUE range-overlap test between a /24 and
 # every CF range (BUG-011: the old check tested only the .1 address, so
 # a CF range starting mid-/24 was missed).

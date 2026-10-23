@@ -89,6 +89,10 @@ EOF
             [ -n "$_F2B_WL" ] && _F2B_IGNORE="$_F2B_IGNORE $_F2B_WL"
         done < "$WHITELIST_FILE"
     fi
+    # IPv6 (Wave 9): CF's v6 ranges join ignoreip too (they are few).
+    for _F2B_CF6 in "${CF6_RANGES[@]}"; do
+        _F2B_IGNORE="$_F2B_IGNORE $_F2B_CF6"
+    done
     _F2B_CF_N=0
     for _F2B_CF in "${CF_RANGES[@]}"; do
         _F2B_CF_N=$((_F2B_CF_N + 1))

@@ -104,9 +104,18 @@ def build():
     ]
     cf_block = "\n".join(f'    "{entry}"' for entry in cf_entries)
 
+    cf6_entries = [
+        line.strip()
+        for line in read("src/data/cloudflare-ipv6.list").split("\n")
+        if line.strip()
+    ]
+    cf6_block = "\n".join(f'    "{entry}"' for entry in cf6_entries)
+
     def subst(text):
         return text.replace("@@VERSION@@", version).replace(
             "@@CF_ENTRIES@@", cf_block
+        ).replace(
+            "@@CF6_ENTRIES@@", cf6_block
         )
 
     preamble = subst(read("src/installer/preamble.sh")).split("\n")
@@ -146,6 +155,7 @@ def build():
         for tok in (
             "@@VERSION@@",
             "@@CF_ENTRIES@@",
+            "@@CF6_ENTRIES@@",
             "@@AUTOBAN_BODY@@",
             "# @include",
             "# @part",

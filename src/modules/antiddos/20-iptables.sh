@@ -379,6 +379,108 @@ apply_iptables() {
     save_static_rules "$IPTABLES_SAVE_FILE"
     chmod 600 "$IPTABLES_SAVE_FILE"
     success "iptables rules saved"
+
+    # IPv6 mirror of this design (Wave 9)
+    apply_ip6tables
+}
+
+# ════════════════════════════════════════════════
+# IPv6 mirror of the INPUT design (Wave 9). Same layer order as IPv4:
+# exempt ACCEPTs -> request policing -> ESTABLISHED -> flood limits ->
+# connlimit -> scan drops. Skipped cleanly when no IPv6 stack exists.
+# ════════════════════════════════════════════════
+apply_ip6tables() {
+    command -v ip6tables >/dev/null 2>&1 || { info "ip6tables unavailable - IPv6 rules skipped"; return 0; }
+    ip6tables -L INPUT >/dev/null 2>&1 || { info "IPv6 stack unavailable - IPv6 rules skipped"; return 0; }
+    info "Applying IPv6 firewall rules (mirror of the IPv4 design)..."
+    ipt6_add() { ip6tables -C "$@" 2>/dev/null || ip6tables -A "$@" 2>/dev/null || true; }
+
+    ipt6_add INPUT -i lo -j ACCEPT
+
+    # Exempt set snapshot (CF v6 + self v6 + whitelist v6 entries)
+    : > /etc/antiddos/exempt6.list 2>/dev/null || true
+    local _r6 _s6 _w6
+    for _r6 in "${CF6_RANGES[@]}"; do
+        ipt6_add INPUT -s "$_r6" -j ACCEPT
+        echo "$_r6" >> /etc/antiddos/exempt6.list
+    done
+    while IFS= read -r _s6; do
+        [ -z "$_s6" ] && continue
+        ipt6_add INPUT -s "$_s6/128" -j ACCEPT
+        echo "$_s6" >> /etc/antiddos/exempt6.list
+    done < <(list_self_ips6)
+    if [ -f "$WHITELIST_FILE" ]; then
+        while IFS= read -r _w6; do
+            _w6="${_w6%%#*}"; _w6="${_w6// /}"
+            case "$_w6" in *:*) : ;; *) continue ;; esac
+            [ -z "$_w6" ] && continue
+            ipt6_add INPUT -s "$_w6" -j ACCEPT
+            echo "$_w6" >> /etc/antiddos/exempt6.list
+        done < "$WHITELIST_FILE"
+    fi
+
+    # Request-rate policing BEFORE the established accept (same BUG-002
+    # lesson as IPv4: below it, this rule could never fire)
+    ipt6_add INPUT -p tcp -m multiport --dports 80,443 \
+        -m hashlimit --hashlimit-name http_req_rate6 --hashlimit-mode srcip \
+        --hashlimit 300/min --hashlimit-burst 100 -j DROP
+
+    ipt6_add INPUT -m conntrack --ctstate INVALID -j DROP
+    ipt6_add INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+
+    # Flood limits
+    ipt6_add INPUT -p tcp --syn -m hashlimit --hashlimit-name syn_limit6 \
+        --hashlimit-mode srcip --hashlimit 200/sec --hashlimit-burst 400 -j DROP
+    ipt6_add INPUT -p udp -m hashlimit --hashlimit-name udp_limit6 \
+        --hashlimit-mode srcip --hashlimit 1000/sec --hashlimit-burst 2000 -j DROP
+    # ICMPv6: NDP must keep working (it is IPv6's ARP) - accept it,
+    # rate-limit echo requests, accept the rest.
+    ipt6_add INPUT -p icmpv6 --icmpv6-type 133 -j ACCEPT
+    ipt6_add INPUT -p icmpv6 --icmpv6-type 135 -j ACCEPT
+    ipt6_add INPUT -p icmpv6 --icmpv6-type 136 -j ACCEPT
+    ipt6_add INPUT -p icmpv6 --icmpv6-type echo-request \
+        -m hashlimit --hashlimit-name icmp_limit6 --hashlimit-mode srcip \
+        --hashlimit 50/sec --hashlimit-burst 100 -j DROP
+    ipt6_add INPUT -p icmpv6 -j ACCEPT
+
+    # Connection limit per host (mask 128) with the same LOG prefix the
+    # conn-flood fail2ban jail matches
+    ipt6_add INPUT -p tcp --syn -m connlimit --connlimit-above "$CONN_LIMIT_PER_IP" \
+        --connlimit-mask 128 -j LOG --log-prefix "[CONNLIMIT DROP] " --log-level 4
+    ipt6_add INPUT -p tcp --syn -m connlimit --connlimit-above "$CONN_LIMIT_PER_IP" \
+        --connlimit-mask 128 -m comment --comment "nx_connlimit" -j DROP
+
+    # Scan signatures: LOG ([NX-SCAN], feeds the portscan jail) + DROP
+    ipt6_add INPUT -p tcp --tcp-flags ALL NONE \
+        -m limit --limit 10/min --limit-burst 20 \
+        -j LOG --log-prefix "[NX-SCAN] " --log-level 4
+    ipt6_add INPUT -p tcp --tcp-flags ALL ALL \
+        -m limit --limit 10/min --limit-burst 20 \
+        -j LOG --log-prefix "[NX-SCAN] " --log-level 4
+    ipt6_add INPUT -p tcp --tcp-flags ALL FIN \
+        -m limit --limit 10/min --limit-burst 20 \
+        -j LOG --log-prefix "[NX-SCAN] " --log-level 4
+    ipt6_add INPUT -p tcp --tcp-flags ALL NONE -j DROP
+    ipt6_add INPUT -p tcp --tcp-flags ALL ALL -j DROP
+    ipt6_add INPUT -p tcp --tcp-flags ALL FIN -j DROP
+    ipt6_add INPUT -p tcp --tcp-flags SYN,FIN SYN,FIN -j DROP
+    ipt6_add INPUT -p tcp --tcp-flags SYN,RST SYN,RST -j DROP
+
+    ip6tables-save 2>/dev/null | nx_static_rules_filter > /etc/antiddos/ip6tables-antiddos.rules || true
+    chmod 600 /etc/antiddos/ip6tables-antiddos.rules 2>/dev/null || true
+    success "IPv6 rules applied + saved"
+}
+
+# Delete ip6tables rules by pattern (mirror of nx_delete_matching).
+nx_delete_matching6() {
+    local _c="$1" _p="$2" _n
+    command -v ip6tables >/dev/null 2>&1 || return 0
+    ip6tables -L "$_c" >/dev/null 2>&1 || return 0
+    while true; do
+        _n=$(ip6tables -S "$_c" 2>/dev/null | grep -nE "$_p" | head -1 | cut -d: -f1 || true)
+        [ -z "$_n" ] && break
+        ip6tables -D "$_c" $((_n - 1)) 2>/dev/null || break
+    done
 }
 
 # ════════════════════════════════════════════════

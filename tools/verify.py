@@ -76,7 +76,7 @@ check(
 )
 
 # --- De-duplication ----------------------------------------------------------
-needle = "while IFS= read -r _cfl"
+needle = "while IFS= read -r _cfl; do"
 holders = [
     str(p.relative_to(ROOT))
     for p in (ROOT / "src").rglob("*.sh")

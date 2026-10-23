@@ -50,6 +50,7 @@ EXEMPT_FILE="/etc/antiddos/exempt.list"
 # silently never landed. (iptables-save/-restore are separate binaries
 # and are not affected by this wrapper.)
 iptables() { command iptables -w 5 "$@"; }
+ip6tables() { command ip6tables -w 5 "$@"; }
 
 mkdir -p /etc/antiddos
 touch "$LOG_FILE" && chmod 600 "$LOG_FILE"
@@ -64,6 +65,7 @@ sep()     { echo -e "${CYAN}═════════════════�
 
 # ── Cloudflare IP ranges (NEVER rate-limited) ─────────────
 # @include lib/cloudflare-loader.sh
+# @include lib/cloudflare6-loader.sh
 
 # Get all server's own public IPs (auto-whitelist)
 # @include lib/server-ips.sh
