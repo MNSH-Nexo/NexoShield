@@ -1,8 +1,9 @@
 #!/bin/sh
 exec bash <(tr -d '\r' < "$0" | tail -n +3) "$@"
 #!/bin/bash
+# ── GENERATED FILE ─ built by tools/build.py from src/ ─ do not edit directly; edit the sources and rebuild ──
 # ============================================================
-#  Proxy Manager - Auto Installer  v3.0
+#  Proxy Manager - Auto Installer  v3.4.12
 #  One file, one command, everything ready
 #
 #  Install:
@@ -27,7 +28,7 @@ exec bash <(tr -d '\r' < "$0" | tail -n +3) "$@"
 # ============================================================
 set -euo pipefail
 
-VERSION="3.0"
+VERSION="3.4.12"
 INSTALL_DIR="/opt/proxy-manager"
 BIN_LINK="/usr/local/bin/proxy"
 LOG="/var/log/proxy-manager-install.log"
@@ -57,7 +58,7 @@ echo ""
 
 mkdir -p "$INSTALL_DIR"
 
-# ── Cloudflare IP ranges (single source of truth) ────────
+# ── Cloudflare IP ranges (single source of truth: src/data/cloudflare-ipv4.list) ──
 CF_RANGES=(
     "1.0.0.0/24"
     "1.1.1.0/24"
@@ -898,8 +899,8 @@ setup_tc() {
 
     # HTB root
     tc qdisc add dev "$IF" root handle 1: htb default 20
-    tc class add dev "$IF" parent 1: classid 1:1  htb rate $BW  ceil $BW
-    tc class add dev "$IF" parent 1:1 classid 1:10 htb rate $BW  ceil $BW   burst 25Mb  # CF: unlimited
+    tc class add dev "$IF" parent 1: classid 1:1  htb rate "$BW"  ceil "$BW"
+    tc class add dev "$IF" parent 1:1 classid 1:10 htb rate "$BW"  ceil "$BW"   burst 25Mb  # CF: unlimited
     tc class add dev "$IF" parent 1:1 classid 1:20 htb rate 500mbit ceil 500mbit burst 6400Kb  # normal
     tc class add dev "$IF" parent 1:1 classid 1:30 htb rate 100mbit ceil 100mbit burst 1280Kb  # throttled
     tc class add dev "$IF" parent 1:1 classid 1:40 htb rate 50mbit  ceil 50mbit  burst 640Kb   # hard-throttled
@@ -1200,7 +1201,7 @@ install_proxy() {
 
     echo -e "${YELLOW}[2/7] Installing 3proxy...${NC}"
     TMPDIR_BUILD=$(mktemp -d)
-    cd "$TMPDIR_BUILD"
+    cd "$TMPDIR_BUILD" || return 1
     if run_spinner "Installing 3proxy via apt" apt-get install -y 3proxy; then
         PROXY_BIN_PATH=$(command -v 3proxy 2>/dev/null || echo "/usr/bin/3proxy")
         [ "$PROXY_BIN_PATH" != "$PROXY_BIN" ] && ln -sf "$PROXY_BIN_PATH" "$PROXY_BIN"
@@ -1210,7 +1211,7 @@ install_proxy() {
         if run_spinner "Downloading 3proxy source" wget -O 3proxy.tar.gz \
             https://github.com/3proxy/3proxy/archive/refs/tags/0.9.4.tar.gz; then
             run_spinner "Extracting source" tar -xzf 3proxy.tar.gz
-            cd 3proxy-0.9.4
+            cd 3proxy-0.9.4 || { cd /; rm -rf "$TMPDIR_BUILD"; return 1; }
             if run_spinner "Compiling (this can take a while)" \
                 make -f Makefile.Linux -j"$(nproc)"; then
                 cp bin/3proxy "$PROXY_BIN" && chmod +x "$PROXY_BIN" && \
@@ -1459,6 +1460,7 @@ uninstall_proxy() {
 
     # Remove auto-ban iptables rules (tagged with "auto-ban")
     iptables -S INPUT 2>/dev/null | grep '"auto-ban"' | while read -r rule; do
+        # shellcheck disable=SC2086  # intentional: $rule expands to multiple iptables arguments
         iptables -D INPUT ${rule#-A INPUT } 2>/dev/null || true
     done
 
@@ -1659,12 +1661,12 @@ cat > "$INSTALL_DIR/optimize-sysctl.sh" << 'SYSCTL_SCRIPT'
 #!/bin/bash
 set -uo pipefail
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
-CYAN='\033[0;36m'; BLUE='\033[0;34m'; BOLD='\033[1m'; DIM='\033[2m'; NC='\033[0m'
+CYAN='\033[0;36m'; BOLD='\033[1m'; DIM='\033[2m'; NC='\033[0m'
 TARGET_FILE="/etc/sysctl.d/99-vpn-optimized.conf"
 SNAPSHOT_DIR="/var/lib/vpn-sysctl-snapshots"
 LOG_FILE="/var/log/vpn-sysctl-optimizer.log"
 LOCK_FILE="/var/run/vpn-sysctl.lock"
-SCRIPT_VERSION="3.0"
+SCRIPT_VERSION="3.4.12"
 
 [ "$EUID" -ne 0 ] && echo -e "${RED}Root required${NC}" && exit 1
 
@@ -1688,7 +1690,6 @@ detect_environment() {
     RAM_KB=$(grep MemTotal /proc/meminfo 2>/dev/null | awk '{print $2}' || echo 1048576)
     RAM_KB="${RAM_KB//[^0-9]/}"; RAM_KB="${RAM_KB:-1048576}"
     RAM_MB=$((RAM_KB / 1024))
-    RAM_GB=$((RAM_MB / 1024))
     CPU_CORES=$(nproc 2>/dev/null || grep -c ^processor /proc/cpuinfo 2>/dev/null || echo 1)
     CPU_CORES="${CPU_CORES//[^0-9]/}"; CPU_CORES="${CPU_CORES:-1}"
     KERNEL=$(uname -r)
@@ -1715,7 +1716,6 @@ detect_environment() {
         grep -v '127\.\|10\.\|192\.168\.\|172\.\(1[6-9]\|2[0-9]\|3[01]\)\.' | \
         wc -l 2>/dev/null || echo 0)
 
-    CURRENT_IP_FORWARD=$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo 0)
 
     BBR_AVAILABLE=0
     modprobe tcp_bbr 2>/dev/null || true
@@ -1736,7 +1736,6 @@ detect_environment() {
     HAS_SWAP=0; [ "${SWAP_TOTAL:-0}" -gt 0 ] && HAS_SWAP=1
 
     CURRENT_CONGESTION=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
-    CURRENT_QDISC=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "unknown")
     CURRENT_RMEM=$(sysctl -n net.core.rmem_max 2>/dev/null || echo 0)
     CURRENT_SWAPPINESS=$(sysctl -n vm.swappiness 2>/dev/null || echo 60)
 }
@@ -2009,7 +2008,8 @@ do_rollback() {
     # from OLDER installs of this script that are NOT in the snapshot's list,
     # without touching unrelated system files in /etc/sysctl.d/.
     if [ -f "$SPATH/sysctl_d_list.txt" ]; then
-        local TBASE="$(basename "$TARGET_FILE")"
+        local TBASE
+        TBASE="$(basename "$TARGET_FILE")"
         while IFS= read -r CURF; do
             [ -z "$CURF" ] && continue
             # Only remove files that belong to OUR script (match TARGET_FILE name
@@ -2200,7 +2200,7 @@ SYSCTL_SCRIPT
 # ══════════════════════════════════════════════════════════
 cat > "$INSTALL_DIR/proxy-menu.sh" << 'MENU_SCRIPT'
 #!/bin/bash
-VERSION="3.0"
+VERSION="3.4.12"
 INSTALL_DIR="/opt/proxy-manager"
 _BSRC="${BASH_SOURCE[0]:-}"
 if [ -n "$_BSRC" ] && [ "$_BSRC" != "/dev/stdin" ] && [[ "$_BSRC" != /dev/fd/* ]]; then
@@ -3068,9 +3068,9 @@ _autoban_control() {
                           grep '"auto-ban"' | awk '{print $1}' | head -1)" \
                        2>/dev/null || break
                done
-               [ -f /etc/antiddos/banned.list ] && > /etc/antiddos/banned.list
-               [ -f /tmp/autoban_throttle ]     && > /tmp/autoban_throttle
-               [ -f /tmp/autoban_watch ]        && > /tmp/autoban_watch
+               [ -f /etc/antiddos/banned.list ] && : > /etc/antiddos/banned.list
+               [ -f /tmp/autoban_throttle ]     && : > /tmp/autoban_throttle
+               [ -f /tmp/autoban_watch ]        && : > /tmp/autoban_watch
                ok "All auto-bans flushed"
                press_enter ;;
             0) return ;;
@@ -3123,7 +3123,7 @@ MENU_SCRIPT
 cat > "$INSTALL_DIR/antiddos.sh" << 'ANTIDDOS_SCRIPT'
 #!/bin/bash
 # ============================================================
-#  Anti-DDoS Protection Manager v3.0
+#  Anti-DDoS Protection Manager v3.4.12
 #
 #  Layers:
 #    1. Kernel (sysctl hardening + tight conntrack timeouts)
@@ -3147,7 +3147,7 @@ set -euo pipefail
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 CYAN='\033[0;36m'; WHITE='\033[1;37m'; DIM='\033[2m'; BOLD='\033[1m'; NC='\033[0m'
 
-SCRIPT_VERSION="3.0"
+SCRIPT_VERSION="3.4.12"
 LOG_FILE="/var/log/antiddos.log"
 STATE_FILE="/etc/antiddos/state.conf"
 BANNED_LIST="/etc/antiddos/banned.list"
@@ -3872,7 +3872,6 @@ SCORE_SUSPECT=80
 SCORE_RECOVER=3
 # When connections are counted we snapshot the previous sample to derive the
 # new-connection rate (attacker signature) without per-packet overhead.
-PREV_SAMPLE=4
 
 # Thresholds
 # THRESHOLD: minimum active connections from one IP to start watching.
@@ -4719,6 +4718,7 @@ show_status() {
     done
 
     sep
+    # shellcheck disable=SC1090  # STATE_FILE is a fixed path held in a variable
     [ -f "$STATE_FILE" ] && . "$STATE_FILE" 2>/dev/null && \
         echo -e "  ${GREEN}✓ Installed${NC} - $(grep '^DATE=' "$STATE_FILE" | cut -d= -f2-)" || \
         echo -e "  ${YELLOW}○ Not installed${NC}"
@@ -5086,4 +5086,3 @@ echo ""
 echo -e "  ${C}Run now:${NC}"
 echo -e "  ${W}${BOLD}  proxy${NC}"
 sep
-
