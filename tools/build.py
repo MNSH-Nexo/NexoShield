@@ -148,6 +148,11 @@ def build():
             body = body.replace(
                 "@@NXCOUNTD_C@@", read("src/native/nxcountd.c")
             )
+            body = body.replace(
+                "@@NX_XDP_C@@", read("src/native/nx_xdp.c")
+            ).replace(
+                "@@NX_XDP_LOADER_C@@", read("src/native/nx-xdp-loader.c")
+            )
         parts.append(subst(body))
         parts.append(delim)
 
@@ -162,6 +167,8 @@ def build():
             "@@CF6_ENTRIES@@",
             "@@AUTOBAN_BODY@@",
             "@@NXCOUNTD_C@@",
+            "@@NX_XDP_C@@",
+            "@@NX_XDP_LOADER_C@@",
             "# @include",
             "# @part",
         )
@@ -193,6 +200,11 @@ def main():
                 )
                 body = body.replace(
                     "@@NXCOUNTD_C@@", read("src/native/nxcountd.c")
+                )
+                body = body.replace(
+                    "@@NX_XDP_C@@", read("src/native/nx_xdp.c")
+                ).replace(
+                    "@@NX_XDP_LOADER_C@@", read("src/native/nx-xdp-loader.c")
                 )
             body = body.replace("@@VERSION@@", version)
             (out_dir / filename).write_text(body + "\n", encoding="utf-8")

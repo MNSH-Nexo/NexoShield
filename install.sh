@@ -4041,6 +4041,12 @@ stress_gate=1           # 1: score bans need host stress (or score < 10)
 
 # ── Adaptive thresholds (Phase 2d; needs nxcountd) ──
 adaptive_enabled=1      # 1: tighten gates under a global arrival anomaly
+
+# ── XDP emergency shield triggers (Phase 3) ──
+xdp_syncookie_rate=500  # syncookies sent per minute that justify line-rate relief
+xdp_overflow_rate=1000  # listen overflows per minute that justify relief
+xdp_syn_rate=3000       # sustained SYN arrivals/sec that justify relief
+xdp_calm_seconds=600    # calm required before the shield detaches
 EOF
     chmod 644 "$f" 2>/dev/null || true
 }
@@ -4953,6 +4959,10 @@ setup_autoban() {
     # arrival/completion data (see setup_countd below).
     setup_countd || true
 
+    # Phase 3: the XDP emergency shield (built only with a BPF
+    # toolchain present; dormant otherwise).
+    setup_xdp || true
+
     # Require tcpdump
     if ! command -v tcpdump >/dev/null 2>&1; then
         if command -v apt-get >/dev/null 2>&1; then
@@ -5113,6 +5123,12 @@ stress_gate=1           # 1: score bans need host stress (or score < 10)
 
 # ── Adaptive thresholds (Phase 2d; needs nxcountd) ──
 adaptive_enabled=1      # 1: tighten gates under a global arrival anomaly
+
+# ── XDP emergency shield triggers (Phase 3) ──
+xdp_syncookie_rate=500  # syncookies sent per minute that justify line-rate relief
+xdp_overflow_rate=1000  # listen overflows per minute that justify relief
+xdp_syn_rate=3000       # sustained SYN arrivals/sec that justify relief
+xdp_calm_seconds=600    # calm required before the shield detaches
 EOF
     chmod 644 "$f" 2>/dev/null || true
 }
@@ -5207,6 +5223,10 @@ nx_load_scoring_config() {
     SUBNET_BAN_MINUTES=$(nx_cfg subnet_ban_minutes 60)
     STRESS_GATE=$(nx_cfg stress_gate 1)
     ADAPTIVE_ENABLED=$(nx_cfg adaptive_enabled 1)
+    XDP_SYNCOOKIE_RATE=$(nx_cfg xdp_syncookie_rate 500)
+    XDP_OVERFLOW_RATE=$(nx_cfg xdp_overflow_rate 1000)
+    XDP_SYN_RATE=$(nx_cfg xdp_syn_rate 3000)
+    XDP_CALM_SECONDS=$(nx_cfg xdp_calm_seconds 600)
     _NX_CFG_LOADED_MTIME="$(_nx_cfg_stat)"
 }
 nx_maybe_reload_scoring_config() {
@@ -5872,6 +5892,8 @@ NX_STRESSED_UNTIL=0
 _NX_OVF_PREV=""
 _NX_SYNCOOK_PREV=""
 _NX_SYNCOOK_LAST_LOG=0
+NX_OVF_DELTA=0
+NX_SYNCOOK_DELTA=0
 nx_update_stress() {
     local now ovf scook
     now=$(date +%s)
@@ -5879,13 +5901,21 @@ nx_update_stress() {
         /^TcpExt:/ { if (!h) { for (i=2;i<=NF;i++) { if ($i=="ListenOverflows") co=i; if ($i=="SyncookiesSent") cs=i } h=1; next }
                      print $(co), $(cs); exit }' /proc/net/netstat 2>/dev/null)"
     ovf="${ovf//[^0-9]/}"; scook="${scook//[^0-9]/}"
+    NX_OVF_DELTA=0
+    NX_SYNCOOK_DELTA=0
     if [ -n "$ovf" ]; then
-        if [ -n "$_NX_OVF_PREV" ] && [ "$ovf" -gt "$_NX_OVF_PREV" ]; then
-            NX_STRESSED_UNTIL=$(( now + 60 ))
+        if [ -n "$_NX_OVF_PREV" ]; then
+            NX_OVF_DELTA=$(( ovf - _NX_OVF_PREV ))
+            [ "$NX_OVF_DELTA" -lt 0 ] && NX_OVF_DELTA=0
+            [ "$ovf" -gt "$_NX_OVF_PREV" ] && NX_STRESSED_UNTIL=$(( now + 60 ))
         fi
         _NX_OVF_PREV="$ovf"
     fi
     if [ -n "$scook" ]; then
+        if [ -n "$_NX_SYNCOOK_PREV" ]; then
+            NX_SYNCOOK_DELTA=$(( scook - _NX_SYNCOOK_PREV ))
+            [ "$NX_SYNCOOK_DELTA" -lt 0 ] && NX_SYNCOOK_DELTA=0
+        fi
         if [ -n "$_NX_SYNCOOK_PREV" ] && [ "$scook" -gt "$_NX_SYNCOOK_PREV" ] \
            && [ $(( now - _NX_SYNCOOK_LAST_LOG )) -ge 60 ]; then
             log " SYNPRESSURE: syncookies engaged (+$(( scook - _NX_SYNCOOK_PREV )) since last check) - SYN-RECV state is being absorbed by the kernel"
@@ -6155,6 +6185,140 @@ nx_update_adaptive() {
             log " ADAPTIVE: calm - baseline learning resumed (mu=$NX_MU sig=$NX_SIG)"
         fi
         _NX_AD_PREV="$NX_ATTACK"
+    fi
+}
+#
+# The shield is DORMANT: the daemon attaches it only while kernel
+# distress signals say the netfilter path is drowning (syncookie
+# storms, listen-backlog overflows, or an extreme sustained SYN
+# arrival rate from nxcountd), syncs the SAME ban/exempt state the
+# nft backend enforces, and detaches after a sustained calm. If the
+# loader/object were never built (no clang/libbpf at install time)
+# every function here is a no-op.
+
+NX_XDP_BIN="${NX_XDP_BIN:-/usr/local/bin/nx-xdp}"
+NX_XDP_OBJ="${NX_XDP_OBJ:-/usr/local/lib/nx_xdp.o}"
+NX_XDP_DIR="${NX_XDP_DIR:-/run/nexoshield}"
+NX_XDP_BANS_FILE="$NX_XDP_DIR/xdp-bans.list"
+NX_XDP_EXEMPT_FILE="$NX_XDP_DIR/xdp-exempt.list"
+NX_XDP_AVAILABLE=0
+NX_XDP_ATTACHED=""
+NX_XDP_IFACE=""
+_NX_XDP_HOT=0
+_NX_XDP_CALM_SINCE=0
+_NX_XDP_WIN_START=0
+_NX_XDP_OVF_WIN=0
+_NX_XDP_SCOOK_WIN=0
+_NX_XDP_BANS_MT=0
+
+nx_xdp_init() {
+    if [ -x "$NX_XDP_BIN" ] && [ -f "$NX_XDP_OBJ" ]; then
+        NX_XDP_IFACE=$(ip route show default 2>/dev/null | awk '/default/{print $5}' | head -1)
+        [ -n "$NX_XDP_IFACE" ] && NX_XDP_AVAILABLE=1
+    fi
+    [ "$NX_XDP_AVAILABLE" = "1" ] && \
+        log " XDP: emergency shield available on $NX_XDP_IFACE (dormant)"
+    return 0
+}
+
+nx_xdp_build_files() {
+    mkdir -p "$NX_XDP_DIR" || return 1
+    local now ip ts dur rem e f
+    now=$(date +%s)
+    : > "$NX_XDP_BANS_FILE.tmp"
+    while read -r ip ts dur; do
+        [ -n "$ip" ] || continue
+        dur="${dur:-$(( ${BAN_HOURS:-4} * 3600 ))}"
+        rem=$(( ts + dur - now ))
+        [ "$rem" -gt 0 ] && printf '%s %s\n' "$ip" "$rem" >> "$NX_XDP_BANS_FILE.tmp"
+    done < "$BANNED_LIST"
+    mv "$NX_XDP_BANS_FILE.tmp" "$NX_XDP_BANS_FILE"
+    {
+        for e in "${SELF_IPS[@]}" "${SELF6_IPS[@]}"; do [ -n "$e" ] && printf '%s\n' "$e"; done
+        for e in "${CF_RANGES[@]}" "${CF6_RANGES[@]}"; do [ -n "$e" ] && printf '%s\n' "$e"; done
+        for f in "$WHITELIST_FILE" /etc/antiddos/self-ips.list /etc/antiddos/public-ips.list /etc/antiddos/exempt.list; do
+            [ -f "$f" ] && cat "$f"
+        done
+    } | grep -E '^[0-9a-fA-F:./]+$' | sort -u > "$NX_XDP_EXEMPT_FILE.tmp"
+    mv "$NX_XDP_EXEMPT_FILE.tmp" "$NX_XDP_EXEMPT_FILE"
+}
+
+nx_xdp_attach() {
+    local reason="$1"
+    nx_xdp_build_files || return 1
+    if ! "$NX_XDP_BIN" check "$NX_XDP_BANS_FILE" "$NX_XDP_EXEMPT_FILE" >/dev/null 2>&1; then
+        log " XDP: sync files failed validation - NOT attaching"
+        return 1
+    fi
+    if "$NX_XDP_BIN" load "$NX_XDP_IFACE" "$NX_XDP_OBJ" >> "${LOG_FILE:-/dev/null}" 2>&1; then
+        "$NX_XDP_BIN" sync-bans "$NX_XDP_BANS_FILE" >/dev/null 2>&1 || true
+        "$NX_XDP_BIN" sync-exempt "$NX_XDP_EXEMPT_FILE" >/dev/null 2>&1 || true
+        NX_XDP_ATTACHED="$NX_XDP_IFACE"
+        _NX_XDP_CALM_SINCE=0
+        _NX_XDP_BANS_MT=$(stat -c %Y "$BANNED_LIST" 2>/dev/null || echo 0)
+        log " XDP: emergency shield ATTACHED on $NX_XDP_IFACE ($reason) - line-rate SYN relief active"
+    else
+        log " XDP: attach FAILED on $NX_XDP_IFACE - continuing with nft/iptables only"
+        return 1
+    fi
+}
+
+nx_xdp_detach() {
+    "$NX_XDP_BIN" unload "$NX_XDP_ATTACHED" >> "${LOG_FILE:-/dev/null}" 2>&1 || true
+    log " XDP: shield detached from $NX_XDP_ATTACHED ($1)"
+    NX_XDP_ATTACHED=""
+    _NX_XDP_HOT=0
+    _NX_XDP_CALM_SINCE=0
+}
+
+nx_xdp_tick() {
+    [ "$NX_XDP_AVAILABLE" = "1" ] || return 0
+    local now rate=0 mt
+    now=$(date +%s)
+    [ "$_NX_XDP_WIN_START" -eq 0 ] && _NX_XDP_WIN_START=$now
+    _NX_XDP_OVF_WIN=$(( _NX_XDP_OVF_WIN + ${NX_OVF_DELTA:-0} ))
+    _NX_XDP_SCOOK_WIN=$(( _NX_XDP_SCOOK_WIN + ${NX_SYNCOOK_DELTA:-0} ))
+    if [ "${NX_EV_OK:-0}" = "1" ] && [ "${NX_EV_DT:-0}" -gt 0 ]; then
+        rate=$(( NX_EV_TOT_DSYN / NX_EV_DT ))
+    fi
+    if [ -z "$NX_XDP_ATTACHED" ]; then
+        if [ "$rate" -gt "${XDP_SYN_RATE:-3000}" ]; then
+            _NX_XDP_HOT=$(( _NX_XDP_HOT + 1 ))
+        else
+            _NX_XDP_HOT=0
+        fi
+        if [ "$_NX_XDP_HOT" -ge 15 ]; then
+            nx_xdp_attach "SYN arrival rate ${rate}/s sustained" || true
+            return 0
+        fi
+        if [ $(( now - _NX_XDP_WIN_START )) -ge 60 ]; then
+            if [ "$_NX_XDP_OVF_WIN" -gt "${XDP_OVERFLOW_RATE:-1000}" ]; then
+                nx_xdp_attach "listen overflows ${_NX_XDP_OVF_WIN}/min" || true
+            elif [ "$_NX_XDP_SCOOK_WIN" -gt "${XDP_SYNCOOKIE_RATE:-500}" ]; then
+                nx_xdp_attach "syncookies ${_NX_XDP_SCOOK_WIN}/min" || true
+            fi
+            _NX_XDP_WIN_START=$now; _NX_XDP_OVF_WIN=0; _NX_XDP_SCOOK_WIN=0
+        fi
+    else
+        mt=$(stat -c %Y "$BANNED_LIST" 2>/dev/null || echo 0)
+        if [ "$mt" != "$_NX_XDP_BANS_MT" ]; then
+            _NX_XDP_BANS_MT="$mt"
+            if nx_xdp_build_files; then
+                "$NX_XDP_BIN" sync-bans "$NX_XDP_BANS_FILE" >/dev/null 2>&1 || true
+                "$NX_XDP_BIN" sync-exempt "$NX_XDP_EXEMPT_FILE" >/dev/null 2>&1 || true
+            fi
+        fi
+        if [ "${NX_OVF_DELTA:-0}" -eq 0 ] && [ "${NX_SYNCOOK_DELTA:-0}" -eq 0 ] && [ "$rate" -lt 500 ]; then
+            [ "$_NX_XDP_CALM_SINCE" -eq 0 ] && _NX_XDP_CALM_SINCE=$now
+            if [ $(( now - _NX_XDP_CALM_SINCE )) -ge "${XDP_CALM_SECONDS:-600}" ]; then
+                nx_xdp_detach "calm for ${XDP_CALM_SECONDS:-600}s"
+            fi
+        else
+            _NX_XDP_CALM_SINCE=0
+        fi
+        if [ $(( now - _NX_XDP_WIN_START )) -ge 60 ]; then
+            _NX_XDP_WIN_START=$now; _NX_XDP_OVF_WIN=0; _NX_XDP_SCOOK_WIN=0
+        fi
     fi
 }
 score_init() {
@@ -6667,6 +6831,7 @@ score_init
 
 # Phase 1b: pick the ban backend before reconcile projects state into it.
 nx_resolve_ban_backend
+nx_xdp_init
 
 # Restore throttle filters recorded before a restart/reboot (the qdisc
 # may have been rebuilt without them - see reapply_throttles, BUG-022).
@@ -6683,6 +6848,7 @@ CYCLE=0
 while true; do
     nx_maybe_reload_scoring_config
     nx_update_stress
+    nx_xdp_tick
     CYCLE=$((CYCLE + 1))
 
     # Keep the persistent throttle mirror current (U-11).
@@ -7564,6 +7730,439 @@ EOF
     systemctl restart nexoshield-countd.service 2>/dev/null || true
     success "nxcountd: conntrack event counter installed (exact arrival counting)"
 }
+
+# setup_xdp (Phase 3): build the XDP emergency shield when clang and
+# libbpf headers are available (one best-effort package attempt,
+# house style). Any failure leaves the feature dormant - the daemon
+# probes for the files and simply never attaches.
+setup_xdp() {
+    if ! command -v clang >/dev/null 2>&1 || [ ! -f /usr/include/bpf/libbpf.h ]; then
+        if command -v apt-get >/dev/null 2>&1; then
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq clang libbpf-dev >/dev/null 2>&1 || true
+        elif command -v dnf >/dev/null 2>&1; then
+            dnf install -y clang libbpf-devel >/dev/null 2>&1 || true
+        fi
+    fi
+    if ! command -v clang >/dev/null 2>&1 || [ ! -f /usr/include/bpf/libbpf.h ]; then
+        info "XDP shield: no clang/libbpf - dormant feature skipped"
+        return 0
+    fi
+    local build_dir
+    build_dir=$(mktemp -d) || return 0
+    cat > "$build_dir/nx_xdp.c" << 'NXXDP_EOF'
+/*
+ * nx_xdp — NexoShield emergency XDP shield (DPI upgrade Phase 3).
+ *
+ * Dormant line-rate relief for volumetric SYN floods. The daemon
+ * attaches this program ONLY while the host is drowning (syncookie
+ * storms / backlog overflows / extreme SYN arrival rates) and
+ * detaches it when calm returns. It drops NEW connection attempts
+ * (pure SYNs) from sources present in the ban LPM tries — the same
+ * ban state the nftables backend enforces at netfilter — before
+ * conntrack allocation, which is the resource a SYN flood actually
+ * exhausts. Established traffic and non-SYN packets pass untouched;
+ * exempt sources (self / whitelist / Cloudflare) are checked first
+ * and always pass: FR-1/FR-2 hold at line rate too.
+ *
+ * Ban values are monotonic-clock expiry stamps (ns), mirroring the
+ * timed nft sets; an expired entry passes (the daemon's state files
+ * remain the source of truth and re-sync while attached).
+ *
+ * Counters (per-CPU): 0 = SYNs seen, 1 = drops, 2 = exempt passes.
+ *
+ * Built only when clang + libbpf headers exist at install time.
+ * Known limits: no VLAN tag parsing (cloud NICs are untagged);
+ * XDP_PASS for anything unparsable — fail-open by design.
+ */
+#include <linux/bpf.h>
+#include <linux/if_ether.h>
+#include <linux/ip.h>
+#include <linux/ipv6.h>
+#include <linux/tcp.h>
+#include <linux/in.h>
+#include <bpf/bpf_helpers.h>
+#include <bpf/bpf_endian.h>
+
+struct lpm4_key { __u32 prefixlen; __u32 addr; };
+struct lpm6_key { __u32 prefixlen; __u8 addr[16]; };
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LPM_TRIE);
+    __type(key, struct lpm4_key);
+    __type(value, __u64);
+    __uint(max_entries, 65536);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+} ban4 SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LPM_TRIE);
+    __type(key, struct lpm6_key);
+    __type(value, __u64);
+    __uint(max_entries, 65536);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+} ban6 SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LPM_TRIE);
+    __type(key, struct lpm4_key);
+    __type(value, __u32);
+    __uint(max_entries, 65536);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+} exempt4 SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LPM_TRIE);
+    __type(key, struct lpm6_key);
+    __type(value, __u32);
+    __uint(max_entries, 65536);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+} exempt6 SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __type(key, __u32);
+    __type(value, __u64);
+    __uint(max_entries, 3);
+} counters SEC(".maps");
+
+enum { C_SYN = 0, C_DROP = 1, C_EXEMPT_PASS = 2 };
+
+static __always_inline void bump(__u32 k)
+{
+    __u64 *v = bpf_map_lookup_elem(&counters, &k);
+    if (v) (*v)++;
+}
+
+SEC("xdp")
+int nx_xdp_prog(struct xdp_md *ctx)
+{
+    void *data = (void *)(long)ctx->data;
+    void *data_end = (void *)(long)ctx->data_end;
+    struct ethhdr *eth = data;
+    if ((void *)(eth + 1) > data_end) return XDP_PASS;
+    __u16 proto = bpf_ntohs(eth->h_proto);
+    __u64 now = bpf_ktime_get_ns();
+
+    if (proto == ETH_P_IP) {
+        struct iphdr *ip = (void *)(eth + 1);
+        if ((void *)(ip + 1) > data_end) return XDP_PASS;
+        if (ip->protocol != IPPROTO_TCP) return XDP_PASS;
+        struct tcphdr *tcp = (void *)ip + ip->ihl * 4;
+        if ((void *)(tcp + 1) > data_end) return XDP_PASS;
+        if (tcp->syn) bump(C_SYN);
+        if (!tcp->syn || tcp->ack) return XDP_PASS;
+        struct lpm4_key ek = { .prefixlen = 32, .addr = ip->saddr };
+        if (bpf_map_lookup_elem(&exempt4, &ek)) { bump(C_EXEMPT_PASS); return XDP_PASS; }
+        struct lpm4_key bk = { .prefixlen = 32, .addr = ip->saddr };
+        __u64 *exp = bpf_map_lookup_elem(&ban4, &bk);
+        if (exp && *exp > now) { bump(C_DROP); return XDP_DROP; }
+        return XDP_PASS;
+    }
+
+    if (proto == ETH_P_IPV6) {
+        struct ipv6hdr *ip6 = (void *)(eth + 1);
+        if ((void *)(ip6 + 1) > data_end) return XDP_PASS;
+        if (ip6->nexthdr != IPPROTO_TCP) return XDP_PASS;
+        struct tcphdr *tcp = (void *)(ip6 + 1);
+        if ((void *)(tcp + 1) > data_end) return XDP_PASS;
+        if (tcp->syn) bump(C_SYN);
+        if (!tcp->syn || tcp->ack) return XDP_PASS;
+        struct lpm6_key ek = { .prefixlen = 128 };
+        __builtin_memcpy(ek.addr, &ip6->saddr, 16);
+        if (bpf_map_lookup_elem(&exempt6, &ek)) { bump(C_EXEMPT_PASS); return XDP_PASS; }
+        struct lpm6_key bk = { .prefixlen = 128 };
+        __builtin_memcpy(bk.addr, &ip6->saddr, 16);
+        __u64 *exp = bpf_map_lookup_elem(&ban6, &bk);
+        if (exp && *exp > now) { bump(C_DROP); return XDP_DROP; }
+        return XDP_PASS;
+    }
+
+    return XDP_PASS;
+}
+
+char _license[] SEC("license") = "GPL";
+NXXDP_EOF
+    cat > "$build_dir/nx-xdp-loader.c" << 'NXLOADER_EOF'
+/*
+ * nx-xdp — loader/sync tool for the NexoShield XDP shield (Phase 3).
+ *
+ *   nx-xdp load <iface> <obj.o>   attach (native, else generic), pin maps
+ *   nx-xdp unload <iface>         detach + unpin
+ *   nx-xdp sync-bans <file>       lines: <ip|cidr> <ttl_seconds>
+ *   nx-xdp sync-exempt <file>     lines: <ip|cidr>
+ *   nx-xdp stats                  syn= drops= exempt_pass= (per-CPU sums)
+ *   nx-xdp check <bans> <exempt>  parse-only validation (no BPF touched)
+ *
+ * Maps are pinned under /sys/fs/bpf/nexoshield so the daemon can
+ * re-sync ban state while the program is attached without holding
+ * the object open. Ban values are CLOCK_MONOTONIC nanosecond expiry
+ * stamps, exactly what the XDP program compares against
+ * bpf_ktime_get_ns().
+ */
+#include <arpa/inet.h>
+#include <errno.h>
+#include <limits.h>
+#include <net/if.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <unistd.h>
+
+#include <bpf/libbpf.h>
+#include <bpf/bpf.h>
+
+#define PIN_DIR "/sys/fs/bpf/nexoshield"
+
+static uint64_t mono_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+/* ── sync-file parsing (shared by check + sync; unit-testable) ── */
+typedef struct {
+    int family;              /* AF_INET / AF_INET6 */
+    int prefix;              /* 0..32 / 0..128 */
+    uint8_t addr[16];
+    uint64_t ttl;            /* bans only */
+} Entry;
+
+static int parse_cidr(const char *text, int *family, int *prefix, uint8_t *addr)
+{
+    char buf[128];
+    snprintf(buf, sizeof buf, "%s", text);
+    char *slash = strchr(buf, '/');
+    int pfx = -1;
+    if (slash) { *slash = 0; pfx = atoi(slash + 1); }
+    if (strchr(buf, ':')) {
+        if (inet_pton(AF_INET6, buf, addr) != 1) return -1;
+        if (pfx < 0) pfx = 128;
+        if (pfx > 128) return -1;
+        *family = AF_INET6;
+    } else {
+        if (inet_pton(AF_INET, buf, addr) != 1) return -1;
+        if (pfx < 0) pfx = 32;
+        if (pfx > 32) return -1;
+        *family = AF_INET;
+    }
+    *prefix = pfx;
+    return 0;
+}
+
+/* Returns entry count, or -1 with *badline set (1-based). */
+static int parse_file(const char *path, int with_ttl, Entry *out, int max, int *badline)
+{
+    FILE *fp = fopen(path, "r");
+    if (!fp) return -1;
+    char line[256], cidr[128], extra[64];
+    unsigned long long ttl;
+    int n = 0, ln = 0;
+    while (fgets(line, sizeof line, fp)) {
+        ln++;
+        char *hash = strchr(line, '#');
+        if (hash) *hash = 0;
+        int got = with_ttl ? sscanf(line, " %127s %llu %63s", cidr, &ttl, extra)
+                           : sscanf(line, " %127s %63s", cidr, extra);
+        if (got <= 0) continue;                    /* blank/comment */
+        if (with_ttl && got != 2) { *badline = ln; fclose(fp); return -1; }
+        if (!with_ttl && got != 1) { *badline = ln; fclose(fp); return -1; }
+        if (n >= max) { *badline = ln; fclose(fp); return -1; }
+        Entry *e = &out[n];
+        memset(e, 0, sizeof *e);
+        if (parse_cidr(cidr, &e->family, &e->prefix, e->addr) != 0) {
+            *badline = ln; fclose(fp); return -1;
+        }
+        e->ttl = with_ttl ? ttl : 0;
+        n++;
+    }
+    fclose(fp);
+    return n;
+}
+
+static int cmd_check(const char *bans_path, const char *exempt_path)
+{
+    static Entry entries[65536];
+    int bad = 0;
+    int nb = parse_file(bans_path, 1, entries, 65536, &bad);
+    if (nb < 0) { fprintf(stderr, "check: %s: invalid (line %d or unreadable)\n", bans_path, bad); return 1; }
+    int ne = parse_file(exempt_path, 0, entries, 65536, &bad);
+    if (ne < 0) { fprintf(stderr, "check: %s: invalid (line %d or unreadable)\n", exempt_path, bad); return 1; }
+    printf("bans=%d exempt=%d\n", nb, ne);
+    return 0;
+}
+
+/* ── map helpers ── */
+static int open_pinned(const char *name)
+{
+    char path[PATH_MAX];
+    snprintf(path, sizeof path, "%s/%s", PIN_DIR, name);
+    int fd = bpf_obj_get(path);
+    if (fd < 0) fprintf(stderr, "nx-xdp: cannot open pinned map %s (shield attached?)\n", path);
+    return fd;
+}
+
+static void clear_map(int fd, size_t key_size)
+{
+    uint8_t *key = calloc(1, key_size), *next = calloc(1, key_size);
+    if (!key || !next) { free(key); free(next); return; }
+    int first = 1;
+    /* collect-then-delete: deleting while iterating an LPM trie is unsafe */
+    size_t cap = 1024, cnt = 0;
+    uint8_t *all = malloc(cap * key_size);
+    if (!all) { free(key); free(next); return; }
+    while (bpf_map_get_next_key(fd, first ? NULL : key, next) == 0) {
+        memcpy(key, next, key_size);
+        first = 0;
+        if (cnt == cap) { cap *= 2; all = realloc(all, cap * key_size); if (!all) { free(key); free(next); return; } }
+        memcpy(all + cnt * key_size, next, key_size);
+        cnt++;
+    }
+    for (size_t i = 0; i < cnt; i++) bpf_map_delete_elem(fd, all + i * key_size);
+    free(key); free(next); free(all);
+}
+
+static int sync_map(const char *map_name, const Entry *entries, int n, int is_ban, size_t key_size)
+{
+    int fd = open_pinned(map_name);
+    if (fd < 0) return 1;
+    clear_map(fd, key_size);
+    uint64_t now = mono_ns();
+    int rc = 0;
+    for (int i = 0; i < n; i++) {
+        const Entry *e = &entries[i];
+        uint8_t key[20];
+        memset(key, 0, sizeof key);
+        uint32_t pfx = (uint32_t)e->prefix;
+        memcpy(key, &pfx, 4);
+        if (e->family == AF_INET) memcpy(key + 4, e->addr, 4);
+        else memcpy(key + 4, e->addr, 16);
+        if (is_ban) {
+            uint64_t exp = now + e->ttl * 1000000000ULL;
+            if (bpf_map_update_elem(fd, key, &exp, BPF_ANY) != 0) rc = 1;
+        } else {
+            uint32_t one = 1;
+            if (bpf_map_update_elem(fd, key, &one, BPF_ANY) != 0) rc = 1;
+        }
+    }
+    close(fd);
+    return rc;
+}
+
+static int cmd_sync(const char *path, int is_ban)
+{
+    static Entry entries[65536];
+    int bad = 0;
+    int n = parse_file(path, is_ban, entries, 65536, &bad);
+    if (n < 0) { fprintf(stderr, "nx-xdp: %s invalid (line %d)\n", path, bad); return 1; }
+    int rc = 0, v4 = 0, v6 = 0;
+    static Entry fam4[65536], fam6[65536];
+    for (int i = 0; i < n; i++)
+        if (entries[i].family == AF_INET) fam4[v4++] = entries[i];
+        else fam6[v6++] = entries[i];
+    if (sync_map(is_ban ? "ban4" : "exempt4", fam4, v4, is_ban, 8) != 0) rc = 1;
+    if (sync_map(is_ban ? "ban6" : "exempt6", fam6, v6, is_ban, 20) != 0) rc = 1;
+    if (!rc) printf("synced %s: %d entries\n", is_ban ? "bans" : "exempt", n);
+    return rc;
+}
+
+static int cmd_load(const char *iface, const char *obj_path)
+{
+    unsigned ifindex = if_nametoindex(iface);
+    if (!ifindex) { fprintf(stderr, "nx-xdp: no such interface %s\n", iface); return 1; }
+    struct bpf_object *obj = bpf_object__open_file(obj_path, NULL);
+    if (!obj) { fprintf(stderr, "nx-xdp: cannot open %s\n", obj_path); return 1; }
+    if (bpf_object__load(obj) != 0) { fprintf(stderr, "nx-xdp: cannot load %s\n", obj_path); return 1; }
+    struct bpf_program *prog = bpf_object__find_program_by_name(obj, "nx_xdp_prog");
+    if (!prog) { fprintf(stderr, "nx-xdp: program not found in %s\n", obj_path); return 1; }
+    bpf_xdp_detach(ifindex, XDP_FLAGS_DRV_MODE, NULL);
+    bpf_xdp_detach(ifindex, XDP_FLAGS_SKB_MODE, NULL);
+    const char *mode = "native";
+    if (bpf_xdp_attach(ifindex, bpf_program__fd(prog), XDP_FLAGS_DRV_MODE, NULL) != 0) {
+        if (bpf_xdp_attach(ifindex, bpf_program__fd(prog), XDP_FLAGS_SKB_MODE, NULL) != 0) {
+            fprintf(stderr, "nx-xdp: attach failed on %s (native and generic)\n", iface);
+            return 1;
+        }
+        mode = "generic";
+    }
+    mkdir(PIN_DIR, 0755);
+    const char *names[5] = { "ban4", "ban6", "exempt4", "exempt6", "counters" };
+    for (int i = 0; i < 5; i++) {
+        struct bpf_map *m = bpf_object__find_map_by_name(obj, names[i]);
+        if (!m) continue;
+        char path[PATH_MAX];
+        snprintf(path, sizeof path, "%s/%s", PIN_DIR, names[i]);
+        unlink(path);
+        bpf_map__pin(m, path);
+    }
+    printf("attached %s (%s mode)\n", iface, mode);
+    return 0;
+}
+
+static int cmd_unload(const char *iface)
+{
+    unsigned ifindex = if_nametoindex(iface);
+    if (!ifindex) { fprintf(stderr, "nx-xdp: no such interface %s\n", iface); return 1; }
+    bpf_xdp_detach(ifindex, XDP_FLAGS_DRV_MODE, NULL);
+    bpf_xdp_detach(ifindex, XDP_FLAGS_SKB_MODE, NULL);
+    const char *names[5] = { "ban4", "ban6", "exempt4", "exempt6", "counters" };
+    for (int i = 0; i < 5; i++) {
+        char path[PATH_MAX];
+        snprintf(path, sizeof path, "%s/%s", PIN_DIR, names[i]);
+        unlink(path);
+    }
+    rmdir(PIN_DIR);
+    printf("detached %s\n", iface);
+    return 0;
+}
+
+static int cmd_stats(void)
+{
+    int fd = open_pinned("counters");
+    if (fd < 0) return 1;
+    int cpus = libbpf_num_possible_cpus();
+    if (cpus < 1) cpus = 1;
+    uint64_t *vals = calloc((size_t)cpus, sizeof(uint64_t));
+    if (!vals) { close(fd); return 1; }
+    uint64_t sums[3] = {0, 0, 0};
+    for (uint32_t k = 0; k < 3; k++) {
+        if (bpf_map_lookup_elem(fd, &k, vals) == 0)
+            for (int c = 0; c < cpus; c++) sums[k] += vals[c];
+    }
+    printf("syn=%llu drops=%llu exempt_pass=%llu\n",
+           (unsigned long long)sums[0], (unsigned long long)sums[1],
+           (unsigned long long)sums[2]);
+    free(vals);
+    close(fd);
+    return 0;
+}
+
+int main(int argc, char **argv)
+{
+    libbpf_set_strict_mode(LIBBPF_STRICT_ALL);
+    if (argc >= 2 && !strcmp(argv[1], "check") && argc == 4) return cmd_check(argv[2], argv[3]);
+    if (argc >= 2 && !strcmp(argv[1], "sync-bans") && argc == 3) return cmd_sync(argv[2], 1);
+    if (argc >= 2 && !strcmp(argv[1], "sync-exempt") && argc == 3) return cmd_sync(argv[2], 0);
+    if (argc >= 2 && !strcmp(argv[1], "load") && argc == 4) return cmd_load(argv[2], argv[3]);
+    if (argc >= 2 && !strcmp(argv[1], "unload") && argc == 3) return cmd_unload(argv[2]);
+    if (argc >= 2 && !strcmp(argv[1], "stats") && argc == 2) return cmd_stats();
+    fprintf(stderr, "usage: nx-xdp load <iface> <obj> | unload <iface> | sync-bans <file> | sync-exempt <file> | stats | check <bans> <exempt>\n");
+    return 2;
+}
+NXLOADER_EOF
+    mkdir -p /usr/local/lib
+    if clang -O2 -target bpf -c "$build_dir/nx_xdp.c" -o /usr/local/lib/nx_xdp.o 2>/dev/null \
+       && cc -O2 -o /usr/local/bin/nx-xdp "$build_dir/nx-xdp-loader.c" -lbpf 2>/dev/null; then
+        success "XDP emergency shield: built (dormant; attaches only under flood pressure)"
+    else
+        warn "XDP shield: build failed - feature stays dormant"
+        rm -f /usr/local/lib/nx_xdp.o /usr/local/bin/nx-xdp
+    fi
+    rm -rf "$build_dir"
+}
 setup_tc() {
     command -v tc >/dev/null 2>&1 || {
         warn "tc (iproute2) not installed - skipping bandwidth control"
@@ -7906,6 +8505,12 @@ remove_rules() {
     # Phase 2a: the event counter leaves with the rest of the daemon.
     systemctl disable --now nexoshield-countd.service >/dev/null 2>&1 || true
     rm -f /etc/systemd/system/nexoshield-countd.service /usr/local/bin/nxcountd 2>/dev/null || true
+    # Phase 3: detach + remove the XDP shield if it was ever built.
+    if [ -x /usr/local/bin/nx-xdp ]; then
+        _nx_if=$(ip route show default 2>/dev/null | awk '/default/{print $5}' | head -1)
+        [ -n "$_nx_if" ] && /usr/local/bin/nx-xdp unload "$_nx_if" >/dev/null 2>&1 || true
+    fi
+    rm -f /usr/local/bin/nx-xdp /usr/local/lib/nx_xdp.o 2>/dev/null || true
     systemctl daemon-reload >/dev/null 2>&1 || true
 
     # Sysctl (note: removing the file does not reset values already

@@ -236,6 +236,8 @@ NX_STRESSED_UNTIL=0
 _NX_OVF_PREV=""
 _NX_SYNCOOK_PREV=""
 _NX_SYNCOOK_LAST_LOG=0
+NX_OVF_DELTA=0
+NX_SYNCOOK_DELTA=0
 nx_update_stress() {
     local now ovf scook
     now=$(date +%s)
@@ -243,13 +245,21 @@ nx_update_stress() {
         /^TcpExt:/ { if (!h) { for (i=2;i<=NF;i++) { if ($i=="ListenOverflows") co=i; if ($i=="SyncookiesSent") cs=i } h=1; next }
                      print $(co), $(cs); exit }' /proc/net/netstat 2>/dev/null)"
     ovf="${ovf//[^0-9]/}"; scook="${scook//[^0-9]/}"
+    NX_OVF_DELTA=0
+    NX_SYNCOOK_DELTA=0
     if [ -n "$ovf" ]; then
-        if [ -n "$_NX_OVF_PREV" ] && [ "$ovf" -gt "$_NX_OVF_PREV" ]; then
-            NX_STRESSED_UNTIL=$(( now + 60 ))
+        if [ -n "$_NX_OVF_PREV" ]; then
+            NX_OVF_DELTA=$(( ovf - _NX_OVF_PREV ))
+            [ "$NX_OVF_DELTA" -lt 0 ] && NX_OVF_DELTA=0
+            [ "$ovf" -gt "$_NX_OVF_PREV" ] && NX_STRESSED_UNTIL=$(( now + 60 ))
         fi
         _NX_OVF_PREV="$ovf"
     fi
     if [ -n "$scook" ]; then
+        if [ -n "$_NX_SYNCOOK_PREV" ]; then
+            NX_SYNCOOK_DELTA=$(( scook - _NX_SYNCOOK_PREV ))
+            [ "$NX_SYNCOOK_DELTA" -lt 0 ] && NX_SYNCOOK_DELTA=0
+        fi
         if [ -n "$_NX_SYNCOOK_PREV" ] && [ "$scook" -gt "$_NX_SYNCOOK_PREV" ] \
            && [ $(( now - _NX_SYNCOOK_LAST_LOG )) -ge 60 ]; then
             log " SYNPRESSURE: syncookies engaged (+$(( scook - _NX_SYNCOOK_PREV )) since last check) - SYN-RECV state is being absorbed by the kernel"

@@ -132,6 +132,10 @@ nx_load_scoring_config() {
     SUBNET_BAN_MINUTES=$(nx_cfg subnet_ban_minutes 60)
     STRESS_GATE=$(nx_cfg stress_gate 1)
     ADAPTIVE_ENABLED=$(nx_cfg adaptive_enabled 1)
+    XDP_SYNCOOKIE_RATE=$(nx_cfg xdp_syncookie_rate 500)
+    XDP_OVERFLOW_RATE=$(nx_cfg xdp_overflow_rate 1000)
+    XDP_SYN_RATE=$(nx_cfg xdp_syn_rate 3000)
+    XDP_CALM_SECONDS=$(nx_cfg xdp_calm_seconds 600)
     _NX_CFG_LOADED_MTIME="$(_nx_cfg_stat)"
 }
 nx_maybe_reload_scoring_config() {

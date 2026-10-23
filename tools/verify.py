@@ -61,6 +61,11 @@ def expected_body(filename):
         body = body.replace(
             "@@NXCOUNTD_C@@", build_mod.read("src/native/nxcountd.c")
         )
+        body = body.replace(
+            "@@NX_XDP_C@@", build_mod.read("src/native/nx_xdp.c")
+        ).replace(
+            "@@NX_XDP_LOADER_C@@", build_mod.read("src/native/nx-xdp-loader.c")
+        )
     return body.replace("@@VERSION@@", version)
 
 

@@ -106,6 +106,7 @@ score_init
 
 # Phase 1b: pick the ban backend before reconcile projects state into it.
 nx_resolve_ban_backend
+nx_xdp_init
 
 # Restore throttle filters recorded before a restart/reboot (the qdisc
 # may have been rebuilt without them - see reapply_throttles, BUG-022).
@@ -122,6 +123,7 @@ CYCLE=0
 while true; do
     nx_maybe_reload_scoring_config
     nx_update_stress
+    nx_xdp_tick
     CYCLE=$((CYCLE + 1))
 
     # Keep the persistent throttle mirror current (U-11).

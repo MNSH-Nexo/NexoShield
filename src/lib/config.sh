@@ -120,6 +120,12 @@ stress_gate=1           # 1: score bans need host stress (or score < 10)
 
 # ── Adaptive thresholds (Phase 2d; needs nxcountd) ──
 adaptive_enabled=1      # 1: tighten gates under a global arrival anomaly
+
+# ── XDP emergency shield triggers (Phase 3) ──
+xdp_syncookie_rate=500  # syncookies sent per minute that justify line-rate relief
+xdp_overflow_rate=1000  # listen overflows per minute that justify relief
+xdp_syn_rate=3000       # sustained SYN arrivals/sec that justify relief
+xdp_calm_seconds=600    # calm required before the shield detaches
 EOF
     chmod 644 "$f" 2>/dev/null || true
 }

@@ -94,6 +94,12 @@ remove_rules() {
     # Phase 2a: the event counter leaves with the rest of the daemon.
     systemctl disable --now nexoshield-countd.service >/dev/null 2>&1 || true
     rm -f /etc/systemd/system/nexoshield-countd.service /usr/local/bin/nxcountd 2>/dev/null || true
+    # Phase 3: detach + remove the XDP shield if it was ever built.
+    if [ -x /usr/local/bin/nx-xdp ]; then
+        _nx_if=$(ip route show default 2>/dev/null | awk '/default/{print $5}' | head -1)
+        [ -n "$_nx_if" ] && /usr/local/bin/nx-xdp unload "$_nx_if" >/dev/null 2>&1 || true
+    fi
+    rm -f /usr/local/bin/nx-xdp /usr/local/lib/nx_xdp.o 2>/dev/null || true
     systemctl daemon-reload >/dev/null 2>&1 || true
 
     # Sysctl (note: removing the file does not reset values already
