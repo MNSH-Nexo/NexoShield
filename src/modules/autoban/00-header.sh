@@ -9,7 +9,7 @@
 # site-by-site during the fix waves (docs/FIX-PLAN.md).
 # ============================================================
 #  Smart Throttle+Ban — Anti-DDoS Layer 4
-#  Pipeline: watch(120 conns) → throttle(100Mbps) → ban(4h) | instant ban: 300 conns
+#  Pipeline: watch(120 conns) → throttle(100Mbps) → ban(progressive 30m-7d) | instant ban: 300 conns
 #  CF IPs + server own IPs: ALWAYS exempt
 # ============================================================
 
@@ -47,7 +47,7 @@ SCORE_FILE="$SCORE_DIR/reputation.dat"
 #   79-60 SUSPECT   watch only, no penalty
 #   59-40 THROTTLED move to class 1:30 (100Mbps)
 #   39-20 HARD      move to class 1:40 (50Mbps)
-#   <20  BANNED     ban_ip (4h)
+#   <20  BANNED     ban_ip (progressive 30m-7d)
 # (values assigned by nx_load_scoring_config below)
 # Scoring model v2 (docs/SCORING.md): every score movement is rated in
 # points per MINUTE and scaled by the real elapsed time of the sample,

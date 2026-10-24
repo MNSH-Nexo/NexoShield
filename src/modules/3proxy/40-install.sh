@@ -122,13 +122,15 @@ install_proxy() {
     fi
 
     echo -e "${YELLOW}[4/7] Security settings...${NC}"
-    read -t 30 -rp "Max connections per IP (default: 20): " MAX_CONN < /dev/tty 2>/dev/null || MAX_CONN=""
-    MAX_CONN=${MAX_CONN:-20}
-    [[ "$MAX_CONN" =~ ^[0-9]+$ ]] || MAX_CONN=20
-
-    read -t 30 -rp "Max total connections (default: 10000): " MAX_TOTAL_CONN < /dev/tty 2>/dev/null || MAX_TOTAL_CONN=""
-    MAX_TOTAL_CONN=${MAX_TOTAL_CONN:-10000}
-    [[ "$MAX_TOTAL_CONN" =~ ^[0-9]+$ ]] || MAX_TOTAL_CONN=10000
+    # No per-service connection cap: the proxy may serve thousands
+    # of users, and abuse is stopped per-IP by NexoShield's layers
+    # (connlimit tiers, the auto-ban daemon, the per-IP port guard
+    # below) - not by a blunt service-wide ceiling. maxconn stays
+    # only as a high resource guard so 3proxy never falls back to
+    # its built-in default of 100.
+    read -t 30 -rp "Connection ceiling (resource guard only, default: 100000): " MAX_TOTAL_CONN < /dev/tty 2>/dev/null || MAX_TOTAL_CONN=""
+    MAX_TOTAL_CONN=${MAX_TOTAL_CONN:-100000}
+    [[ "$MAX_TOTAL_CONN" =~ ^[0-9]+$ ]] || MAX_TOTAL_CONN=100000
 
     read -t 30 -rp "Idle timeout in seconds (default: 60): " CONN_TIMEOUT < /dev/tty 2>/dev/null || CONN_TIMEOUT=""
     CONN_TIMEOUT=${CONN_TIMEOUT:-60}
@@ -196,7 +198,7 @@ deny * * 169.254.0.0/16
 deny * * 100.64.0.0/10
 auth strong
 allow $PROXY_USER
-socks -p$PORT -i0.0.0.0 -e0.0.0.0 -n$MAX_CONN
+socks -p$PORT -i0.0.0.0 -e0.0.0.0
 EOF
     chgrp nexoproxy "$PROXY_CONF" 2>/dev/null || true
     chmod 640 "$PROXY_CONF"
@@ -217,8 +219,8 @@ PrivateTmp=true
 ProtectSystem=strict
 ReadWritePaths=$PROXY_LOG_DIR
 ProtectHome=true
-LimitNOFILE=65535
-LimitNPROC=65535
+LimitNOFILE=1048576
+LimitNPROC=1048576
 ExecStart=$PROXY_BIN $PROXY_CONF
 ExecReload=/bin/kill -HUP \$MAINPID
 Restart=always
@@ -242,7 +244,7 @@ $PROXY_LOG_DIR/*.log {
 EOF
 
     echo -e "${YELLOW}[6/7] Firewall rules (CF=unlimited)...${NC}"
-    setup_iptables_for_port "$PORT" "$MAX_CONN"
+    setup_iptables_for_port "$PORT"
 
     echo -e "${YELLOW}[7/7] Bandwidth control...${NC}"
     # Detect main interface
@@ -261,7 +263,6 @@ EOF
 PORT=$PORT
 USER=$PROXY_USER
 PASS=$PROXY_PASS
-MAX_CONN=$MAX_CONN
 MAX_TOTAL_CONN=$MAX_TOTAL_CONN
 INSTALL_DATE=$(date)
 MAIN_IF=$MAIN_IF

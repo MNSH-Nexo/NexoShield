@@ -258,7 +258,7 @@ EOF
     echo -e "    ${GREEN}✓${NC}  ICMP Flood  - rate-limited per source"
     echo -e "    ${GREEN}✓${NC}  Port Scans  - NULL/XMAS/FIN/bogus dropped"
     echo -e "    ${GREEN}✓${NC}  RST Flood   - rate-limited"
-    echo -e "    ${GREEN}✓${NC}  Smart Ban   - watch(45s)->throttle(100M)->ban(4h)"
+    echo -e "    ${GREEN}✓${NC}  Smart Ban   - watch(45s)->throttle(100M)->ban(progressive 30m-7d)"
     echo -e "    ${GREEN}✓${NC}  CF Users    - ALWAYS unlimited, never throttled/banned"
     echo -e "    ${GREEN}✓${NC}  Bandwidth   - CF=unlimited, non-CF=500Mbps max"
     echo -e "    ${GREEN}✓${NC}  Slowloris   - keepalive_time=30s"

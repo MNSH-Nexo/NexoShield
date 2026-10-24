@@ -57,8 +57,8 @@ uninstall_proxy() {
             iptables -D INPUT -p tcp --dport "$PORT" -s "$SIP/32" \
                 -m comment --comment "3proxy_self_allow" -j ACCEPT 2>/dev/null || true
         done < <(list_self_ips_all)
-        # Rate-limit rules for this port - by enumeration (BUG-014: the
-        # hitcount was MAX_CONN*3 at create, not a fixed 60)
+        # Rate-limit rules for this port - by enumeration (BUG-014:
+        # older versions created them with varying hitcounts)
         local _rn
         for _rn in $(iptables -S INPUT 2>/dev/null | grep -n "3proxy_${PORT}" | cut -d: -f1 | sort -rn); do
             iptables -D INPUT $((_rn - 1)) 2>/dev/null || true

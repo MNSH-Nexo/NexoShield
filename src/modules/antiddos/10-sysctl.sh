@@ -86,16 +86,16 @@ apply_sysctl_hardening() {
 
 # ── SYN Flood ─────────────────────────────────
 net.ipv4.tcp_syncookies = 1
-net.ipv4.tcp_max_syn_backlog = 4096
+net.ipv4.tcp_max_syn_backlog = 16384
 net.ipv4.tcp_synack_retries = 2
 net.ipv4.tcp_syn_retries = 2
 
 # ── Connection & TIME_WAIT ────────────────────
 net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_fin_timeout = 10
-net.ipv4.tcp_max_tw_buckets = 400000
+net.ipv4.tcp_max_tw_buckets = 1440000
 # tcp_max_orphans: limits half-open connections (Hold/Heavy attack defense)
-net.ipv4.tcp_max_orphans = 4096
+net.ipv4.tcp_max_orphans = 65536
 # Keepalive 30s: detect dead connections fast (Slowloris mitigation)
 net.ipv4.tcp_keepalive_time = 30
 net.ipv4.tcp_keepalive_intvl = 5

@@ -241,6 +241,6 @@ update_f2b_ignoreip() {
 
 # ════════════════════════════════════════════════
 # LAYER 4: Smart throttle+ban (auto-ban.sh)
-# Pipeline: watch (45s) → throttle 100Mbps → ban 4h
+# Pipeline: watch (45s) → throttle 100Mbps → ban (progressive 30m-7d)
 # CF IPs: ALWAYS exempt
 # ════════════════════════════════════════════════

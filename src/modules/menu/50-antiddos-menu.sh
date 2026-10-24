@@ -85,7 +85,7 @@ _antiddos_install() {
     echo -e "  ${C}[2/5]${NC} Firewall rules   — CF whitelist, SYN/UDP/HTTP rate limits"
     echo -e "  ${C}[3/5]${NC} fail2ban         — ban repeated attackers automatically"
     echo -e "  ${C}[4/5]${NC} Smart auto-ban   — watch → throttle → ban pipeline"
-    echo -e "  ${C}[5/5]${NC} Bandwidth cap    — unlimited for CF, 500Mbps for others"
+    echo -e "  ${C}[5/5]${NC} Bandwidth cap    — unlimited for CF, link-scaled cap for others"
     echo ""
     echo -e "  ${DIM}Cloudflare IPs are never affected by any limit.${NC}"
     echo ""

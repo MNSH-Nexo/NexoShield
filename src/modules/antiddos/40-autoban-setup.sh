@@ -61,7 +61,7 @@ EOF
     sleep 2
 
     if systemctl is-active auto-ban >/dev/null 2>&1; then
-        success "Auto-ban service: running (watch:${CONN_THRESHOLD:-80} conns, ban:${BAN_CONN_THRESHOLD:-200} conns, duration:4h)"
+        success "Auto-ban service: running (watch:120 conns, instant ban:300 conns, bans progressive 30m-7d - tunable in scoring.conf)"
     else
         warn "Auto-ban service failed to start - check: journalctl -u auto-ban"
     fi

@@ -2,7 +2,6 @@
 # Assembled into 3proxy-socks5.sh by tools/build.py - not a standalone script.
 setup_iptables_for_port() {
     local PORT="$1"
-    local MAX_CONN="${2:-20}"
 
     # Remove old rules for this port
     iptables -D INPUT -p tcp --dport "$PORT" -j ACCEPT 2>/dev/null || true
@@ -25,10 +24,10 @@ setup_iptables_for_port() {
         iptables -D INPUT -p tcp --dport "$PORT" -s "$SIP/32" \
             -m comment --comment "3proxy_self_allow" -j ACCEPT 2>/dev/null || true
     done < <(list_self_ips_all)
-    # Remove old rate-limit rules by enumeration (BUG-014: the hitcount
-    # depends on MAX_CONN at create time - *3 now, *2 in old versions -
-    # so a fixed spec delete can miss the real rule; the recent-rule name
-    # is the stable identifier)
+    # Remove old rate-limit rules by enumeration (BUG-014: rules
+    # created by older versions carry varying hitcounts, so a fixed
+    # spec delete can miss the real rule; the recent-rule name is
+    # the stable identifier)
     local _rn
     for _rn in $(iptables -S INPUT 2>/dev/null | grep -n "3proxy_$PORT" | cut -d: -f1 | sort -rn); do
         iptables -D INPUT $((_rn - 1)) 2>/dev/null || true
@@ -69,10 +68,13 @@ setup_iptables_for_port() {
     fi
 
     # ── Step 3: Non-CF rate-limit (new conns per IP) ──────
+    # Per-IP burst guard: 300 NEW hits per 60s window from one IP.
+    # This is the port's abuse protection - deliberately per-IP and
+    # independent of any service-wide connection ceiling.
     # Only apply to IPs NOT from CF (CF already accepted above)
     iptables -A INPUT -p tcp --dport "$PORT" -m state --state NEW \
         -m recent --name "3proxy_$PORT" --update --seconds 60 \
-        --hitcount $((MAX_CONN * 3)) -j DROP
+        --hitcount 300 -j DROP
     iptables -A INPUT -p tcp --dport "$PORT" -m state --state NEW \
         -m recent --name "3proxy_$PORT" --set
 

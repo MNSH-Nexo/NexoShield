@@ -10,7 +10,7 @@
 
 <img src="https://img.shields.io/badge/Platform-Ubuntu%2020%2B-E95420?style=flat-square&logo=ubuntu&logoColor=white" alt="Platform"/>
 <img src="https://img.shields.io/badge/Shell-Bash%205%2B-4EAA25?style=flat-square&logo=gnubash&logoColor=white" alt="Shell"/>
-<img src="https://img.shields.io/badge/Version-3.12.0-7c3aed?style=flat-square" alt="Version"/>
+<img src="https://img.shields.io/badge/Version-3.14.0-7c3aed?style=flat-square" alt="Version"/>
 <img src="https://img.shields.io/badge/License-MIT-1a73e8?style=flat-square" alt="License"/>
 
 </div>
@@ -234,7 +234,7 @@ shield
 
 ```
 ════════════════════════════════════════════════════
-  NexoShield v3.12.0 — Server Security Toolkit
+  NexoShield v3.14.0 — Server Security Toolkit
 ════════════════════════════════════════════════════
   1.  SOCKS5 Proxy          ● Running
   2.  Network Optimization  ● Optimized
@@ -393,7 +393,7 @@ MIT License — آزادانه استفاده، تغییر و توزیع کن.
 
 Built with the assistance of [HappySeeds AI](https://happyseeds.ai)
 
-**TARS** 🤖 — AI engineering partner of **Mashani**, built by Meta · [Muse](https://muse.ai): architect of the v3.5 → v3.12 rebuild — the modular refactor, the 68-finding security audit, scoring engine v2 and the DPI upgrade (event-based measurement, CUSUM, adaptive gates, the XDP shield), the exemption guarantee, field testing and releases.
+**TARS** 🤖 — AI engineering partner of **Mashani**, built by Meta · [Muse](https://muse.ai): architect of the v3.5 → v3.14 rebuild — the modular refactor, the 68-finding security audit, scoring engine v2 and the DPI upgrade (event-based measurement, CUSUM, adaptive gates, the XDP shield), the exemption guarantee, field testing and releases.
 
 ---
 

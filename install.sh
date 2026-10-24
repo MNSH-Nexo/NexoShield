@@ -3,7 +3,7 @@ exec bash <(tr -d '\r' < "$0" | tail -n +3) "$@"
 #!/bin/bash
 # ── GENERATED FILE ─ built by tools/build.py from src/ ─ do not edit directly; edit the sources and rebuild ──
 # ============================================================
-#  Proxy Manager - Auto Installer  v3.13.0
+#  Proxy Manager - Auto Installer  v3.14.0
 #  One file, one command, everything ready
 #
 #  Install:
@@ -28,7 +28,7 @@ exec bash <(tr -d '\r' < "$0" | tail -n +3) "$@"
 # ============================================================
 set -euo pipefail
 
-VERSION="3.13.0"
+VERSION="3.14.0"
 INSTALL_DIR="/opt/proxy-manager"
 BIN_LINK="/usr/local/bin/shield"
 LOG="/var/log/proxy-manager-install.log"
@@ -1235,7 +1235,6 @@ TCEOF
 # ── iptables rules for proxy port (CF unlimited) ─────────
 setup_iptables_for_port() {
     local PORT="$1"
-    local MAX_CONN="${2:-20}"
 
     # Remove old rules for this port
     iptables -D INPUT -p tcp --dport "$PORT" -j ACCEPT 2>/dev/null || true
@@ -1258,10 +1257,10 @@ setup_iptables_for_port() {
         iptables -D INPUT -p tcp --dport "$PORT" -s "$SIP/32" \
             -m comment --comment "3proxy_self_allow" -j ACCEPT 2>/dev/null || true
     done < <(list_self_ips_all)
-    # Remove old rate-limit rules by enumeration (BUG-014: the hitcount
-    # depends on MAX_CONN at create time - *3 now, *2 in old versions -
-    # so a fixed spec delete can miss the real rule; the recent-rule name
-    # is the stable identifier)
+    # Remove old rate-limit rules by enumeration (BUG-014: rules
+    # created by older versions carry varying hitcounts, so a fixed
+    # spec delete can miss the real rule; the recent-rule name is
+    # the stable identifier)
     local _rn
     for _rn in $(iptables -S INPUT 2>/dev/null | grep -n "3proxy_$PORT" | cut -d: -f1 | sort -rn); do
         iptables -D INPUT $((_rn - 1)) 2>/dev/null || true
@@ -1302,10 +1301,13 @@ setup_iptables_for_port() {
     fi
 
     # ── Step 3: Non-CF rate-limit (new conns per IP) ──────
+    # Per-IP burst guard: 300 NEW hits per 60s window from one IP.
+    # This is the port's abuse protection - deliberately per-IP and
+    # independent of any service-wide connection ceiling.
     # Only apply to IPs NOT from CF (CF already accepted above)
     iptables -A INPUT -p tcp --dport "$PORT" -m state --state NEW \
         -m recent --name "3proxy_$PORT" --update --seconds 60 \
-        --hitcount $((MAX_CONN * 3)) -j DROP
+        --hitcount 300 -j DROP
     iptables -A INPUT -p tcp --dport "$PORT" -m state --state NEW \
         -m recent --name "3proxy_$PORT" --set
 
@@ -1522,13 +1524,15 @@ install_proxy() {
     fi
 
     echo -e "${YELLOW}[4/7] Security settings...${NC}"
-    read -t 30 -rp "Max connections per IP (default: 20): " MAX_CONN < /dev/tty 2>/dev/null || MAX_CONN=""
-    MAX_CONN=${MAX_CONN:-20}
-    [[ "$MAX_CONN" =~ ^[0-9]+$ ]] || MAX_CONN=20
-
-    read -t 30 -rp "Max total connections (default: 10000): " MAX_TOTAL_CONN < /dev/tty 2>/dev/null || MAX_TOTAL_CONN=""
-    MAX_TOTAL_CONN=${MAX_TOTAL_CONN:-10000}
-    [[ "$MAX_TOTAL_CONN" =~ ^[0-9]+$ ]] || MAX_TOTAL_CONN=10000
+    # No per-service connection cap: the proxy may serve thousands
+    # of users, and abuse is stopped per-IP by NexoShield's layers
+    # (connlimit tiers, the auto-ban daemon, the per-IP port guard
+    # below) - not by a blunt service-wide ceiling. maxconn stays
+    # only as a high resource guard so 3proxy never falls back to
+    # its built-in default of 100.
+    read -t 30 -rp "Connection ceiling (resource guard only, default: 100000): " MAX_TOTAL_CONN < /dev/tty 2>/dev/null || MAX_TOTAL_CONN=""
+    MAX_TOTAL_CONN=${MAX_TOTAL_CONN:-100000}
+    [[ "$MAX_TOTAL_CONN" =~ ^[0-9]+$ ]] || MAX_TOTAL_CONN=100000
 
     read -t 30 -rp "Idle timeout in seconds (default: 60): " CONN_TIMEOUT < /dev/tty 2>/dev/null || CONN_TIMEOUT=""
     CONN_TIMEOUT=${CONN_TIMEOUT:-60}
@@ -1596,7 +1600,7 @@ deny * * 169.254.0.0/16
 deny * * 100.64.0.0/10
 auth strong
 allow $PROXY_USER
-socks -p$PORT -i0.0.0.0 -e0.0.0.0 -n$MAX_CONN
+socks -p$PORT -i0.0.0.0 -e0.0.0.0
 EOF
     chgrp nexoproxy "$PROXY_CONF" 2>/dev/null || true
     chmod 640 "$PROXY_CONF"
@@ -1617,8 +1621,8 @@ PrivateTmp=true
 ProtectSystem=strict
 ReadWritePaths=$PROXY_LOG_DIR
 ProtectHome=true
-LimitNOFILE=65535
-LimitNPROC=65535
+LimitNOFILE=1048576
+LimitNPROC=1048576
 ExecStart=$PROXY_BIN $PROXY_CONF
 ExecReload=/bin/kill -HUP \$MAINPID
 Restart=always
@@ -1642,7 +1646,7 @@ $PROXY_LOG_DIR/*.log {
 EOF
 
     echo -e "${YELLOW}[6/7] Firewall rules (CF=unlimited)...${NC}"
-    setup_iptables_for_port "$PORT" "$MAX_CONN"
+    setup_iptables_for_port "$PORT"
 
     echo -e "${YELLOW}[7/7] Bandwidth control...${NC}"
     # Detect main interface
@@ -1661,7 +1665,6 @@ EOF
 PORT=$PORT
 USER=$PROXY_USER
 PASS=$PROXY_PASS
-MAX_CONN=$MAX_CONN
 MAX_TOTAL_CONN=$MAX_TOTAL_CONN
 INSTALL_DATE=$(date)
 MAIN_IF=$MAIN_IF
@@ -1759,8 +1762,8 @@ uninstall_proxy() {
             iptables -D INPUT -p tcp --dport "$PORT" -s "$SIP/32" \
                 -m comment --comment "3proxy_self_allow" -j ACCEPT 2>/dev/null || true
         done < <(list_self_ips_all)
-        # Rate-limit rules for this port - by enumeration (BUG-014: the
-        # hitcount was MAX_CONN*3 at create, not a fixed 60)
+        # Rate-limit rules for this port - by enumeration (BUG-014:
+        # older versions created them with varying hitcounts)
         local _rn
         for _rn in $(iptables -S INPUT 2>/dev/null | grep -n "3proxy_${PORT}" | cut -d: -f1 | sort -rn); do
             iptables -D INPUT $((_rn - 1)) 2>/dev/null || true
@@ -2061,7 +2064,7 @@ TARGET_FILE="/etc/sysctl.d/99-vpn-optimized.conf"
 SNAPSHOT_DIR="/var/lib/vpn-sysctl-snapshots"
 LOG_FILE="/var/log/vpn-sysctl-optimizer.log"
 LOCK_FILE="/var/run/vpn-sysctl.lock"
-SCRIPT_VERSION="3.13.0"
+SCRIPT_VERSION="3.14.0"
 
 [ "$EUID" -ne 0 ] && echo -e "${RED}Root required${NC}" && exit 1
 
@@ -2283,8 +2286,8 @@ net.ipv4.tcp_congestion_control = $CONGESTION
 net.ipv4.tcp_notsent_lowat = 131072
 net.ipv4.tcp_fin_timeout = 10
 net.ipv4.tcp_keepalive_time = 30
-net.ipv4.tcp_keepalive_intvl = 10
-net.ipv4.tcp_keepalive_probes = 5
+net.ipv4.tcp_keepalive_intvl = 5
+net.ipv4.tcp_keepalive_probes = 3
 net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.tcp_fastopen = 3
 net.ipv4.tcp_synack_retries = 2
@@ -2652,7 +2655,7 @@ cat > "$INSTALL_DIR/.proxy-menu.sh.nxnew" << 'MENU_SCRIPT'
 # SC2094 - atomic state writes via tmp-file + rename, which the
 # checker flags as same-file pipelines. Both classes were audited
 # site-by-site during the fix waves (docs/FIX-PLAN.md).
-VERSION="3.13.0"
+VERSION="3.14.0"
 INSTALL_DIR="/opt/proxy-manager"
 _BSRC="${BASH_SOURCE[0]:-}"
 if [ -n "$_BSRC" ] && [ "$_BSRC" != "/dev/stdin" ] && [[ "$_BSRC" != /dev/fd/* ]]; then
@@ -3706,7 +3709,7 @@ _antiddos_install() {
     echo -e "  ${C}[2/5]${NC} Firewall rules   — CF whitelist, SYN/UDP/HTTP rate limits"
     echo -e "  ${C}[3/5]${NC} fail2ban         — ban repeated attackers automatically"
     echo -e "  ${C}[4/5]${NC} Smart auto-ban   — watch → throttle → ban pipeline"
-    echo -e "  ${C}[5/5]${NC} Bandwidth cap    — unlimited for CF, 500Mbps for others"
+    echo -e "  ${C}[5/5]${NC} Bandwidth cap    — unlimited for CF, link-scaled cap for others"
     echo ""
     echo -e "  ${DIM}Cloudflare IPs are never affected by any limit.${NC}"
     echo ""
@@ -3844,7 +3847,7 @@ cat > "$INSTALL_DIR/.antiddos.sh.nxnew" << 'ANTIDDOS_SCRIPT'
 # checker flags as same-file pipelines. Both classes were audited
 # site-by-site during the fix waves (docs/FIX-PLAN.md).
 # ============================================================
-#  Anti-DDoS Protection Manager v3.13.0
+#  Anti-DDoS Protection Manager v3.14.0
 #
 #  Layers:
 #    1. Kernel (sysctl hardening + tight conntrack timeouts)
@@ -3861,14 +3864,14 @@ cat > "$INSTALL_DIR/.antiddos.sh.nxnew" << 'ANTIDDOS_SCRIPT'
 #    - tc must work on SRC IP (not DST), else tunnel breaks
 #    - keepalive_time=30s detects dead connections fast (Slowloris)
 #    - conntrack established=120s cleans dead conns quickly
-#    - auto-ban: 120 active conns = watch, 300 conns = instant ban (4h)
+#    - auto-ban: 120 active conns = watch, 300 conns = instant ban (progressive)
 # ============================================================
 set -euo pipefail
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 CYAN='\033[0;36m'; WHITE='\033[1;37m'; DIM='\033[2m'; BOLD='\033[1m'; NC='\033[0m'
 
-SCRIPT_VERSION="3.13.0"
+SCRIPT_VERSION="3.14.0"
 LOG_FILE="/var/log/antiddos.log"
 STATE_FILE="/etc/antiddos/state.conf"
 BANNED_LIST="/etc/antiddos/banned.list"
@@ -4275,16 +4278,16 @@ apply_sysctl_hardening() {
 
 # ── SYN Flood ─────────────────────────────────
 net.ipv4.tcp_syncookies = 1
-net.ipv4.tcp_max_syn_backlog = 4096
+net.ipv4.tcp_max_syn_backlog = 16384
 net.ipv4.tcp_synack_retries = 2
 net.ipv4.tcp_syn_retries = 2
 
 # ── Connection & TIME_WAIT ────────────────────
 net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_fin_timeout = 10
-net.ipv4.tcp_max_tw_buckets = 400000
+net.ipv4.tcp_max_tw_buckets = 1440000
 # tcp_max_orphans: limits half-open connections (Hold/Heavy attack defense)
-net.ipv4.tcp_max_orphans = 4096
+net.ipv4.tcp_max_orphans = 65536
 # Keepalive 30s: detect dead connections fast (Slowloris mitigation)
 net.ipv4.tcp_keepalive_time = 30
 net.ipv4.tcp_keepalive_intvl = 5
@@ -5094,7 +5097,7 @@ update_f2b_ignoreip() {
 
 # ════════════════════════════════════════════════
 # LAYER 4: Smart throttle+ban (auto-ban.sh)
-# Pipeline: watch (45s) → throttle 100Mbps → ban 4h
+# Pipeline: watch (45s) → throttle 100Mbps → ban (progressive 30m-7d)
 # CF IPs: ALWAYS exempt
 # ════════════════════════════════════════════════
 setup_autoban() {
@@ -5130,7 +5133,7 @@ setup_autoban() {
 # site-by-site during the fix waves (docs/FIX-PLAN.md).
 # ============================================================
 #  Smart Throttle+Ban — Anti-DDoS Layer 4
-#  Pipeline: watch(120 conns) → throttle(100Mbps) → ban(4h) | instant ban: 300 conns
+#  Pipeline: watch(120 conns) → throttle(100Mbps) → ban(progressive 30m-7d) | instant ban: 300 conns
 #  CF IPs + server own IPs: ALWAYS exempt
 # ============================================================
 
@@ -5288,7 +5291,7 @@ EOF
 #   79-60 SUSPECT   watch only, no penalty
 #   59-40 THROTTLED move to class 1:30 (100Mbps)
 #   39-20 HARD      move to class 1:40 (50Mbps)
-#   <20  BANNED     ban_ip (4h)
+#   <20  BANNED     ban_ip (progressive 30m-7d)
 # (values assigned by nx_load_scoring_config below)
 # Scoring model v2 (docs/SCORING.md): every score movement is rated in
 # points per MINUTE and scaled by the real elapsed time of the sample,
@@ -7263,7 +7266,7 @@ EOF
     sleep 2
 
     if systemctl is-active auto-ban >/dev/null 2>&1; then
-        success "Auto-ban service: running (watch:${CONN_THRESHOLD:-80} conns, ban:${BAN_CONN_THRESHOLD:-200} conns, duration:4h)"
+        success "Auto-ban service: running (watch:120 conns, instant ban:300 conns, bans progressive 30m-7d - tunable in scoring.conf)"
     else
         warn "Auto-ban service failed to start - check: journalctl -u auto-ban"
     fi
@@ -8819,7 +8822,7 @@ EOF
     echo -e "    ${GREEN}✓${NC}  ICMP Flood  - rate-limited per source"
     echo -e "    ${GREEN}✓${NC}  Port Scans  - NULL/XMAS/FIN/bogus dropped"
     echo -e "    ${GREEN}✓${NC}  RST Flood   - rate-limited"
-    echo -e "    ${GREEN}✓${NC}  Smart Ban   - watch(45s)->throttle(100M)->ban(4h)"
+    echo -e "    ${GREEN}✓${NC}  Smart Ban   - watch(45s)->throttle(100M)->ban(progressive 30m-7d)"
     echo -e "    ${GREEN}✓${NC}  CF Users    - ALWAYS unlimited, never throttled/banned"
     echo -e "    ${GREEN}✓${NC}  Bandwidth   - CF=unlimited, non-CF=500Mbps max"
     echo -e "    ${GREEN}✓${NC}  Slowloris   - keepalive_time=30s"
@@ -8842,7 +8845,7 @@ show_thresholds() {
     printf "  %-35s ${WHITE}%s${NC}\n" "Auto-ban subnet ban:"        "1000 total conns from /24"
     printf "  %-35s ${WHITE}%s${NC}\n" "Auto-ban observe:"           "45s watch before throttle"
     printf "  %-35s ${WHITE}%s${NC}\n" "Auto-ban throttle:"          "100Mbps"
-    printf "  %-35s ${WHITE}%s${NC}\n" "Auto-ban duration:"          "4 hours"
+    printf "  %-35s ${WHITE}%s${NC}\n" "Auto-ban duration:"          "Progressive: 30 min, doubling to 7 days"
     printf "  %-35s ${WHITE}%s${NC}\n" "Reputation scoring:"         "ON (100→0, human-vs-bot)"
     printf "  %-35s ${WHITE}%s${NC}\n" "  bands:"                    "80+normal 60+watch 40+100M 20+50M <20 ban"
     printf "  %-35s ${WHITE}%s${NC}\n" "  auto-release:"             "ON (throttled→normal when calmed)"

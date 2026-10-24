@@ -25,7 +25,7 @@
 #    - tc must work on SRC IP (not DST), else tunnel breaks
 #    - keepalive_time=30s detects dead connections fast (Slowloris)
 #    - conntrack established=120s cleans dead conns quickly
-#    - auto-ban: 120 active conns = watch, 300 conns = instant ban (4h)
+#    - auto-ban: 120 active conns = watch, 300 conns = instant ban (progressive)
 # ============================================================
 set -euo pipefail
 
