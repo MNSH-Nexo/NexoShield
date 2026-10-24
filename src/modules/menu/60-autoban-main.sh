@@ -77,7 +77,7 @@ while true; do
 
     ui_options "1|SOCKS5 Proxy|$_P" "2|Network Optimization|$_N" \
         "3|Anti-DDoS|$_D" "4|Monitoring" "5|Security" "6|Services" \
-        "7|System" "0|Exit"
+        "7|System" "8|Update NexoShield|v$VERSION" "0|Exit"
     ui_input CH "  Enter number: "
     case "$CH" in
         1) menu_proxy ;;
@@ -87,6 +87,7 @@ while true; do
         5) menu_security ;;
         6) menu_services ;;
         7) menu_system ;;
+        8) nx_update_nexoshield; press_enter ;;
         0) clear; exit 0 ;;
     esac
 done

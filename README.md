@@ -10,7 +10,7 @@
 
 <img src="https://img.shields.io/badge/Platform-Ubuntu%2020%2B-E95420?style=flat-square&logo=ubuntu&logoColor=white" alt="Platform"/>
 <img src="https://img.shields.io/badge/Shell-Bash%205%2B-4EAA25?style=flat-square&logo=gnubash&logoColor=white" alt="Shell"/>
-<img src="https://img.shields.io/badge/Version-3.11.0-7c3aed?style=flat-square" alt="Version"/>
+<img src="https://img.shields.io/badge/Version-3.12.0-7c3aed?style=flat-square" alt="Version"/>
 <img src="https://img.shields.io/badge/License-MIT-1a73e8?style=flat-square" alt="License"/>
 
 </div>
@@ -86,6 +86,7 @@ You can use it purely for **server security** — or also enable the built-in **
 - **مانیتورینگ کامل** — داشبورد تهدید بلادرنگ، اتصال‌ها، پردازنده و حافظه، دیسک، لاگ‌ها و پرتکرارترین آی‌پی‌ها.
 - **مدیر پروکسی SOCKS5** بر پایه‌ی 3proxy — نصب، تغییر گذرواژه، **حذف کامل نام کاربری و گذرواژه**، آمار ترافیک و لاگ زنده.
 - **Snapshot و Rollback** برای تنظیمات کرنل.
+- **آپدیت یک‌کلیکی از داخل منو** — بررسی نسخه‌ی تازه روی گیت‌هاب و نصب درجا، با حفظ کامل تنظیمات، اعتبارهای پروکسی و scoring.conf.
 - **نصب و ارتقا در کمتر از ۵ دقیقه** — ارتقا، اعتبارهای پروکسی و تنظیمات شما را حفظ می‌کند.
 
 </div>
@@ -233,7 +234,7 @@ shield
 
 ```
 ════════════════════════════════════════════════════
-  NexoShield v3.11.0 — Server Security Toolkit
+  NexoShield v3.12.0 — Server Security Toolkit
 ════════════════════════════════════════════════════
   1.  SOCKS5 Proxy          ● Running
   2.  Network Optimization  ● Optimized
@@ -242,6 +243,7 @@ shield
   5.  Security
   6.  Services
   7.  System
+  8.  Update NexoShield     v3.12.0
   0.  Exit
 ════════════════════════════════════════════════════
 ```
@@ -261,6 +263,8 @@ shield
 **سرویس‌ها** — مدیریت سرویس‌های واقعاً نصب‌شده روی سیستم (اجرا، توقف، راه‌اندازی مجدد و وضعیت).
 
 **سیستم** — اطلاعات سرور، به‌روزرسانی سیستم، پاک‌سازی لاگ‌ها، راه‌اندازی مجدد و پشتیبان‌گیری از پیکربندی.
+
+**آپدیت NexoShield** — بررسی نسخه‌ی تازه روی گیت‌هاب و نصب آن با یک انتخاب؛ نصب‌کننده پیش از فعال‌سازی راستی‌آزمایی می‌شود و همه‌ی تنظیمات حفظ می‌شوند.
 
 بدون منو هم می‌شود؛ برای اسکریپت‌نویسی و مانیتورینگ خارجی:
 
@@ -389,7 +393,7 @@ MIT License — آزادانه استفاده، تغییر و توزیع کن.
 
 Built with the assistance of [HappySeeds AI](https://happyseeds.ai)
 
-**TARS** 🤖 — AI engineering partner of **Mashani**, built by Meta · [Muse](https://muse.ai): architect of the v3.5 → v3.11 rebuild — the modular refactor, the 68-finding security audit, scoring engine v2 and the DPI upgrade (event-based measurement, CUSUM, adaptive gates, the XDP shield), the exemption guarantee, field testing and releases.
+**TARS** 🤖 — AI engineering partner of **Mashani**, built by Meta · [Muse](https://muse.ai): architect of the v3.5 → v3.12 rebuild — the modular refactor, the 68-finding security audit, scoring engine v2 and the DPI upgrade (event-based measurement, CUSUM, adaptive gates, the XDP shield), the exemption guarantee, field testing and releases.
 
 ---
 

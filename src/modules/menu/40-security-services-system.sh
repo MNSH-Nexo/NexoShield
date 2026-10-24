@@ -144,11 +144,73 @@ menu_services() {
     done
 }
 
+# ── Self-update (v3.12) ───────────────────────────────────
+# One-click update from the menu. The latest version is whatever
+# master on GitHub carries (the project's distribution channel).
+# The downloaded installer must pass bash -n, carry the
+# NexoShield marker and embed exactly the advertised version
+# before it may run; the installer itself stages and verifies
+# every module before activating (BUG-025), and an upgrade
+# preserves credentials and scoring.conf. NX_UPDATE_BASE is a
+# test hook.
+NX_UPDATE_BASE="${NX_UPDATE_BASE:-https://raw.githubusercontent.com/MNSH-Nexo/NexoShield/master}"
+nx_update_nexoshield() {
+    local _latest _tmp _rc
+    echo -e "  ${C}Checking for updates...${NC}"
+    _latest=$(curl -fsSL --max-time 15 "$NX_UPDATE_BASE/VERSION" 2>/dev/null | tr -d '[:space:]' || true)
+    if [ -z "$_latest" ]; then
+        warn "Could not reach the update server - nothing was changed."
+        return 1
+    fi
+    if [ "$_latest" = "$VERSION" ]; then
+        ok "NexoShield is up to date (v$VERSION)."
+        return 0
+    fi
+    if [ "$(printf '%s\n%s\n' "$_latest" "$VERSION" | sort -V | head -1)" != "$VERSION" ]; then
+        warn "Remote version v$_latest is not newer than v$VERSION - nothing to do."
+        return 0
+    fi
+    echo -e "  Update available: ${Y}v$VERSION${NC} -> ${G}v$_latest${NC}"
+    echo -e "  ${DIM}Settings, proxy credentials and scoring.conf are preserved.${NC}"
+    if ! ui_confirm "Download and install v$_latest now?"; then
+        echo -e "  ${DIM}Cancelled.${NC}"
+        return 0
+    fi
+    _tmp=$(mktemp -d) || return 1
+    if ! curl -fsSL --max-time 180 -o "$_tmp/install.sh" "$NX_UPDATE_BASE/install.sh" 2>/dev/null; then
+        warn "Download failed - nothing was changed."
+        rm -rf "$_tmp"; return 1
+    fi
+    if ! bash -n "$_tmp/install.sh" 2>/dev/null || \
+       ! grep -q "NexoShield" "$_tmp/install.sh" || \
+       ! grep -q "^VERSION=\"$_latest\"" "$_tmp/install.sh"; then
+        warn "Downloaded installer failed verification - nothing was changed."
+        rm -rf "$_tmp"; return 1
+    fi
+    echo -e "  ${C}Installing NexoShield v$_latest ...${NC}"
+    if (exec </dev/tty) 2>/dev/null; then
+        bash "$_tmp/install.sh" < /dev/tty
+    else
+        bash "$_tmp/install.sh"
+    fi
+    _rc=$?
+    rm -rf "$_tmp"
+    if [ "$_rc" -ne 0 ]; then
+        warn "Installer exited with an error - the previous install was left untouched."
+        return 1
+    fi
+    ok "Updated to NexoShield v$_latest."
+    if [ -z "${NX_UI_STDIN:-}" ] && ui_confirm "Restart the menu now to use v$_latest?"; then
+        exec bash "$SCRIPT_DIR/proxy-menu.sh"
+    fi
+    return 0
+}
+
 # ── System Menu ───────────────────────────────────────────
 menu_system() {
     while true; do
         ui_title "System"
-        ui_options "1|Server info" "2|Update" "3|Clean logs" "4|Reboot" \
+        ui_options "1|Server info" "2|Update system packages" "3|Clean logs" "4|Reboot" \
             "5|Backup config" "0|Back"
         ui_input CH "  Enter number: "
         case "$CH" in

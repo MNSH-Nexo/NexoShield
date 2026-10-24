@@ -3,7 +3,7 @@ exec bash <(tr -d '\r' < "$0" | tail -n +3) "$@"
 #!/bin/bash
 # ── GENERATED FILE ─ built by tools/build.py from src/ ─ do not edit directly; edit the sources and rebuild ──
 # ============================================================
-#  Proxy Manager - Auto Installer  v3.11.0
+#  Proxy Manager - Auto Installer  v3.12.0
 #  One file, one command, everything ready
 #
 #  Install:
@@ -28,7 +28,7 @@ exec bash <(tr -d '\r' < "$0" | tail -n +3) "$@"
 # ============================================================
 set -euo pipefail
 
-VERSION="3.11.0"
+VERSION="3.12.0"
 INSTALL_DIR="/opt/proxy-manager"
 BIN_LINK="/usr/local/bin/shield"
 LOG="/var/log/proxy-manager-install.log"
@@ -2041,7 +2041,7 @@ TARGET_FILE="/etc/sysctl.d/99-vpn-optimized.conf"
 SNAPSHOT_DIR="/var/lib/vpn-sysctl-snapshots"
 LOG_FILE="/var/log/vpn-sysctl-optimizer.log"
 LOCK_FILE="/var/run/vpn-sysctl.lock"
-SCRIPT_VERSION="3.11.0"
+SCRIPT_VERSION="3.12.0"
 
 [ "$EUID" -ne 0 ] && echo -e "${RED}Root required${NC}" && exit 1
 
@@ -2632,7 +2632,7 @@ cat > "$INSTALL_DIR/.proxy-menu.sh.nxnew" << 'MENU_SCRIPT'
 # SC2094 - atomic state writes via tmp-file + rename, which the
 # checker flags as same-file pipelines. Both classes were audited
 # site-by-site during the fix waves (docs/FIX-PLAN.md).
-VERSION="3.11.0"
+VERSION="3.12.0"
 INSTALL_DIR="/opt/proxy-manager"
 _BSRC="${BASH_SOURCE[0]:-}"
 if [ -n "$_BSRC" ] && [ "$_BSRC" != "/dev/stdin" ] && [[ "$_BSRC" != /dev/fd/* ]]; then
@@ -3461,11 +3461,73 @@ menu_services() {
     done
 }
 
+# ── Self-update (v3.12) ───────────────────────────────────
+# One-click update from the menu. The latest version is whatever
+# master on GitHub carries (the project's distribution channel).
+# The downloaded installer must pass bash -n, carry the
+# NexoShield marker and embed exactly the advertised version
+# before it may run; the installer itself stages and verifies
+# every module before activating (BUG-025), and an upgrade
+# preserves credentials and scoring.conf. NX_UPDATE_BASE is a
+# test hook.
+NX_UPDATE_BASE="${NX_UPDATE_BASE:-https://raw.githubusercontent.com/MNSH-Nexo/NexoShield/master}"
+nx_update_nexoshield() {
+    local _latest _tmp _rc
+    echo -e "  ${C}Checking for updates...${NC}"
+    _latest=$(curl -fsSL --max-time 15 "$NX_UPDATE_BASE/VERSION" 2>/dev/null | tr -d '[:space:]' || true)
+    if [ -z "$_latest" ]; then
+        warn "Could not reach the update server - nothing was changed."
+        return 1
+    fi
+    if [ "$_latest" = "$VERSION" ]; then
+        ok "NexoShield is up to date (v$VERSION)."
+        return 0
+    fi
+    if [ "$(printf '%s\n%s\n' "$_latest" "$VERSION" | sort -V | head -1)" != "$VERSION" ]; then
+        warn "Remote version v$_latest is not newer than v$VERSION - nothing to do."
+        return 0
+    fi
+    echo -e "  Update available: ${Y}v$VERSION${NC} -> ${G}v$_latest${NC}"
+    echo -e "  ${DIM}Settings, proxy credentials and scoring.conf are preserved.${NC}"
+    if ! ui_confirm "Download and install v$_latest now?"; then
+        echo -e "  ${DIM}Cancelled.${NC}"
+        return 0
+    fi
+    _tmp=$(mktemp -d) || return 1
+    if ! curl -fsSL --max-time 180 -o "$_tmp/install.sh" "$NX_UPDATE_BASE/install.sh" 2>/dev/null; then
+        warn "Download failed - nothing was changed."
+        rm -rf "$_tmp"; return 1
+    fi
+    if ! bash -n "$_tmp/install.sh" 2>/dev/null || \
+       ! grep -q "NexoShield" "$_tmp/install.sh" || \
+       ! grep -q "^VERSION=\"$_latest\"" "$_tmp/install.sh"; then
+        warn "Downloaded installer failed verification - nothing was changed."
+        rm -rf "$_tmp"; return 1
+    fi
+    echo -e "  ${C}Installing NexoShield v$_latest ...${NC}"
+    if (exec </dev/tty) 2>/dev/null; then
+        bash "$_tmp/install.sh" < /dev/tty
+    else
+        bash "$_tmp/install.sh"
+    fi
+    _rc=$?
+    rm -rf "$_tmp"
+    if [ "$_rc" -ne 0 ]; then
+        warn "Installer exited with an error - the previous install was left untouched."
+        return 1
+    fi
+    ok "Updated to NexoShield v$_latest."
+    if [ -z "${NX_UI_STDIN:-}" ] && ui_confirm "Restart the menu now to use v$_latest?"; then
+        exec bash "$SCRIPT_DIR/proxy-menu.sh"
+    fi
+    return 0
+}
+
 # ── System Menu ───────────────────────────────────────────
 menu_system() {
     while true; do
         ui_title "System"
-        ui_options "1|Server info" "2|Update" "3|Clean logs" "4|Reboot" \
+        ui_options "1|Server info" "2|Update system packages" "3|Clean logs" "4|Reboot" \
             "5|Backup config" "0|Back"
         ui_input CH "  Enter number: "
         case "$CH" in
@@ -3733,7 +3795,7 @@ while true; do
 
     ui_options "1|SOCKS5 Proxy|$_P" "2|Network Optimization|$_N" \
         "3|Anti-DDoS|$_D" "4|Monitoring" "5|Security" "6|Services" \
-        "7|System" "0|Exit"
+        "7|System" "8|Update NexoShield|v$VERSION" "0|Exit"
     ui_input CH "  Enter number: "
     case "$CH" in
         1) menu_proxy ;;
@@ -3743,6 +3805,7 @@ while true; do
         5) menu_security ;;
         6) menu_services ;;
         7) menu_system ;;
+        8) nx_update_nexoshield; press_enter ;;
         0) clear; exit 0 ;;
     esac
 done
@@ -3761,7 +3824,7 @@ cat > "$INSTALL_DIR/.antiddos.sh.nxnew" << 'ANTIDDOS_SCRIPT'
 # checker flags as same-file pipelines. Both classes were audited
 # site-by-site during the fix waves (docs/FIX-PLAN.md).
 # ============================================================
-#  Anti-DDoS Protection Manager v3.11.0
+#  Anti-DDoS Protection Manager v3.12.0
 #
 #  Layers:
 #    1. Kernel (sysctl hardening + tight conntrack timeouts)
@@ -3785,7 +3848,7 @@ set -euo pipefail
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 CYAN='\033[0;36m'; WHITE='\033[1;37m'; DIM='\033[2m'; BOLD='\033[1m'; NC='\033[0m'
 
-SCRIPT_VERSION="3.11.0"
+SCRIPT_VERSION="3.12.0"
 LOG_FILE="/var/log/antiddos.log"
 STATE_FILE="/etc/antiddos/state.conf"
 BANNED_LIST="/etc/antiddos/banned.list"

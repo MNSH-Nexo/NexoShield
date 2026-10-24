@@ -137,6 +137,8 @@ q
 1
 
 0
+8
+
 0
 EOF
 
@@ -147,7 +149,7 @@ TERM=xterm PATH="$W/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:
 timeout 60 bash "$W/mod/proxy-menu.sh" < "$W/input.txt" > "$OUT" 2>&1
 RC=$?
 [ "$RC" -eq 0 ] && ok || bad "menu walk exit code $RC"
-for marker in "Monitoring" "LIVE THREAT MONITOR" "SOCKS5 Proxy (3proxy)" \
+for marker in "Monitoring" "LIVE THREAT MONITOR" "Could not reach the update server" "SOCKS5 Proxy (3proxy)" \
               "Threat IPs" "Security" "Anti-DDoS Protection" \
               "Network Optimization" "Services" "System" "Hostname:"; do
     grep -q -- "$marker" "$OUT" && ok || bad "screen marker missing: $marker"
