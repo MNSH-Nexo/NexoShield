@@ -33,7 +33,7 @@ LOG_FILE="/var/log/proxy-manager.log"
 R='\033[0;31m'; G='\033[0;32m'; Y='\033[1;33m'; C='\033[0;36m'
 W='\033[1;37m'; DIM='\033[2m'; BOLD='\033[1m'; NC='\033[0m'
 
-[ "$EUID" -ne 0 ] && echo -e "${R}Root required: sudo proxy${NC}" && exit 1
+[ "$EUID" -ne 0 ] && echo -e "${R}Root required: sudo shield${NC}" && exit 1
 touch "$LOG_FILE" 2>/dev/null && chmod 600 "$LOG_FILE" 2>/dev/null || true
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE" 2>/dev/null || true; }
 sep()  { echo -e "${C}════════════════════════════════════════════════${NC}"; }

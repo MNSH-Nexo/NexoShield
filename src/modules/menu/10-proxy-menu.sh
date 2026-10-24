@@ -13,13 +13,18 @@ menu_proxy() {
             # Read vars with prefix to avoid conflict with bash $USER builtin
             _INFO_USER=$(grep '^USER=' /etc/3proxy/install.info 2>/dev/null | cut -d= -f2- || echo "")
             _INFO_PASS=$(grep '^PASS=' /etc/3proxy/install.info 2>/dev/null | cut -d= -f2- || echo "")
-            echo -e "  User   : ${G}${_INFO_USER:-?}${NC}   Pass: ${G}${_INFO_PASS:-?}${NC}"
-            echo -e "  Link   : ${G}socks5://${_INFO_USER:-?}:${_INFO_PASS:-?}@$(get_ip):${PORT:-?}${NC}"
+            if [ -n "$_INFO_USER" ]; then
+                echo -e "  User   : ${G}$_INFO_USER${NC}   Pass: ${G}${_INFO_PASS:-?}${NC}"
+                echo -e "  Link   : ${G}socks5://$_INFO_USER:${_INFO_PASS:-?}@$(get_ip):${PORT:-?}${NC}"
+            else
+                echo -e "  User   : ${Y}(none - authentication OFF)${NC}"
+                echo -e "  Link   : ${G}socks5://$(get_ip):${PORT:-?}${NC}"
+            fi
         }
         echo ""
         ui_options "1|Install/Update" "2|Remove" "3|Start" "4|Stop" \
             "5|Restart" "6|Live log" "7|Traffic stats" "8|Change password" \
-            "9|Suspicious IPs" "0|Back"
+            "9|Delete user & password" "10|Suspicious IPs" "0|Back"
         ui_input CH "  Enter number: "
         case "$CH" in
             1) # Ensure the Cloudflare whitelist file exists before install so CF
@@ -58,7 +63,18 @@ menu_proxy() {
             6) bash "$PROXY_SCRIPT" --log ;;
             7) bash "$PROXY_SCRIPT" --stats ;;
             8) bash "$PROXY_SCRIPT" --change-pass; press_enter ;;
-            9) _proxy_suspicious ;;
+            9) echo ""
+               echo -e "  ${R}${BOLD}⚠  Delete the proxy user & password${NC}"
+               echo -e "  ${DIM}The proxy will accept connections WITHOUT authentication -"
+               echo -e "  anyone who can reach the port will be able to use it.${NC}"
+               echo ""
+               if ui_confirm "Delete credentials and open the proxy?"; then
+                   bash "$PROXY_SCRIPT" --delete-user
+               else
+                   echo -e "  ${DIM}Cancelled.${NC}"
+               fi
+               press_enter ;;
+            10) _proxy_suspicious ;;
             0) return ;;
         esac
     done

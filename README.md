@@ -10,7 +10,7 @@
 
 <img src="https://img.shields.io/badge/Platform-Ubuntu%2020%2B-E95420?style=flat-square&logo=ubuntu&logoColor=white" alt="Platform"/>
 <img src="https://img.shields.io/badge/Shell-Bash%205%2B-4EAA25?style=flat-square&logo=gnubash&logoColor=white" alt="Shell"/>
-<img src="https://img.shields.io/badge/Version-3.10.0-7c3aed?style=flat-square" alt="Version"/>
+<img src="https://img.shields.io/badge/Version-3.11.0-7c3aed?style=flat-square" alt="Version"/>
 <img src="https://img.shields.io/badge/License-MIT-1a73e8?style=flat-square" alt="License"/>
 
 </div>
@@ -80,7 +80,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/MNSH-Nexo/NexoShield/master/
 **بعد از نصب، با این دستور اجرا کن:**
 
 ```bash
-proxy
+shield
 ```
 
 **پیش‌نیاز**
@@ -206,7 +206,7 @@ Connection Detected
 ## فایل‌های نصب شده
 
 ```
-/usr/local/bin/proxy          ← دستور اصلی
+/usr/local/bin/shield         ← دستور اصلی
 /etc/antiddos/                ← تنظیمات و banned list
 /etc/3proxy/                  ← تنظیمات SOCKS5 (اختیاری)
 /var/log/auto-ban.log         ← لاگ ban/unban

@@ -9,7 +9,11 @@ show_info() {
     SERVER_IP=$(get_server_ip)
     sep
     echo -e "  ${CYAN}Connection info:${NC}"; sep
-    echo -e "  socks5://${_INFO_USER:-?}:${_INFO_PASS:-?}@$SERVER_IP:${_INFO_PORT:-?}"
+    if [ -n "$_INFO_USER" ]; then
+        echo -e "  socks5://${_INFO_USER}:${_INFO_PASS:-?}@$SERVER_IP:${_INFO_PORT:-?}"
+    else
+        echo -e "  socks5://$SERVER_IP:${_INFO_PORT:-?}  ${YELLOW}(no authentication)${NC}"
+    fi
     # (No IPv6 form: 3proxy binds 0.0.0.0 only - BUG-059.)
     sep
 }
@@ -78,6 +82,39 @@ show_menu() {
     sep
 }
 
+# delete_proxy_user: remove the SOCKS credentials entirely. The
+# users file is emptied (the config's `include` stays valid), the
+# config switches auth strong -> none and the per-user allow becomes
+# allow *, and install.info is cleared so every display agrees.
+# Re-running Install/Update generates fresh credentials (the install
+# path already treats an empty users file as "no credentials").
+# The caller (menu) confirms: this OPENS the proxy to anyone who can
+# reach the port. SSRF deny rules for private ranges stay in place.
+delete_proxy_user() {
+    local _cu
+    _cu=$(grep -oP '(?<=^users )\S+(?=:CL:)' "$PROXY_USERS" 2>/dev/null | head -1 || true)
+    if [ -z "$_cu" ]; then
+        echo -e "${YELLOW}No proxy user configured - authentication is already off.${NC}"
+        return 0
+    fi
+    : > "$PROXY_USERS" || { echo -e "${RED}Cannot write $PROXY_USERS${NC}"; return 1; }
+    chgrp nexoproxy "$PROXY_USERS" 2>/dev/null || true
+    chmod 640 "$PROXY_USERS" 2>/dev/null || true
+    sed -i 's/^auth strong/auth none/' "$PROXY_CONF" 2>/dev/null || true
+    sed -i -E 's/^allow [^ ]+/allow */' "$PROXY_CONF" 2>/dev/null || true
+    if [ -f /etc/3proxy/install.info ]; then
+        sed -i 's/^USER=.*/USER=/' /etc/3proxy/install.info 2>/dev/null || true
+        sed -i 's/^PASS=.*/PASS=/' /etc/3proxy/install.info 2>/dev/null || true
+    fi
+    if systemctl restart 3proxy 2>/dev/null; then
+        echo -e "${GREEN}Proxy user '${_cu}' and its password deleted - authentication is OFF.${NC}"
+        echo -e "${YELLOW}Anyone who can reach the port can now use this proxy. Run Install/Update to set new credentials.${NC}"
+        return 0
+    fi
+    echo -e "${RED}Credentials removed but the 3proxy restart FAILED - check: systemctl status 3proxy${NC}"
+    return 1
+}
+
 # ── CLI flags (called from proxy-menu.sh) ────────────────
 case "${1:-}" in
     --install|-i) install_proxy;  exit 0 ;;
@@ -90,6 +127,7 @@ case "${1:-}" in
                       echo -e "${GREEN}Stopped${NC}" || echo -e "${RED}Error${NC}"; exit 0 ;;
     --start)      systemctl start 3proxy 2>/dev/null && \
                       echo -e "${GREEN}Started${NC}" || echo -e "${RED}Error${NC}"; exit 0 ;;
+    --delete-user) delete_proxy_user; exit $? ;;
     --log)        tail -f "$PROXY_LOG_DIR"/access.log.* 2>/dev/null || \
                       journalctl -u 3proxy -f --no-pager; exit 0 ;;
     --tc-status)  MAIN_IF=$(ip route show default 2>/dev/null | awk '/default/{print $5}' | head -1)

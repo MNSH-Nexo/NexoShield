@@ -24,11 +24,19 @@ chmod +x "$INSTALL_DIR/3proxy-socks5.sh" \
          "$INSTALL_DIR/antiddos.sh"
 ok "Files created"
 
-# ── Link proxy command ────────────────────────────────────
-info "Installing proxy command..."
+# ── Link shield command ───────────────────────────────────
+info "Installing shield command..."
 ln -sf "$INSTALL_DIR/proxy-menu.sh" "$BIN_LINK"
 chmod +x "$BIN_LINK"
-ok "Command ${W}proxy${NC} installed"
+ok "Command ${W}shield${NC} installed"
+# Pre-v3.11 installs linked the menu as /usr/local/bin/proxy. Drop
+# that link on upgrade - but only if it is OURS (a symlink to this
+# menu); never touch a foreign binary of the same name (BUG-058).
+if [ "/usr/local/bin/proxy" != "$BIN_LINK" ] && [ -L /usr/local/bin/proxy ] && \
+   [ "$(readlink /usr/local/bin/proxy 2>/dev/null)" = "$INSTALL_DIR/proxy-menu.sh" ]; then
+    rm -f /usr/local/bin/proxy
+    info "Removed the old 'proxy' command link (the menu is 'shield' now)"
+fi
 
 # ── Final result ──────────────────────────────────────────
 echo ""
@@ -36,7 +44,7 @@ sep
 echo -e "  ${G}${BOLD}✓ Installation complete! v${VERSION}${NC}"
 sep
 echo -e "  Install path : ${DIM}$INSTALL_DIR${NC}"
-echo -e "  Command      : ${W}${BOLD}proxy${NC}"
+echo -e "  Command      : ${W}${BOLD}shield${NC}"
 echo -e "  Install log  : ${DIM}$LOG${NC}"
 echo ""
 echo -e "  ${C}Scripts installed:${NC}"
@@ -46,6 +54,6 @@ echo -e "  ${DIM}->${NC}  antiddos.sh         (5-layer DDoS protection)"
 echo -e "  ${DIM}->${NC}  proxy-menu.sh       (main control panel)"
 echo ""
 echo -e "  ${C}Run now:${NC}"
-echo -e "  ${W}${BOLD}  proxy${NC}"
+echo -e "  ${W}${BOLD}  shield${NC}"
 sep
 

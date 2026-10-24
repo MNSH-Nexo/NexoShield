@@ -14,7 +14,7 @@ VERSION                     Single source of truth for the version string
 src/
   installer/
     preamble.sh             Installer head: banner, root check, CF array
-    outro.sh                Installer tail: permissions, `proxy` link, banner
+    outro.sh                Installer tail: permissions, `shield` link, banner
   modules/                  Runtime scripts, one directory per script.
                             Parts assemble in filename order (00-, 10-, ...).
     3proxy/                 -> 3proxy-socks5.sh   (SOCKS5 manager)
@@ -28,7 +28,7 @@ src/
     sysctl/                 -> optimize-sysctl.sh (kernel optimizer)
       00-header.sh  10-detect.sh  20-snapshot-config.sh
       30-apply-rollback.sh    40-status-main.sh
-    menu/                   -> proxy-menu.sh      (the `proxy` command)
+    menu/                   -> proxy-menu.sh      (the `shield` command)
       00-header.sh  10-proxy-menu.sh  20-sysctl-monitor-menus.sh
       30-monitor-dashboard.sh         40-security-services-system.sh
       50-antiddos-menu.sh             60-autoban-main.sh

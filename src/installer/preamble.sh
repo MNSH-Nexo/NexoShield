@@ -29,7 +29,7 @@ set -euo pipefail
 
 VERSION="@@VERSION@@"
 INSTALL_DIR="/opt/proxy-manager"
-BIN_LINK="/usr/local/bin/proxy"
+BIN_LINK="/usr/local/bin/shield"
 LOG="/var/log/proxy-manager-install.log"
 
 R='\033[0;31m'; G='\033[0;32m'; Y='\033[1;33m'

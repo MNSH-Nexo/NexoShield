@@ -3,7 +3,7 @@ exec bash <(tr -d '\r' < "$0" | tail -n +3) "$@"
 #!/bin/bash
 # ── GENERATED FILE ─ built by tools/build.py from src/ ─ do not edit directly; edit the sources and rebuild ──
 # ============================================================
-#  Proxy Manager - Auto Installer  v3.10.0
+#  Proxy Manager - Auto Installer  v3.11.0
 #  One file, one command, everything ready
 #
 #  Install:
@@ -28,9 +28,9 @@ exec bash <(tr -d '\r' < "$0" | tail -n +3) "$@"
 # ============================================================
 set -euo pipefail
 
-VERSION="3.10.0"
+VERSION="3.11.0"
 INSTALL_DIR="/opt/proxy-manager"
-BIN_LINK="/usr/local/bin/proxy"
+BIN_LINK="/usr/local/bin/shield"
 LOG="/var/log/proxy-manager-install.log"
 
 R='\033[0;31m'; G='\033[0;32m'; Y='\033[1;33m'
@@ -1851,7 +1851,11 @@ show_info() {
     SERVER_IP=$(get_server_ip)
     sep
     echo -e "  ${CYAN}Connection info:${NC}"; sep
-    echo -e "  socks5://${_INFO_USER:-?}:${_INFO_PASS:-?}@$SERVER_IP:${_INFO_PORT:-?}"
+    if [ -n "$_INFO_USER" ]; then
+        echo -e "  socks5://${_INFO_USER}:${_INFO_PASS:-?}@$SERVER_IP:${_INFO_PORT:-?}"
+    else
+        echo -e "  socks5://$SERVER_IP:${_INFO_PORT:-?}  ${YELLOW}(no authentication)${NC}"
+    fi
     # (No IPv6 form: 3proxy binds 0.0.0.0 only - BUG-059.)
     sep
 }
@@ -1920,6 +1924,39 @@ show_menu() {
     sep
 }
 
+# delete_proxy_user: remove the SOCKS credentials entirely. The
+# users file is emptied (the config's `include` stays valid), the
+# config switches auth strong -> none and the per-user allow becomes
+# allow *, and install.info is cleared so every display agrees.
+# Re-running Install/Update generates fresh credentials (the install
+# path already treats an empty users file as "no credentials").
+# The caller (menu) confirms: this OPENS the proxy to anyone who can
+# reach the port. SSRF deny rules for private ranges stay in place.
+delete_proxy_user() {
+    local _cu
+    _cu=$(grep -oP '(?<=^users )\S+(?=:CL:)' "$PROXY_USERS" 2>/dev/null | head -1 || true)
+    if [ -z "$_cu" ]; then
+        echo -e "${YELLOW}No proxy user configured - authentication is already off.${NC}"
+        return 0
+    fi
+    : > "$PROXY_USERS" || { echo -e "${RED}Cannot write $PROXY_USERS${NC}"; return 1; }
+    chgrp nexoproxy "$PROXY_USERS" 2>/dev/null || true
+    chmod 640 "$PROXY_USERS" 2>/dev/null || true
+    sed -i 's/^auth strong/auth none/' "$PROXY_CONF" 2>/dev/null || true
+    sed -i -E 's/^allow [^ ]+/allow */' "$PROXY_CONF" 2>/dev/null || true
+    if [ -f /etc/3proxy/install.info ]; then
+        sed -i 's/^USER=.*/USER=/' /etc/3proxy/install.info 2>/dev/null || true
+        sed -i 's/^PASS=.*/PASS=/' /etc/3proxy/install.info 2>/dev/null || true
+    fi
+    if systemctl restart 3proxy 2>/dev/null; then
+        echo -e "${GREEN}Proxy user '${_cu}' and its password deleted - authentication is OFF.${NC}"
+        echo -e "${YELLOW}Anyone who can reach the port can now use this proxy. Run Install/Update to set new credentials.${NC}"
+        return 0
+    fi
+    echo -e "${RED}Credentials removed but the 3proxy restart FAILED - check: systemctl status 3proxy${NC}"
+    return 1
+}
+
 # ── CLI flags (called from proxy-menu.sh) ────────────────
 case "${1:-}" in
     --install|-i) install_proxy;  exit 0 ;;
@@ -1932,6 +1969,7 @@ case "${1:-}" in
                       echo -e "${GREEN}Stopped${NC}" || echo -e "${RED}Error${NC}"; exit 0 ;;
     --start)      systemctl start 3proxy 2>/dev/null && \
                       echo -e "${GREEN}Started${NC}" || echo -e "${RED}Error${NC}"; exit 0 ;;
+    --delete-user) delete_proxy_user; exit $? ;;
     --log)        tail -f "$PROXY_LOG_DIR"/access.log.* 2>/dev/null || \
                       journalctl -u 3proxy -f --no-pager; exit 0 ;;
     --tc-status)  MAIN_IF=$(ip route show default 2>/dev/null | awk '/default/{print $5}' | head -1)
@@ -2003,7 +2041,7 @@ TARGET_FILE="/etc/sysctl.d/99-vpn-optimized.conf"
 SNAPSHOT_DIR="/var/lib/vpn-sysctl-snapshots"
 LOG_FILE="/var/log/vpn-sysctl-optimizer.log"
 LOCK_FILE="/var/run/vpn-sysctl.lock"
-SCRIPT_VERSION="3.10.0"
+SCRIPT_VERSION="3.11.0"
 
 [ "$EUID" -ne 0 ] && echo -e "${RED}Root required${NC}" && exit 1
 
@@ -2594,7 +2632,7 @@ cat > "$INSTALL_DIR/.proxy-menu.sh.nxnew" << 'MENU_SCRIPT'
 # SC2094 - atomic state writes via tmp-file + rename, which the
 # checker flags as same-file pipelines. Both classes were audited
 # site-by-site during the fix waves (docs/FIX-PLAN.md).
-VERSION="3.10.0"
+VERSION="3.11.0"
 INSTALL_DIR="/opt/proxy-manager"
 _BSRC="${BASH_SOURCE[0]:-}"
 if [ -n "$_BSRC" ] && [ "$_BSRC" != "/dev/stdin" ] && [[ "$_BSRC" != /dev/fd/* ]]; then
@@ -2620,7 +2658,7 @@ LOG_FILE="/var/log/proxy-manager.log"
 R='\033[0;31m'; G='\033[0;32m'; Y='\033[1;33m'; C='\033[0;36m'
 W='\033[1;37m'; DIM='\033[2m'; BOLD='\033[1m'; NC='\033[0m'
 
-[ "$EUID" -ne 0 ] && echo -e "${R}Root required: sudo proxy${NC}" && exit 1
+[ "$EUID" -ne 0 ] && echo -e "${R}Root required: sudo shield${NC}" && exit 1
 touch "$LOG_FILE" 2>/dev/null && chmod 600 "$LOG_FILE" 2>/dev/null || true
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE" 2>/dev/null || true; }
 sep()  { echo -e "${C}════════════════════════════════════════════════${NC}"; }
@@ -2855,13 +2893,18 @@ menu_proxy() {
             # Read vars with prefix to avoid conflict with bash $USER builtin
             _INFO_USER=$(grep '^USER=' /etc/3proxy/install.info 2>/dev/null | cut -d= -f2- || echo "")
             _INFO_PASS=$(grep '^PASS=' /etc/3proxy/install.info 2>/dev/null | cut -d= -f2- || echo "")
-            echo -e "  User   : ${G}${_INFO_USER:-?}${NC}   Pass: ${G}${_INFO_PASS:-?}${NC}"
-            echo -e "  Link   : ${G}socks5://${_INFO_USER:-?}:${_INFO_PASS:-?}@$(get_ip):${PORT:-?}${NC}"
+            if [ -n "$_INFO_USER" ]; then
+                echo -e "  User   : ${G}$_INFO_USER${NC}   Pass: ${G}${_INFO_PASS:-?}${NC}"
+                echo -e "  Link   : ${G}socks5://$_INFO_USER:${_INFO_PASS:-?}@$(get_ip):${PORT:-?}${NC}"
+            else
+                echo -e "  User   : ${Y}(none - authentication OFF)${NC}"
+                echo -e "  Link   : ${G}socks5://$(get_ip):${PORT:-?}${NC}"
+            fi
         }
         echo ""
         ui_options "1|Install/Update" "2|Remove" "3|Start" "4|Stop" \
             "5|Restart" "6|Live log" "7|Traffic stats" "8|Change password" \
-            "9|Suspicious IPs" "0|Back"
+            "9|Delete user & password" "10|Suspicious IPs" "0|Back"
         ui_input CH "  Enter number: "
         case "$CH" in
             1) # Ensure the Cloudflare whitelist file exists before install so CF
@@ -2900,7 +2943,18 @@ menu_proxy() {
             6) bash "$PROXY_SCRIPT" --log ;;
             7) bash "$PROXY_SCRIPT" --stats ;;
             8) bash "$PROXY_SCRIPT" --change-pass; press_enter ;;
-            9) _proxy_suspicious ;;
+            9) echo ""
+               echo -e "  ${R}${BOLD}⚠  Delete the proxy user & password${NC}"
+               echo -e "  ${DIM}The proxy will accept connections WITHOUT authentication -"
+               echo -e "  anyone who can reach the port will be able to use it.${NC}"
+               echo ""
+               if ui_confirm "Delete credentials and open the proxy?"; then
+                   bash "$PROXY_SCRIPT" --delete-user
+               else
+                   echo -e "  ${DIM}Cancelled.${NC}"
+               fi
+               press_enter ;;
+            10) _proxy_suspicious ;;
             0) return ;;
         esac
     done
@@ -3707,7 +3761,7 @@ cat > "$INSTALL_DIR/.antiddos.sh.nxnew" << 'ANTIDDOS_SCRIPT'
 # checker flags as same-file pipelines. Both classes were audited
 # site-by-site during the fix waves (docs/FIX-PLAN.md).
 # ============================================================
-#  Anti-DDoS Protection Manager v3.10.0
+#  Anti-DDoS Protection Manager v3.11.0
 #
 #  Layers:
 #    1. Kernel (sysctl hardening + tight conntrack timeouts)
@@ -3731,7 +3785,7 @@ set -euo pipefail
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 CYAN='\033[0;36m'; WHITE='\033[1;37m'; DIM='\033[2m'; BOLD='\033[1m'; NC='\033[0m'
 
-SCRIPT_VERSION="3.10.0"
+SCRIPT_VERSION="3.11.0"
 LOG_FILE="/var/log/antiddos.log"
 STATE_FILE="/etc/antiddos/state.conf"
 BANNED_LIST="/etc/antiddos/banned.list"
@@ -9142,11 +9196,19 @@ chmod +x "$INSTALL_DIR/3proxy-socks5.sh" \
          "$INSTALL_DIR/antiddos.sh"
 ok "Files created"
 
-# ── Link proxy command ────────────────────────────────────
-info "Installing proxy command..."
+# ── Link shield command ───────────────────────────────────
+info "Installing shield command..."
 ln -sf "$INSTALL_DIR/proxy-menu.sh" "$BIN_LINK"
 chmod +x "$BIN_LINK"
-ok "Command ${W}proxy${NC} installed"
+ok "Command ${W}shield${NC} installed"
+# Pre-v3.11 installs linked the menu as /usr/local/bin/proxy. Drop
+# that link on upgrade - but only if it is OURS (a symlink to this
+# menu); never touch a foreign binary of the same name (BUG-058).
+if [ "/usr/local/bin/proxy" != "$BIN_LINK" ] && [ -L /usr/local/bin/proxy ] && \
+   [ "$(readlink /usr/local/bin/proxy 2>/dev/null)" = "$INSTALL_DIR/proxy-menu.sh" ]; then
+    rm -f /usr/local/bin/proxy
+    info "Removed the old 'proxy' command link (the menu is 'shield' now)"
+fi
 
 # ── Final result ──────────────────────────────────────────
 echo ""
@@ -9154,7 +9216,7 @@ sep
 echo -e "  ${G}${BOLD}✓ Installation complete! v${VERSION}${NC}"
 sep
 echo -e "  Install path : ${DIM}$INSTALL_DIR${NC}"
-echo -e "  Command      : ${W}${BOLD}proxy${NC}"
+echo -e "  Command      : ${W}${BOLD}shield${NC}"
 echo -e "  Install log  : ${DIM}$LOG${NC}"
 echo ""
 echo -e "  ${C}Scripts installed:${NC}"
@@ -9164,5 +9226,5 @@ echo -e "  ${DIM}->${NC}  antiddos.sh         (5-layer DDoS protection)"
 echo -e "  ${DIM}->${NC}  proxy-menu.sh       (main control panel)"
 echo ""
 echo -e "  ${C}Run now:${NC}"
-echo -e "  ${W}${BOLD}  proxy${NC}"
+echo -e "  ${W}${BOLD}  shield${NC}"
 sep
