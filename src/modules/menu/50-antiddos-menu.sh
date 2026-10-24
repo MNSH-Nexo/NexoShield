@@ -41,7 +41,8 @@ menu_antiddos() {
         echo ""
         ui_options "1|Install / Re-install all layers" "2|Status & active bans" \
             "3|Unban an IP" "4|Auto-ban control (start/stop/log)" \
-            "5|Remove all protection" "0|Back"
+            "5|Whitelist — exempt an IP from ALL layers" \
+            "6|Remove all protection" "0|Back"
         ui_input CH "  Enter number: "
         case "$CH" in
             1) _antiddos_install ;;
@@ -59,7 +60,22 @@ menu_antiddos() {
                fi
                press_enter ;;
             4) _autoban_control ;;
-            5) echo ""
+            5) # The whitelist manager itself lives in antiddos.sh
+               # (one implementation): entries are exempt from EVERY
+               # layer - iptables, SYNPROXY, tc, fail2ban, auto-ban -
+               # and changes apply live. It is part of the Anti-DDoS
+               # subsystem, so it needs the layers installed first.
+               if [ -f /etc/antiddos/state.conf ]; then
+                   bash "$ANTIDDOS_SCRIPT" --whitelist < /dev/tty
+               else
+                   echo ""
+                   echo -e "  ${C}Whitelist Manager${NC}"
+                   echo -e "  ${DIM}The whitelist is part of Anti-DDoS protection - install it first"
+                   echo -e "  (option 1). IPs you add there are exempt from every layer:"
+                   echo -e "  iptables, SYNPROXY, tc shaping, fail2ban and the auto-ban daemon.${NC}"
+                   press_enter
+               fi ;;
+            6) echo ""
                echo -e "  ${R}${BOLD}⚠  Remove ALL Anti-DDoS Protection${NC}"
                echo -e "  ${DIM}This will remove: iptables rules, sysctl hardening, fail2ban jails,"
                echo -e "  auto-ban service, tc bandwidth shaping, and boot persistence.${NC}"
@@ -113,6 +129,7 @@ _antiddos_install() {
     echo -e "  • Everything is automatic — no action needed"
     echo -e "  • Use ${C}Status & active bans${NC} to monitor blocked IPs"
     echo -e "  • Use ${C}Auto-ban control${NC} to see live ban log"
+    echo -e "  • Use ${C}Whitelist${NC} to exempt your own / office IPs from every layer"
     sep
     press_enter
 }

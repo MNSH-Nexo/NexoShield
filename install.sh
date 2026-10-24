@@ -3,7 +3,7 @@ exec bash <(tr -d '\r' < "$0" | tail -n +3) "$@"
 #!/bin/bash
 # ── GENERATED FILE ─ built by tools/build.py from src/ ─ do not edit directly; edit the sources and rebuild ──
 # ============================================================
-#  Proxy Manager - Auto Installer  v3.14.0
+#  Proxy Manager - Auto Installer  v3.15.0
 #  One file, one command, everything ready
 #
 #  Install:
@@ -28,7 +28,7 @@ exec bash <(tr -d '\r' < "$0" | tail -n +3) "$@"
 # ============================================================
 set -euo pipefail
 
-VERSION="3.14.0"
+VERSION="3.15.0"
 INSTALL_DIR="/opt/proxy-manager"
 BIN_LINK="/usr/local/bin/shield"
 LOG="/var/log/proxy-manager-install.log"
@@ -2064,7 +2064,7 @@ TARGET_FILE="/etc/sysctl.d/99-vpn-optimized.conf"
 SNAPSHOT_DIR="/var/lib/vpn-sysctl-snapshots"
 LOG_FILE="/var/log/vpn-sysctl-optimizer.log"
 LOCK_FILE="/var/run/vpn-sysctl.lock"
-SCRIPT_VERSION="3.14.0"
+SCRIPT_VERSION="3.15.0"
 
 [ "$EUID" -ne 0 ] && echo -e "${RED}Root required${NC}" && exit 1
 
@@ -2655,7 +2655,7 @@ cat > "$INSTALL_DIR/.proxy-menu.sh.nxnew" << 'MENU_SCRIPT'
 # SC2094 - atomic state writes via tmp-file + rename, which the
 # checker flags as same-file pipelines. Both classes were audited
 # site-by-site during the fix waves (docs/FIX-PLAN.md).
-VERSION="3.14.0"
+VERSION="3.15.0"
 INSTALL_DIR="/opt/proxy-manager"
 _BSRC="${BASH_SOURCE[0]:-}"
 if [ -n "$_BSRC" ] && [ "$_BSRC" != "/dev/stdin" ] && [[ "$_BSRC" != /dev/fd/* ]]; then
@@ -3665,7 +3665,8 @@ menu_antiddos() {
         echo ""
         ui_options "1|Install / Re-install all layers" "2|Status & active bans" \
             "3|Unban an IP" "4|Auto-ban control (start/stop/log)" \
-            "5|Remove all protection" "0|Back"
+            "5|Whitelist — exempt an IP from ALL layers" \
+            "6|Remove all protection" "0|Back"
         ui_input CH "  Enter number: "
         case "$CH" in
             1) _antiddos_install ;;
@@ -3683,7 +3684,22 @@ menu_antiddos() {
                fi
                press_enter ;;
             4) _autoban_control ;;
-            5) echo ""
+            5) # The whitelist manager itself lives in antiddos.sh
+               # (one implementation): entries are exempt from EVERY
+               # layer - iptables, SYNPROXY, tc, fail2ban, auto-ban -
+               # and changes apply live. It is part of the Anti-DDoS
+               # subsystem, so it needs the layers installed first.
+               if [ -f /etc/antiddos/state.conf ]; then
+                   bash "$ANTIDDOS_SCRIPT" --whitelist < /dev/tty
+               else
+                   echo ""
+                   echo -e "  ${C}Whitelist Manager${NC}"
+                   echo -e "  ${DIM}The whitelist is part of Anti-DDoS protection - install it first"
+                   echo -e "  (option 1). IPs you add there are exempt from every layer:"
+                   echo -e "  iptables, SYNPROXY, tc shaping, fail2ban and the auto-ban daemon.${NC}"
+                   press_enter
+               fi ;;
+            6) echo ""
                echo -e "  ${R}${BOLD}⚠  Remove ALL Anti-DDoS Protection${NC}"
                echo -e "  ${DIM}This will remove: iptables rules, sysctl hardening, fail2ban jails,"
                echo -e "  auto-ban service, tc bandwidth shaping, and boot persistence.${NC}"
@@ -3737,6 +3753,7 @@ _antiddos_install() {
     echo -e "  • Everything is automatic — no action needed"
     echo -e "  • Use ${C}Status & active bans${NC} to monitor blocked IPs"
     echo -e "  • Use ${C}Auto-ban control${NC} to see live ban log"
+    echo -e "  • Use ${C}Whitelist${NC} to exempt your own / office IPs from every layer"
     sep
     press_enter
 }
@@ -3847,7 +3864,7 @@ cat > "$INSTALL_DIR/.antiddos.sh.nxnew" << 'ANTIDDOS_SCRIPT'
 # checker flags as same-file pipelines. Both classes were audited
 # site-by-site during the fix waves (docs/FIX-PLAN.md).
 # ============================================================
-#  Anti-DDoS Protection Manager v3.14.0
+#  Anti-DDoS Protection Manager v3.15.0
 #
 #  Layers:
 #    1. Kernel (sysctl hardening + tight conntrack timeouts)
@@ -3871,7 +3888,7 @@ set -euo pipefail
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 CYAN='\033[0;36m'; WHITE='\033[1;37m'; DIM='\033[2m'; BOLD='\033[1m'; NC='\033[0m'
 
-SCRIPT_VERSION="3.14.0"
+SCRIPT_VERSION="3.15.0"
 LOG_FILE="/var/log/antiddos.log"
 STATE_FILE="/etc/antiddos/state.conf"
 BANNED_LIST="/etc/antiddos/banned.list"

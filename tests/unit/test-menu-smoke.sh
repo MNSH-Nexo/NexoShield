@@ -93,7 +93,7 @@ printf '192.0.2.55|55|1761300000|1761300000|130|0|0|0|0|0|0\n' > "$W/state/reput
 # Monitoring: 2 Connections, 3 CPU&RAM, 4 Disk, 6 autoban log,
 # 7 top IPs, 1 live dashboard (q + sacrificial blank), 5 Logs > 4
 # journal, 0 back. Then Proxy > 10 Suspicious > skip, Security >
-# 1 blocked + 6 autoban status, Anti-DDoS in/out, Sysctl > 3
+# 1 blocked + 6 autoban status, Anti-DDoS > 5 whitelist note, Sysctl > 3
 # values, Services in/out, System > 1 info, Exit.
 cat > "$W/input.txt" <<'EOF'
 4
@@ -126,6 +126,8 @@ q
 
 0
 3
+5
+
 0
 2
 3
@@ -150,7 +152,7 @@ timeout 60 bash "$W/mod/proxy-menu.sh" < "$W/input.txt" > "$OUT" 2>&1
 RC=$?
 [ "$RC" -eq 0 ] && ok || bad "menu walk exit code $RC"
 for marker in "Monitoring" "LIVE THREAT MONITOR" "Could not reach the update server" "SOCKS5 Proxy (3proxy)" \
-              "Threat IPs" "Security" "Anti-DDoS Protection" \
+              "Threat IPs" "Security" "Anti-DDoS Protection" "Whitelist — exempt an IP from ALL layers" "exempt from every layer" \
               "Network Optimization" "Services" "System" "Hostname:"; do
     grep -q -- "$marker" "$OUT" && ok || bad "screen marker missing: $marker"
 done
