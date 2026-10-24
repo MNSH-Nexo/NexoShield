@@ -3,7 +3,7 @@ exec bash <(tr -d '\r' < "$0" | tail -n +3) "$@"
 #!/bin/bash
 # ── GENERATED FILE ─ built by tools/build.py from src/ ─ do not edit directly; edit the sources and rebuild ──
 # ============================================================
-#  Proxy Manager - Auto Installer  v3.16.0
+#  Proxy Manager - Auto Installer  v3.16.1
 #  One file, one command, everything ready
 #
 #  Install:
@@ -28,7 +28,7 @@ exec bash <(tr -d '\r' < "$0" | tail -n +3) "$@"
 # ============================================================
 set -euo pipefail
 
-VERSION="3.16.0"
+VERSION="3.16.1"
 INSTALL_DIR="/opt/proxy-manager"
 BIN_LINK="/usr/local/bin/shield"
 LOG="/var/log/proxy-manager-install.log"
@@ -1047,6 +1047,24 @@ list_self_ips_all() {
       fi
     } | sort -u | grep -v '^$'
 }
+# nx_install_binary SRC DEST [MODE]
+# Atomically replace DEST with SRC: copy to a staging file in the
+# SAME directory, then rename over DEST. A plain `cp` onto a
+# RUNNING executable fails with ETXTBSY ("Text file busy") - this
+# broke 3proxy Install/Update on every live server (v3.16.0 field
+# report: the service runs from /usr/local/bin/3proxy while the
+# update tried to overwrite that very file). rename(2) swaps the
+# path instantly; the running process keeps its old inode and is
+# undisturbed until its service restarts onto the new binary.
+nx_install_binary() {
+    local src="$1" dst="$2" mode="${3:-755}" tmp
+    tmp="${dst}.new.$$"
+    if cp "$src" "$tmp" && chmod "$mode" "$tmp" && mv -f "$tmp" "$dst"; then
+        return 0
+    fi
+    rm -f "$tmp"
+    return 1
+}
 
 get_server_ip() {
     curl -s -4 --max-time 5 https://api.ipify.org 2>/dev/null || \
@@ -1488,7 +1506,9 @@ install_proxy() {
                 fi
             fi
             if [ "$_build_ok" -eq 1 ]; then
-                cp bin/3proxy "$PROXY_BIN" && chmod +x "$PROXY_BIN" && \
+                # Atomic replace: cp onto the RUNNING binary fails
+                # with ETXTBSY on every live update (field bug).
+                nx_install_binary bin/3proxy "$PROXY_BIN" 755 && \
                     echo -e "${GREEN}3proxy compiled from source.${NC}" || {
                     echo -e "${RED}Copy failed!${NC}"; cd /; rm -rf "$TMPDIR_BUILD"; return 1
                 }
@@ -2064,7 +2084,7 @@ TARGET_FILE="/etc/sysctl.d/99-vpn-optimized.conf"
 SNAPSHOT_DIR="/var/lib/vpn-sysctl-snapshots"
 LOG_FILE="/var/log/vpn-sysctl-optimizer.log"
 LOCK_FILE="/var/run/vpn-sysctl.lock"
-SCRIPT_VERSION="3.16.0"
+SCRIPT_VERSION="3.16.1"
 
 [ "$EUID" -ne 0 ] && echo -e "${RED}Root required${NC}" && exit 1
 
@@ -2655,7 +2675,7 @@ cat > "$INSTALL_DIR/.proxy-menu.sh.nxnew" << 'MENU_SCRIPT'
 # SC2094 - atomic state writes via tmp-file + rename, which the
 # checker flags as same-file pipelines. Both classes were audited
 # site-by-site during the fix waves (docs/FIX-PLAN.md).
-VERSION="3.16.0"
+VERSION="3.16.1"
 INSTALL_DIR="/opt/proxy-manager"
 _BSRC="${BASH_SOURCE[0]:-}"
 if [ -n "$_BSRC" ] && [ "$_BSRC" != "/dev/stdin" ] && [[ "$_BSRC" != /dev/fd/* ]]; then
@@ -3865,7 +3885,7 @@ cat > "$INSTALL_DIR/.antiddos.sh.nxnew" << 'ANTIDDOS_SCRIPT'
 # checker flags as same-file pipelines. Both classes were audited
 # site-by-site during the fix waves (docs/FIX-PLAN.md).
 # ============================================================
-#  Anti-DDoS Protection Manager v3.16.0
+#  Anti-DDoS Protection Manager v3.16.1
 #
 #  Layers:
 #    1. Kernel (sysctl hardening + tight conntrack timeouts)
@@ -3889,7 +3909,7 @@ set -euo pipefail
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 CYAN='\033[0;36m'; WHITE='\033[1;37m'; DIM='\033[2m'; BOLD='\033[1m'; NC='\033[0m'
 
-SCRIPT_VERSION="3.16.0"
+SCRIPT_VERSION="3.16.1"
 LOG_FILE="/var/log/antiddos.log"
 STATE_FILE="/etc/antiddos/state.conf"
 BANNED_LIST="/etc/antiddos/banned.list"
@@ -4207,6 +4227,24 @@ xdp_syn_rate=3000       # sustained SYN arrivals/sec that justify relief
 xdp_calm_seconds=600    # calm required before the shield detaches
 EOF
     chmod 644 "$f" 2>/dev/null || true
+}
+# nx_install_binary SRC DEST [MODE]
+# Atomically replace DEST with SRC: copy to a staging file in the
+# SAME directory, then rename over DEST. A plain `cp` onto a
+# RUNNING executable fails with ETXTBSY ("Text file busy") - this
+# broke 3proxy Install/Update on every live server (v3.16.0 field
+# report: the service runs from /usr/local/bin/3proxy while the
+# update tried to overwrite that very file). rename(2) swaps the
+# path instantly; the running process keeps its old inode and is
+# undisturbed until its service restarts onto the new binary.
+nx_install_binary() {
+    local src="$1" dst="$2" mode="${3:-755}" tmp
+    tmp="${dst}.new.$$"
+    if cp "$src" "$tmp" && chmod "$mode" "$tmp" && mv -f "$tmp" "$dst"; then
+        return 0
+    fi
+    rm -f "$tmp"
+    return 1
 }
 
 # Detect environment
@@ -7869,8 +7907,16 @@ int main(int argc, char **argv)
     return 0;
 }
 NXCOUNTD_EOF
-    if ! cc -O2 -o /usr/local/bin/nxcountd "$build_dir/nxcountd.c" 2>/dev/null; then
+    if ! cc -O2 -o "$build_dir/nxcountd" "$build_dir/nxcountd.c" 2>/dev/null; then
         warn "nxcountd: build failed - event counting unavailable (daemon polls instead)"
+        rm -rf "$build_dir"
+        return 0
+    fi
+    # Atomic replace - compiling straight onto /usr/local/bin
+    # failed with ETXTBSY whenever the counter service was running,
+    # so updates silently kept the old binary forever.
+    if ! nx_install_binary "$build_dir/nxcountd" /usr/local/bin/nxcountd 755; then
+        warn "nxcountd: install failed - keeping the previous binary (daemon polls if none)"
         rm -rf "$build_dir"
         return 0
     fi
@@ -8325,12 +8371,16 @@ int main(int argc, char **argv)
 }
 NXLOADER_EOF
     mkdir -p /usr/local/lib
-    if clang -O2 -target bpf -c "$build_dir/nx_xdp.c" -o /usr/local/lib/nx_xdp.o 2>/dev/null \
-       && cc -O2 -o /usr/local/bin/nx-xdp "$build_dir/nx-xdp-loader.c" -lbpf 2>/dev/null; then
+    if clang -O2 -target bpf -c "$build_dir/nx_xdp.c" -o "$build_dir/nx_xdp.o" 2>/dev/null \
+       && cc -O2 -o "$build_dir/nx-xdp" "$build_dir/nx-xdp-loader.c" -lbpf 2>/dev/null \
+       && nx_install_binary "$build_dir/nx_xdp.o" /usr/local/lib/nx_xdp.o 644 \
+       && nx_install_binary "$build_dir/nx-xdp" /usr/local/bin/nx-xdp 755; then
         success "XDP emergency shield: built (dormant; attaches only under flood pressure)"
     else
-        warn "XDP shield: build failed - feature stays dormant"
-        rm -f /usr/local/lib/nx_xdp.o /usr/local/bin/nx-xdp
+        # A failed rebuild leaves any previous working install
+        # untouched (the old code deleted it - an update could
+        # destroy a working shield).
+        warn "XDP shield: build failed - feature stays dormant (previous install kept)"
     fi
     rm -rf "$build_dir"
 }

@@ -86,7 +86,9 @@ install_proxy() {
                 fi
             fi
             if [ "$_build_ok" -eq 1 ]; then
-                cp bin/3proxy "$PROXY_BIN" && chmod +x "$PROXY_BIN" && \
+                # Atomic replace: cp onto the RUNNING binary fails
+                # with ETXTBSY on every live update (field bug).
+                nx_install_binary bin/3proxy "$PROXY_BIN" 755 && \
                     echo -e "${GREEN}3proxy compiled from source.${NC}" || {
                     echo -e "${RED}Copy failed!${NC}"; cd /; rm -rf "$TMPDIR_BUILD"; return 1
                 }

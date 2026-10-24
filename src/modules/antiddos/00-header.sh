@@ -78,5 +78,6 @@ sep()     { echo -e "${CYAN}═════════════════�
 # @include lib/server-ips.sh
 # @include lib/self-ips.sh
 # @include lib/config.sh
+# @include lib/install-binary.sh
 
 # Detect environment

@@ -87,8 +87,16 @@ setup_countd() {
     cat > "$build_dir/nxcountd.c" << 'NXCOUNTD_EOF'
 @@NXCOUNTD_C@@
 NXCOUNTD_EOF
-    if ! cc -O2 -o /usr/local/bin/nxcountd "$build_dir/nxcountd.c" 2>/dev/null; then
+    if ! cc -O2 -o "$build_dir/nxcountd" "$build_dir/nxcountd.c" 2>/dev/null; then
         warn "nxcountd: build failed - event counting unavailable (daemon polls instead)"
+        rm -rf "$build_dir"
+        return 0
+    fi
+    # Atomic replace - compiling straight onto /usr/local/bin
+    # failed with ETXTBSY whenever the counter service was running,
+    # so updates silently kept the old binary forever.
+    if ! nx_install_binary "$build_dir/nxcountd" /usr/local/bin/nxcountd 755; then
+        warn "nxcountd: install failed - keeping the previous binary (daemon polls if none)"
         rm -rf "$build_dir"
         return 0
     fi
@@ -145,12 +153,16 @@ NXXDP_EOF
 @@NX_XDP_LOADER_C@@
 NXLOADER_EOF
     mkdir -p /usr/local/lib
-    if clang -O2 -target bpf -c "$build_dir/nx_xdp.c" -o /usr/local/lib/nx_xdp.o 2>/dev/null \
-       && cc -O2 -o /usr/local/bin/nx-xdp "$build_dir/nx-xdp-loader.c" -lbpf 2>/dev/null; then
+    if clang -O2 -target bpf -c "$build_dir/nx_xdp.c" -o "$build_dir/nx_xdp.o" 2>/dev/null \
+       && cc -O2 -o "$build_dir/nx-xdp" "$build_dir/nx-xdp-loader.c" -lbpf 2>/dev/null \
+       && nx_install_binary "$build_dir/nx_xdp.o" /usr/local/lib/nx_xdp.o 644 \
+       && nx_install_binary "$build_dir/nx-xdp" /usr/local/bin/nx-xdp 755; then
         success "XDP emergency shield: built (dormant; attaches only under flood pressure)"
     else
-        warn "XDP shield: build failed - feature stays dormant"
-        rm -f /usr/local/lib/nx_xdp.o /usr/local/bin/nx-xdp
+        # A failed rebuild leaves any previous working install
+        # untouched (the old code deleted it - an update could
+        # destroy a working shield).
+        warn "XDP shield: build failed - feature stays dormant (previous install kept)"
     fi
     rm -rf "$build_dir"
 }
