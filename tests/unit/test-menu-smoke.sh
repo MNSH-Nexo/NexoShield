@@ -5,6 +5,17 @@
 # asserts the screens render and the process exits cleanly.
 # This is the end-to-end guard for "the menu sections work".
 set -u
+
+# This suite exercises root-only paths (the menu refuses non-root;
+# the delete fixture lives in /etc). CI runners are unprivileged
+# but carry passwordless sudo: re-exec once as root, else skip.
+if [ "$(id -u)" -ne 0 ]; then
+    if [ -z "${NX_SUDOED:-}" ] && sudo -n true 2>/dev/null; then
+        NX_SUDOED=1 exec sudo -n bash "$0" "$@"
+    fi
+    echo "  SKIP: requires root (no passwordless sudo available)"
+    exit 0
+fi
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 pass=0; fail=0
 ok()  { pass=$((pass+1)); }
