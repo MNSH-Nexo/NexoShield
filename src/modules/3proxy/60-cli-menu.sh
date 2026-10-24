@@ -115,6 +115,60 @@ delete_proxy_user() {
     return 1
 }
 
+# set_proxy_password: the mirror of delete_proxy_user.
+# - A user exists: rotate its password (BUG-026 semantics).
+# - No user (authentication OFF, e.g. after Delete user): CREATE
+#   fresh credentials and switch authentication back ON in the
+#   live config. The old --change-pass read the username from the
+#   config's allow line, which is "allow *" in the off state - it
+#   wrote a literal user named "*" while auth stayed none, so
+#   credentials could never be set again after a delete.
+set_proxy_password() {
+    local NEW_PASS CU
+    if [ ! -f "$PROXY_CONF" ]; then
+        echo -e "${RED}Not installed${NC}"
+        return 1
+    fi
+    NEW_PASS=$(tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c 16)
+    if [ -z "$NEW_PASS" ]; then
+        echo -e "${RED}Failed to generate a secure password (/dev/urandom unavailable). Aborting.${NC}" >&2
+        return 1
+    fi
+    CU=$(grep -oP '(?<=^users )\S+(?=:CL:)' "$PROXY_USERS" 2>/dev/null | head -1 || true)
+    if [ -n "$CU" ]; then
+        echo "users ${CU}:CL:${NEW_PASS}" > "$PROXY_USERS" || return 1
+        if [ -f /etc/3proxy/install.info ]; then
+            sed -i "s/^PASS=.*/PASS=${NEW_PASS}/" /etc/3proxy/install.info 2>/dev/null || true
+        fi
+        if systemctl restart 3proxy 2>/dev/null; then
+            echo -e "${GREEN}Password changed for user '${CU}': ${NEW_PASS}${NC}"
+            return 0
+        fi
+        echo -e "${RED}Password written but the 3proxy restart FAILED - check: systemctl status 3proxy${NC}"
+        return 1
+    fi
+    # No credentials configured: create a fresh user (same
+    # generator as the installer) and re-enable authentication.
+    CU=$(tr -dc 'a-z' </dev/urandom 2>/dev/null | head -c 8)
+    [ -n "$CU" ] || CU="proxyuser"
+    echo "users ${CU}:CL:${NEW_PASS}" > "$PROXY_USERS" || return 1
+    chgrp nexoproxy "$PROXY_USERS" 2>/dev/null || true
+    chmod 640 "$PROXY_USERS" 2>/dev/null || true
+    sed -i 's/^auth none/auth strong/' "$PROXY_CONF" 2>/dev/null || true
+    sed -i -E "s/^allow [^ ]+/allow ${CU}/" "$PROXY_CONF" 2>/dev/null || true
+    if [ -f /etc/3proxy/install.info ]; then
+        sed -i "s/^USER=.*/USER=${CU}/" /etc/3proxy/install.info 2>/dev/null || true
+        sed -i "s/^PASS=.*/PASS=${NEW_PASS}/" /etc/3proxy/install.info 2>/dev/null || true
+    fi
+    if systemctl restart 3proxy 2>/dev/null; then
+        echo -e "${GREEN}Credentials created - authentication is ON.${NC}"
+        echo -e "  User: ${GREEN}${CU}${NC}   Password: ${GREEN}${NEW_PASS}${NC}"
+        return 0
+    fi
+    echo -e "${RED}Credentials written but the 3proxy restart FAILED - check: systemctl status 3proxy${NC}"
+    return 1
+}
+
 # ── CLI flags (called from proxy-menu.sh) ────────────────
 case "${1:-}" in
     --install|-i) install_proxy;  exit 0 ;;
@@ -134,24 +188,7 @@ case "${1:-}" in
                   echo -e "${CYAN}tc classes on ${MAIN_IF:-eth0}:${NC}"
                   tc class show dev "${MAIN_IF:-eth0}" 2>/dev/null || echo "tc not configured"
                   printf '%s\n' "  Press Enter to continue..." >/dev/tty; read -r _PE </dev/tty 2>/dev/null || true; exit 0 ;;
-    --change-pass)
-                  NEW_PASS=$(tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c 16)
-                  if [ -z "$NEW_PASS" ]; then
-                      echo -e "${RED}Failed to generate a secure password (/dev/urandom unavailable). Aborting.${NC}" >&2
-                      exit 1
-                  fi
-                  CU=$(grep -oP '(?<=allow )\S+' "$PROXY_CONF" 2>/dev/null | head -1 || echo "")
-                  if [ -n "$CU" ]; then
-                      echo "users ${CU}:CL:${NEW_PASS}" > "$PROXY_USERS"
-                      [ -f /etc/3proxy/install.info ] && \
-                          sed -i "s/^PASS=.*/PASS=${NEW_PASS}/" /etc/3proxy/install.info 2>/dev/null || true
-                      systemctl restart 3proxy 2>/dev/null && \
-                          echo -e "${GREEN}Password changed: ${NEW_PASS}${NC}" || \
-                          echo -e "${RED}Restart failed${NC}"
-                  else
-                      echo -e "${RED}Not installed${NC}"
-                  fi
-                  exit 0 ;;
+    --change-pass) set_proxy_password; exit $? ;;
 esac
 
 # Standalone mode (run directly without args): show own menu

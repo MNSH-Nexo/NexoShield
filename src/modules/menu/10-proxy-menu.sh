@@ -8,6 +8,7 @@ menu_proxy() {
         PORT=$(get_proxy_port)
         echo -e "  Status : $ST   $(svc_enabled "3proxy")"
         [ -n "$PORT" ] && echo -e "  Port   : ${C}$PORT${NC}"
+        _L8="Change password"
         [ -f /etc/3proxy/install.info ] && {
             # shellcheck disable=SC1091
             # Read vars with prefix to avoid conflict with bash $USER builtin
@@ -17,13 +18,14 @@ menu_proxy() {
                 echo -e "  User   : ${G}$_INFO_USER${NC}   Pass: ${G}${_INFO_PASS:-?}${NC}"
                 echo -e "  Link   : ${G}socks5://$_INFO_USER:${_INFO_PASS:-?}@$(get_ip):${PORT:-?}${NC}"
             else
+                _L8="Set username & password"
                 echo -e "  User   : ${Y}(none - authentication OFF)${NC}"
                 echo -e "  Link   : ${G}socks5://$(get_ip):${PORT:-?}${NC}"
             fi
         }
         echo ""
         ui_options "1|Install/Update" "2|Remove" "3|Start" "4|Stop" \
-            "5|Restart" "6|Live log" "7|Traffic stats" "8|Change password" \
+            "5|Restart" "6|Live log" "7|Traffic stats" "8|$_L8" \
             "9|Delete user & password" "10|Suspicious IPs" "0|Back"
         ui_input CH "  Enter number: "
         case "$CH" in

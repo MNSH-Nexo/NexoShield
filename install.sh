@@ -3,7 +3,7 @@ exec bash <(tr -d '\r' < "$0" | tail -n +3) "$@"
 #!/bin/bash
 # ── GENERATED FILE ─ built by tools/build.py from src/ ─ do not edit directly; edit the sources and rebuild ──
 # ============================================================
-#  Proxy Manager - Auto Installer  v3.16.1
+#  Proxy Manager - Auto Installer  v3.16.2
 #  One file, one command, everything ready
 #
 #  Install:
@@ -28,7 +28,7 @@ exec bash <(tr -d '\r' < "$0" | tail -n +3) "$@"
 # ============================================================
 set -euo pipefail
 
-VERSION="3.16.1"
+VERSION="3.16.2"
 INSTALL_DIR="/opt/proxy-manager"
 BIN_LINK="/usr/local/bin/shield"
 LOG="/var/log/proxy-manager-install.log"
@@ -2000,6 +2000,60 @@ delete_proxy_user() {
     return 1
 }
 
+# set_proxy_password: the mirror of delete_proxy_user.
+# - A user exists: rotate its password (BUG-026 semantics).
+# - No user (authentication OFF, e.g. after Delete user): CREATE
+#   fresh credentials and switch authentication back ON in the
+#   live config. The old --change-pass read the username from the
+#   config's allow line, which is "allow *" in the off state - it
+#   wrote a literal user named "*" while auth stayed none, so
+#   credentials could never be set again after a delete.
+set_proxy_password() {
+    local NEW_PASS CU
+    if [ ! -f "$PROXY_CONF" ]; then
+        echo -e "${RED}Not installed${NC}"
+        return 1
+    fi
+    NEW_PASS=$(tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c 16)
+    if [ -z "$NEW_PASS" ]; then
+        echo -e "${RED}Failed to generate a secure password (/dev/urandom unavailable). Aborting.${NC}" >&2
+        return 1
+    fi
+    CU=$(grep -oP '(?<=^users )\S+(?=:CL:)' "$PROXY_USERS" 2>/dev/null | head -1 || true)
+    if [ -n "$CU" ]; then
+        echo "users ${CU}:CL:${NEW_PASS}" > "$PROXY_USERS" || return 1
+        if [ -f /etc/3proxy/install.info ]; then
+            sed -i "s/^PASS=.*/PASS=${NEW_PASS}/" /etc/3proxy/install.info 2>/dev/null || true
+        fi
+        if systemctl restart 3proxy 2>/dev/null; then
+            echo -e "${GREEN}Password changed for user '${CU}': ${NEW_PASS}${NC}"
+            return 0
+        fi
+        echo -e "${RED}Password written but the 3proxy restart FAILED - check: systemctl status 3proxy${NC}"
+        return 1
+    fi
+    # No credentials configured: create a fresh user (same
+    # generator as the installer) and re-enable authentication.
+    CU=$(tr -dc 'a-z' </dev/urandom 2>/dev/null | head -c 8)
+    [ -n "$CU" ] || CU="proxyuser"
+    echo "users ${CU}:CL:${NEW_PASS}" > "$PROXY_USERS" || return 1
+    chgrp nexoproxy "$PROXY_USERS" 2>/dev/null || true
+    chmod 640 "$PROXY_USERS" 2>/dev/null || true
+    sed -i 's/^auth none/auth strong/' "$PROXY_CONF" 2>/dev/null || true
+    sed -i -E "s/^allow [^ ]+/allow ${CU}/" "$PROXY_CONF" 2>/dev/null || true
+    if [ -f /etc/3proxy/install.info ]; then
+        sed -i "s/^USER=.*/USER=${CU}/" /etc/3proxy/install.info 2>/dev/null || true
+        sed -i "s/^PASS=.*/PASS=${NEW_PASS}/" /etc/3proxy/install.info 2>/dev/null || true
+    fi
+    if systemctl restart 3proxy 2>/dev/null; then
+        echo -e "${GREEN}Credentials created - authentication is ON.${NC}"
+        echo -e "  User: ${GREEN}${CU}${NC}   Password: ${GREEN}${NEW_PASS}${NC}"
+        return 0
+    fi
+    echo -e "${RED}Credentials written but the 3proxy restart FAILED - check: systemctl status 3proxy${NC}"
+    return 1
+}
+
 # ── CLI flags (called from proxy-menu.sh) ────────────────
 case "${1:-}" in
     --install|-i) install_proxy;  exit 0 ;;
@@ -2019,24 +2073,7 @@ case "${1:-}" in
                   echo -e "${CYAN}tc classes on ${MAIN_IF:-eth0}:${NC}"
                   tc class show dev "${MAIN_IF:-eth0}" 2>/dev/null || echo "tc not configured"
                   printf '%s\n' "  Press Enter to continue..." >/dev/tty; read -r _PE </dev/tty 2>/dev/null || true; exit 0 ;;
-    --change-pass)
-                  NEW_PASS=$(tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c 16)
-                  if [ -z "$NEW_PASS" ]; then
-                      echo -e "${RED}Failed to generate a secure password (/dev/urandom unavailable). Aborting.${NC}" >&2
-                      exit 1
-                  fi
-                  CU=$(grep -oP '(?<=allow )\S+' "$PROXY_CONF" 2>/dev/null | head -1 || echo "")
-                  if [ -n "$CU" ]; then
-                      echo "users ${CU}:CL:${NEW_PASS}" > "$PROXY_USERS"
-                      [ -f /etc/3proxy/install.info ] && \
-                          sed -i "s/^PASS=.*/PASS=${NEW_PASS}/" /etc/3proxy/install.info 2>/dev/null || true
-                      systemctl restart 3proxy 2>/dev/null && \
-                          echo -e "${GREEN}Password changed: ${NEW_PASS}${NC}" || \
-                          echo -e "${RED}Restart failed${NC}"
-                  else
-                      echo -e "${RED}Not installed${NC}"
-                  fi
-                  exit 0 ;;
+    --change-pass) set_proxy_password; exit $? ;;
 esac
 
 # Standalone mode (run directly without args): show own menu
@@ -2084,7 +2121,7 @@ TARGET_FILE="/etc/sysctl.d/99-vpn-optimized.conf"
 SNAPSHOT_DIR="/var/lib/vpn-sysctl-snapshots"
 LOG_FILE="/var/log/vpn-sysctl-optimizer.log"
 LOCK_FILE="/var/run/vpn-sysctl.lock"
-SCRIPT_VERSION="3.16.1"
+SCRIPT_VERSION="3.16.2"
 
 [ "$EUID" -ne 0 ] && echo -e "${RED}Root required${NC}" && exit 1
 
@@ -2675,7 +2712,7 @@ cat > "$INSTALL_DIR/.proxy-menu.sh.nxnew" << 'MENU_SCRIPT'
 # SC2094 - atomic state writes via tmp-file + rename, which the
 # checker flags as same-file pipelines. Both classes were audited
 # site-by-site during the fix waves (docs/FIX-PLAN.md).
-VERSION="3.16.1"
+VERSION="3.16.2"
 INSTALL_DIR="/opt/proxy-manager"
 _BSRC="${BASH_SOURCE[0]:-}"
 if [ -n "$_BSRC" ] && [ "$_BSRC" != "/dev/stdin" ] && [[ "$_BSRC" != /dev/fd/* ]]; then
@@ -2931,6 +2968,7 @@ menu_proxy() {
         PORT=$(get_proxy_port)
         echo -e "  Status : $ST   $(svc_enabled "3proxy")"
         [ -n "$PORT" ] && echo -e "  Port   : ${C}$PORT${NC}"
+        _L8="Change password"
         [ -f /etc/3proxy/install.info ] && {
             # shellcheck disable=SC1091
             # Read vars with prefix to avoid conflict with bash $USER builtin
@@ -2940,13 +2978,14 @@ menu_proxy() {
                 echo -e "  User   : ${G}$_INFO_USER${NC}   Pass: ${G}${_INFO_PASS:-?}${NC}"
                 echo -e "  Link   : ${G}socks5://$_INFO_USER:${_INFO_PASS:-?}@$(get_ip):${PORT:-?}${NC}"
             else
+                _L8="Set username & password"
                 echo -e "  User   : ${Y}(none - authentication OFF)${NC}"
                 echo -e "  Link   : ${G}socks5://$(get_ip):${PORT:-?}${NC}"
             fi
         }
         echo ""
         ui_options "1|Install/Update" "2|Remove" "3|Start" "4|Stop" \
-            "5|Restart" "6|Live log" "7|Traffic stats" "8|Change password" \
+            "5|Restart" "6|Live log" "7|Traffic stats" "8|$_L8" \
             "9|Delete user & password" "10|Suspicious IPs" "0|Back"
         ui_input CH "  Enter number: "
         case "$CH" in
@@ -3885,7 +3924,7 @@ cat > "$INSTALL_DIR/.antiddos.sh.nxnew" << 'ANTIDDOS_SCRIPT'
 # checker flags as same-file pipelines. Both classes were audited
 # site-by-site during the fix waves (docs/FIX-PLAN.md).
 # ============================================================
-#  Anti-DDoS Protection Manager v3.16.1
+#  Anti-DDoS Protection Manager v3.16.2
 #
 #  Layers:
 #    1. Kernel (sysctl hardening + tight conntrack timeouts)
@@ -3909,7 +3948,7 @@ set -euo pipefail
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 CYAN='\033[0;36m'; WHITE='\033[1;37m'; DIM='\033[2m'; BOLD='\033[1m'; NC='\033[0m'
 
-SCRIPT_VERSION="3.16.1"
+SCRIPT_VERSION="3.16.2"
 LOG_FILE="/var/log/antiddos.log"
 STATE_FILE="/etc/antiddos/state.conf"
 BANNED_LIST="/etc/antiddos/banned.list"
