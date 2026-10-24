@@ -271,6 +271,7 @@ manage_whitelist() {
         fi
         echo -e "  ${CYAN}a.${NC} Add IP/CIDR"
         echo -e "  ${CYAN}d.${NC} Remove entry"
+        echo -e "  ${CYAN}c.${NC} Check an IP (is it exempt from all layers?)"
         echo -e "  ${CYAN}0.${NC} Back"
         sep
         printf '%s' "  Enter choice: " >/dev/tty; read -r WCH </dev/tty || WCH=""
@@ -292,6 +293,16 @@ manage_whitelist() {
                     apply_iptables >/dev/null 2>&1 || true
                     apply_tc_runtime "$MAIN_IF" >/dev/null 2>&1 || true
                     update_f2b_ignoreip || true
+                fi
+                printf '%s\n' "  Press Enter..." >/dev/tty; read -r _PE </dev/tty 2>/dev/null || true ;;
+            c|C)
+                printf '%s' "  IP to check: " >/dev/tty
+                read -r CIP </dev/tty || CIP=""
+                CIP="${CIP// /}"
+                if [ -n "$CIP" ]; then
+                    exempt_check "$CIP"
+                else
+                    echo -e "  ${YELLOW}No input.${NC}"
                 fi
                 printf '%s\n' "  Press Enter..." >/dev/tty; read -r _PE </dev/tty 2>/dev/null || true ;;
             d|D)

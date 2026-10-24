@@ -128,6 +128,8 @@ q
 3
 5
 
+7
+
 0
 2
 3
@@ -152,7 +154,7 @@ timeout 60 bash "$W/mod/proxy-menu.sh" < "$W/input.txt" > "$OUT" 2>&1
 RC=$?
 [ "$RC" -eq 0 ] && ok || bad "menu walk exit code $RC"
 for marker in "Monitoring" "LIVE THREAT MONITOR" "Could not reach the update server" "SOCKS5 Proxy (3proxy)" \
-              "Threat IPs" "Security" "Anti-DDoS Protection" "Whitelist — exempt an IP from ALL layers" "exempt from every layer" \
+              "Threat IPs" "Security" "Anti-DDoS Protection" "Whitelist — exempt an IP from ALL layers" "exempt from every layer" "Current Thresholds" \
               "Network Optimization" "Services" "System" "Hostname:"; do
     grep -q -- "$marker" "$OUT" && ok || bad "screen marker missing: $marker"
 done

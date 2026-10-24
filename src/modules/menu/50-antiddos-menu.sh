@@ -42,7 +42,7 @@ menu_antiddos() {
         ui_options "1|Install / Re-install all layers" "2|Status & active bans" \
             "3|Unban an IP" "4|Auto-ban control (start/stop/log)" \
             "5|Whitelist — exempt an IP from ALL layers" \
-            "6|Remove all protection" "0|Back"
+            "6|Remove all protection" "7|Scoring & rate thresholds" "0|Back"
         ui_input CH "  Enter number: "
         case "$CH" in
             1) _antiddos_install ;;
@@ -75,6 +75,7 @@ menu_antiddos() {
                    echo -e "  iptables, SYNPROXY, tc shaping, fail2ban and the auto-ban daemon.${NC}"
                    press_enter
                fi ;;
+            7) bash "$ANTIDDOS_SCRIPT" --thresholds; press_enter ;;
             6) echo ""
                echo -e "  ${R}${BOLD}⚠  Remove ALL Anti-DDoS Protection${NC}"
                echo -e "  ${DIM}This will remove: iptables rules, sysctl hardening, fail2ban jails,"

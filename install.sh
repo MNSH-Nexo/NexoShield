@@ -3,7 +3,7 @@ exec bash <(tr -d '\r' < "$0" | tail -n +3) "$@"
 #!/bin/bash
 # ── GENERATED FILE ─ built by tools/build.py from src/ ─ do not edit directly; edit the sources and rebuild ──
 # ============================================================
-#  Proxy Manager - Auto Installer  v3.15.0
+#  Proxy Manager - Auto Installer  v3.16.0
 #  One file, one command, everything ready
 #
 #  Install:
@@ -28,7 +28,7 @@ exec bash <(tr -d '\r' < "$0" | tail -n +3) "$@"
 # ============================================================
 set -euo pipefail
 
-VERSION="3.15.0"
+VERSION="3.16.0"
 INSTALL_DIR="/opt/proxy-manager"
 BIN_LINK="/usr/local/bin/shield"
 LOG="/var/log/proxy-manager-install.log"
@@ -2064,7 +2064,7 @@ TARGET_FILE="/etc/sysctl.d/99-vpn-optimized.conf"
 SNAPSHOT_DIR="/var/lib/vpn-sysctl-snapshots"
 LOG_FILE="/var/log/vpn-sysctl-optimizer.log"
 LOCK_FILE="/var/run/vpn-sysctl.lock"
-SCRIPT_VERSION="3.15.0"
+SCRIPT_VERSION="3.16.0"
 
 [ "$EUID" -ne 0 ] && echo -e "${RED}Root required${NC}" && exit 1
 
@@ -2655,7 +2655,7 @@ cat > "$INSTALL_DIR/.proxy-menu.sh.nxnew" << 'MENU_SCRIPT'
 # SC2094 - atomic state writes via tmp-file + rename, which the
 # checker flags as same-file pipelines. Both classes were audited
 # site-by-site during the fix waves (docs/FIX-PLAN.md).
-VERSION="3.15.0"
+VERSION="3.16.0"
 INSTALL_DIR="/opt/proxy-manager"
 _BSRC="${BASH_SOURCE[0]:-}"
 if [ -n "$_BSRC" ] && [ "$_BSRC" != "/dev/stdin" ] && [[ "$_BSRC" != /dev/fd/* ]]; then
@@ -3666,7 +3666,7 @@ menu_antiddos() {
         ui_options "1|Install / Re-install all layers" "2|Status & active bans" \
             "3|Unban an IP" "4|Auto-ban control (start/stop/log)" \
             "5|Whitelist — exempt an IP from ALL layers" \
-            "6|Remove all protection" "0|Back"
+            "6|Remove all protection" "7|Scoring & rate thresholds" "0|Back"
         ui_input CH "  Enter number: "
         case "$CH" in
             1) _antiddos_install ;;
@@ -3699,6 +3699,7 @@ menu_antiddos() {
                    echo -e "  iptables, SYNPROXY, tc shaping, fail2ban and the auto-ban daemon.${NC}"
                    press_enter
                fi ;;
+            7) bash "$ANTIDDOS_SCRIPT" --thresholds; press_enter ;;
             6) echo ""
                echo -e "  ${R}${BOLD}⚠  Remove ALL Anti-DDoS Protection${NC}"
                echo -e "  ${DIM}This will remove: iptables rules, sysctl hardening, fail2ban jails,"
@@ -3864,7 +3865,7 @@ cat > "$INSTALL_DIR/.antiddos.sh.nxnew" << 'ANTIDDOS_SCRIPT'
 # checker flags as same-file pipelines. Both classes were audited
 # site-by-site during the fix waves (docs/FIX-PLAN.md).
 # ============================================================
-#  Anti-DDoS Protection Manager v3.15.0
+#  Anti-DDoS Protection Manager v3.16.0
 #
 #  Layers:
 #    1. Kernel (sysctl hardening + tight conntrack timeouts)
@@ -3888,7 +3889,7 @@ set -euo pipefail
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 CYAN='\033[0;36m'; WHITE='\033[1;37m'; DIM='\033[2m'; BOLD='\033[1m'; NC='\033[0m'
 
-SCRIPT_VERSION="3.15.0"
+SCRIPT_VERSION="3.16.0"
 LOG_FILE="/var/log/antiddos.log"
 STATE_FILE="/etc/antiddos/state.conf"
 BANNED_LIST="/etc/antiddos/banned.list"
@@ -9118,6 +9119,7 @@ manage_whitelist() {
         fi
         echo -e "  ${CYAN}a.${NC} Add IP/CIDR"
         echo -e "  ${CYAN}d.${NC} Remove entry"
+        echo -e "  ${CYAN}c.${NC} Check an IP (is it exempt from all layers?)"
         echo -e "  ${CYAN}0.${NC} Back"
         sep
         printf '%s' "  Enter choice: " >/dev/tty; read -r WCH </dev/tty || WCH=""
@@ -9139,6 +9141,16 @@ manage_whitelist() {
                     apply_iptables >/dev/null 2>&1 || true
                     apply_tc_runtime "$MAIN_IF" >/dev/null 2>&1 || true
                     update_f2b_ignoreip || true
+                fi
+                printf '%s\n' "  Press Enter..." >/dev/tty; read -r _PE </dev/tty 2>/dev/null || true ;;
+            c|C)
+                printf '%s' "  IP to check: " >/dev/tty
+                read -r CIP </dev/tty || CIP=""
+                CIP="${CIP// /}"
+                if [ -n "$CIP" ]; then
+                    exempt_check "$CIP"
+                else
+                    echo -e "  ${YELLOW}No input.${NC}"
                 fi
                 printf '%s\n' "  Press Enter..." >/dev/tty; read -r _PE </dev/tty 2>/dev/null || true ;;
             d|D)

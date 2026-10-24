@@ -60,5 +60,11 @@ grep -q "NexoShield v$RV — Server Security Toolkit" "$ROOT/README.md" && ok ||
 SHORT=$(echo "$RV" | cut -d. -f1,2)
 grep -q "v3.5 → v$SHORT rebuild" "$ROOT/README.md" && ok || bad "README credit range != v$SHORT"
 
+# Menu completeness pins: every engine diagnostic an admin needs
+# has a menu path - thresholds view and a standalone exempt-check
+# inside the whitelist manager (not only as a Block-IP guard).
+grep -q -- '--thresholds' "$ROOT/src/modules/menu/50-antiddos-menu.sh" && ok || bad "menu lost the thresholds view"
+grep -q 'Check an IP (is it exempt' "$ROOT/src/modules/antiddos/70-whitelist-main.sh" && ok || bad "whitelist manager lost the exempt-check entry"
+
 echo "coherence: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
