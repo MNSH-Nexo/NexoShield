@@ -1,5 +1,48 @@
 # @part modules/3proxy/40-install.sh - install_proxy
 # Assembled into 3proxy-socks5.sh by tools/build.py - not a standalone script.
+# _port_held_by_other: is PORT held by something OTHER than our
+# own 3proxy service? ss -tlnp names the owning process, so a
+# listener owned by 3proxy is our own service - an update
+# restarts it onto the same port, it is NOT a conflict.
+_port_held_by_other() {
+    local P="$1"
+    if ss -tlnp 2>/dev/null | grep -qE ":$P\b.*\"3proxy\""; then
+        return 1
+    fi
+    ss -tuln 2>/dev/null | grep -qE ":$P\b"
+}
+
+# pick_proxy_port: settle PORT for install/update.
+# - Default = the already-installed port (install.info) when one
+#   exists, else 1080 - an update must not silently re-default.
+# - The old loop treated ANY listener as foreign, so every update
+#   on a running proxy silently moved it to port+1 (and broke
+#   every client configured for the old port).
+pick_proxy_port() {
+    local DEFAULT_PORT=1080 _OLD
+    if [ -f /etc/3proxy/install.info ]; then
+        _OLD=$(grep '^PORT=' /etc/3proxy/install.info 2>/dev/null | cut -d= -f2- || true)
+        [[ "$_OLD" =~ ^[0-9]+$ ]] && DEFAULT_PORT="$_OLD"
+    fi
+    read -t 30 -rp "Port (default: $DEFAULT_PORT): " INPUT_PORT < /dev/tty 2>/dev/null || INPUT_PORT=""
+    PORT=${INPUT_PORT:-$DEFAULT_PORT}
+    [[ "$PORT" =~ ^[0-9]+$ ]] && [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] || PORT=$DEFAULT_PORT
+    TRIED=0
+    while _port_held_by_other "$PORT" && [ "$TRIED" -lt 20 ]; do
+        echo -e "${YELLOW}Port $PORT is in use.${NC}"
+        PORT=$((PORT + 1))
+        TRIED=$((TRIED + 1))
+        echo -e "Trying: ${CYAN}$PORT${NC}"
+    done
+    # BUG-061: fail fast - the loop used to give up after 20 tries and
+    # still write a config bound to an occupied port.
+    if _port_held_by_other "$PORT"; then
+        echo -e "${RED}No free port found after 20 attempts (last tried: $PORT). Aborting - nothing was written.${NC}" >&2
+        return 1
+    fi
+    return 0
+}
+
 install_proxy() {
     sep; echo -e "${YELLOW}Installing 3proxy SOCKS5...${NC}"; sep
 
@@ -103,24 +146,13 @@ install_proxy() {
     cd /; rm -rf "$TMPDIR_BUILD"
 
     echo -e "${YELLOW}[3/7] Port configuration...${NC}"
-    DEFAULT_PORT=1080
-    read -t 30 -rp "Port (default: $DEFAULT_PORT): " INPUT_PORT < /dev/tty 2>/dev/null || INPUT_PORT=""
-    PORT=${INPUT_PORT:-$DEFAULT_PORT}
-    # Validate port number
-    [[ "$PORT" =~ ^[0-9]+$ ]] && [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] || PORT=$DEFAULT_PORT
-    # Find free port if occupied
-    TRIED=0
-    while ss -tuln 2>/dev/null | grep -qE ":$PORT\b" && [ "$TRIED" -lt 20 ]; do
-        echo -e "${YELLOW}Port $PORT is in use.${NC}"
-        PORT=$((PORT + 1))
-        TRIED=$((TRIED + 1))
-        echo -e "Trying: ${CYAN}$PORT${NC}"
-    done
-    # BUG-061: fail fast - the loop used to give up after 20 tries and
-    # still write a config bound to an occupied port.
-    if ss -tuln 2>/dev/null | grep -qE ":$PORT\\b"; then
-        echo -e "${RED}No free port found after 20 attempts (last tried: $PORT). Aborting - nothing was written.${NC}" >&2
-        return 1
+    _OLD_PORT=""
+    [ -f /etc/3proxy/install.info ] && _OLD_PORT=$(grep '^PORT=' /etc/3proxy/install.info 2>/dev/null | cut -d= -f2- || true)
+    pick_proxy_port || return 1
+    # A deliberate port change vacates the old port: drop its
+    # firewall rules so the old port does not stay open behind us.
+    if [ -n "$_OLD_PORT" ] && [ "$_OLD_PORT" != "$PORT" ]; then
+        remove_proxy_port_rules "$_OLD_PORT"
     fi
 
     echo -e "${YELLOW}[4/7] Security settings...${NC}"

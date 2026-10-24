@@ -1,5 +1,40 @@
 # @part modules/3proxy/20-iptables.sh - setup_iptables_for_port
 # Assembled into 3proxy-socks5.sh by tools/build.py - not a standalone script.
+# remove_proxy_port_rules: delete-only mirror of the delete half of
+# setup_iptables_for_port. Used when an update deliberately moves
+# the proxy to a new port, so the vacated port's rules do not
+# linger (and the old port does not stay open behind us).
+remove_proxy_port_rules() {
+    local PORT="$1"
+    iptables -D INPUT -p tcp --dport "$PORT" -j ACCEPT 2>/dev/null || true
+    iptables -D INPUT -p tcp --dport "$PORT" \
+        -m comment --comment "3proxy_stats_in" 2>/dev/null || true
+    iptables -D OUTPUT -p tcp --sport "$PORT" \
+        -m comment --comment "3proxy_stats_out" 2>/dev/null || true
+    for CF in "${CF_RANGES[@]}"; do
+        [[ "$CF" == *":"* ]] && continue
+        iptables -D INPUT -p tcp --dport "$PORT" -s "$CF" \
+            -m comment --comment "3proxy_cf_allow" -j ACCEPT 2>/dev/null || true
+    done
+    while IFS= read -r SIP; do
+        [ -z "$SIP" ] && continue
+        iptables -D INPUT -p tcp --dport "$PORT" -s "$SIP/32" \
+            -m comment --comment "3proxy_self_allow" -j ACCEPT 2>/dev/null || true
+    done < <(list_self_ips_all)
+    local _rn
+    for _rn in $(iptables -S INPUT 2>/dev/null | grep -n "3proxy_$PORT" | cut -d: -f1 | sort -rn); do
+        iptables -D INPUT $((_rn - 1)) 2>/dev/null || true
+    done
+    if [ -f /etc/antiddos/whitelist.list ]; then
+        while IFS= read -r WIP; do
+            WIP="${WIP%%#*}"; WIP="${WIP// /}"
+            [ -z "$WIP" ] && continue
+            iptables -D INPUT -p tcp --dport "$PORT" -s "$WIP" \
+                -m comment --comment "3proxy_wl_allow" -j ACCEPT 2>/dev/null || true
+        done < /etc/antiddos/whitelist.list
+    fi
+}
+
 setup_iptables_for_port() {
     local PORT="$1"
 
