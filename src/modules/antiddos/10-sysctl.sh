@@ -24,34 +24,47 @@ detect_env() {
         grep -cv '127\.\|10\.\|192\.168\.\|172\.\(1[6-9]\|2[0-9]\|3[01]\)\.' || true)
     PUBLIC_IP_COUNT="${PUBLIC_IP_COUNT:-0}"
 
-    # Scale rate limits by RAM
+    # Scale rate limits by RAM.
+    # CONN_LIMIT_PER_IP tiers (v3.13) sit ABOVE the auto-ban
+    # daemon's watch gate (120 concurrent) on every tier, so the
+    # behavioural scorer engages before the kernel starts resetting
+    # connections - the connlimit is the hard backstop against
+    # connection-hold exhaustion, not the first responder. The old
+    # 50/100/200 tiers fired below the watch gate and reset
+    # legitimate shared IPs (CGNAT, office/home NAT, VPN egress),
+    # where one public IP routinely carries 100+ concurrent
+    # connections from many real users. BW tiers rose for the same
+    # reason: 50 Mbit/s starved a single legitimate proxy/download
+    # user on a small box; a per-IP ceiling exists to stop one
+    # source monopolising the link, not to ration normal use. On a
+    # slower link than the tier value the cap simply never fires.
     if [ "$RAM_MB" -ge 4096 ]; then
         SYN_LIMIT="2000/sec"; SYN_BURST="4000"
         UDP_LIMIT="500/sec";  UDP_BURST="1000"
         ICMP_LIMIT="100/sec"; ICMP_BURST="200"
-        CONN_LIMIT_PER_IP="200"
-        NEW_CONN_RATE="200/sec"; NEW_CONN_BURST="400"
+        CONN_LIMIT_PER_IP="600"
+        NEW_CONN_RATE="400/sec"; NEW_CONN_BURST="800"
         # HTTP_REQ_RATE: packets on ESTABLISHED TCP per IP
         # A heavy download = ~1500byte packets = ~800 pkt/s per Gbps
         # Normal user with 100Mbps fiber download = ~80 pkt/s — set 2000 to be safe
         HTTP_REQ_RATE="2000/sec"; HTTP_REQ_BURST="4000"
-        BW_PER_IP_MBIT="200"
+        BW_PER_IP_MBIT="500"
     elif [ "$RAM_MB" -ge 2048 ]; then
         SYN_LIMIT="1000/sec"; SYN_BURST="2000"
         UDP_LIMIT="300/sec";  UDP_BURST="600"
         ICMP_LIMIT="50/sec";  ICMP_BURST="100"
-        CONN_LIMIT_PER_IP="100"
-        NEW_CONN_RATE="100/sec"; NEW_CONN_BURST="200"
+        CONN_LIMIT_PER_IP="300"
+        NEW_CONN_RATE="200/sec"; NEW_CONN_BURST="400"
         HTTP_REQ_RATE="1000/sec"; HTTP_REQ_BURST="2000"
-        BW_PER_IP_MBIT="100"
+        BW_PER_IP_MBIT="250"
     else
         SYN_LIMIT="500/sec";  SYN_BURST="1000"
         UDP_LIMIT="150/sec";  UDP_BURST="300"
         ICMP_LIMIT="25/sec";  ICMP_BURST="50"
-        CONN_LIMIT_PER_IP="50"
-        NEW_CONN_RATE="50/sec"; NEW_CONN_BURST="100"
+        CONN_LIMIT_PER_IP="150"
+        NEW_CONN_RATE="100/sec"; NEW_CONN_BURST="200"
         HTTP_REQ_RATE="500/sec"; HTTP_REQ_BURST="1000"
-        BW_PER_IP_MBIT="50"
+        BW_PER_IP_MBIT="100"
     fi
 }
 

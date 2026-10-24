@@ -9,7 +9,7 @@ exec bash <(tr -d '\r' < "$0" | tail -n +3) "$@"
 #    bash install.sh
 #
 #  After install:
-#    proxy
+#    shield
 #
 #  Changelog v3.0:
 #    + Smart throttle+ban (watch->throttle->ban pipeline)
@@ -46,13 +46,33 @@ if [ "$EUID" -ne 0 ]; then
     echo -e "${R}Must be run as root: sudo bash $0${NC}"; exit 1
 fi
 
+# ── Supported OS: Ubuntu 20.04+ and Debian 11+ ────────────
+# Everything NexoShield installs (apt packages, systemd units,
+# sysctl.d, iptables persistence) is distribution-identical on
+# the two; Debian 12 was field-verified with v3.5.0. Anything
+# else gets a clear stop here instead of half-failed apt calls
+# deeper in (override with NX_FORCE_OS=1 if you must).
+_NX_OS_ID=""
+[ -r /etc/os-release ] && _NX_OS_ID=$(grep '^ID=' /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"' || true)
+case "$_NX_OS_ID" in
+    ubuntu|debian) ;;
+    *)
+        if [ "${NX_FORCE_OS:-0}" != "1" ]; then
+            echo -e "${R}Unsupported OS: '${_NX_OS_ID:-unknown}' - NexoShield supports Ubuntu 20.04+ and Debian 11+.${NC}"
+            echo -e "${R}Set NX_FORCE_OS=1 to try anyway (untested).${NC}"
+            exit 1
+        fi
+        echo -e "${Y}Warning: untested OS '${_NX_OS_ID}' - continuing because NX_FORCE_OS=1.${NC}"
+        ;;
+esac
+
 clear 2>/dev/null || true
 sep
 echo -e "  ${C}${BOLD}Proxy Manager Installer v${VERSION}${NC}"
 sep
 echo ""
 info "Install path: $INSTALL_DIR"
-info "Command after install: ${W}proxy${NC}"
+info "Command after install: ${W}shield${NC}"
 echo ""
 
 mkdir -p "$INSTALL_DIR"

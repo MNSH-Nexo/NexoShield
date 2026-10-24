@@ -106,9 +106,9 @@ apply_iptables() {
         # Each connection ~1-5 Mbps for proxy; 60 conns ≈ 60-300 Mbps cap
         ipt_add INPUT -p tcp \
             -m conntrack --ctstate NEW \
-            -m connlimit --connlimit-above 60 --connlimit-mask 32 \
+            -m connlimit --connlimit-above "$CONN_LIMIT_PER_IP" --connlimit-mask 32 \
             -j DROP 2>/dev/null && \
-            success "Per-IP bandwidth cap: connlimit fallback (max 60 conns/IP — kernel too old for byte-mode)" || \
+            success "Per-IP bandwidth cap: connlimit fallback (max $CONN_LIMIT_PER_IP conns/IP — kernel too old for byte-mode)" || \
             warn "Per-IP bandwidth cap: both byte-mode and connlimit fallback failed"
     fi
 

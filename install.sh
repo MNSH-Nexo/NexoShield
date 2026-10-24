@@ -3,14 +3,14 @@ exec bash <(tr -d '\r' < "$0" | tail -n +3) "$@"
 #!/bin/bash
 # ── GENERATED FILE ─ built by tools/build.py from src/ ─ do not edit directly; edit the sources and rebuild ──
 # ============================================================
-#  Proxy Manager - Auto Installer  v3.12.0
+#  Proxy Manager - Auto Installer  v3.13.0
 #  One file, one command, everything ready
 #
 #  Install:
 #    bash install.sh
 #
 #  After install:
-#    proxy
+#    shield
 #
 #  Changelog v3.0:
 #    + Smart throttle+ban (watch->throttle->ban pipeline)
@@ -28,7 +28,7 @@ exec bash <(tr -d '\r' < "$0" | tail -n +3) "$@"
 # ============================================================
 set -euo pipefail
 
-VERSION="3.12.0"
+VERSION="3.13.0"
 INSTALL_DIR="/opt/proxy-manager"
 BIN_LINK="/usr/local/bin/shield"
 LOG="/var/log/proxy-manager-install.log"
@@ -47,13 +47,33 @@ if [ "$EUID" -ne 0 ]; then
     echo -e "${R}Must be run as root: sudo bash $0${NC}"; exit 1
 fi
 
+# ── Supported OS: Ubuntu 20.04+ and Debian 11+ ────────────
+# Everything NexoShield installs (apt packages, systemd units,
+# sysctl.d, iptables persistence) is distribution-identical on
+# the two; Debian 12 was field-verified with v3.5.0. Anything
+# else gets a clear stop here instead of half-failed apt calls
+# deeper in (override with NX_FORCE_OS=1 if you must).
+_NX_OS_ID=""
+[ -r /etc/os-release ] && _NX_OS_ID=$(grep '^ID=' /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"' || true)
+case "$_NX_OS_ID" in
+    ubuntu|debian) ;;
+    *)
+        if [ "${NX_FORCE_OS:-0}" != "1" ]; then
+            echo -e "${R}Unsupported OS: '${_NX_OS_ID:-unknown}' - NexoShield supports Ubuntu 20.04+ and Debian 11+.${NC}"
+            echo -e "${R}Set NX_FORCE_OS=1 to try anyway (untested).${NC}"
+            exit 1
+        fi
+        echo -e "${Y}Warning: untested OS '${_NX_OS_ID}' - continuing because NX_FORCE_OS=1.${NC}"
+        ;;
+esac
+
 clear 2>/dev/null || true
 sep
 echo -e "  ${C}${BOLD}Proxy Manager Installer v${VERSION}${NC}"
 sep
 echo ""
 info "Install path: $INSTALL_DIR"
-info "Command after install: ${W}proxy${NC}"
+info "Command after install: ${W}shield${NC}"
 echo ""
 
 mkdir -p "$INSTALL_DIR"
@@ -2041,7 +2061,7 @@ TARGET_FILE="/etc/sysctl.d/99-vpn-optimized.conf"
 SNAPSHOT_DIR="/var/lib/vpn-sysctl-snapshots"
 LOG_FILE="/var/log/vpn-sysctl-optimizer.log"
 LOCK_FILE="/var/run/vpn-sysctl.lock"
-SCRIPT_VERSION="3.12.0"
+SCRIPT_VERSION="3.13.0"
 
 [ "$EUID" -ne 0 ] && echo -e "${RED}Root required${NC}" && exit 1
 
@@ -2632,7 +2652,7 @@ cat > "$INSTALL_DIR/.proxy-menu.sh.nxnew" << 'MENU_SCRIPT'
 # SC2094 - atomic state writes via tmp-file + rename, which the
 # checker flags as same-file pipelines. Both classes were audited
 # site-by-site during the fix waves (docs/FIX-PLAN.md).
-VERSION="3.12.0"
+VERSION="3.13.0"
 INSTALL_DIR="/opt/proxy-manager"
 _BSRC="${BASH_SOURCE[0]:-}"
 if [ -n "$_BSRC" ] && [ "$_BSRC" != "/dev/stdin" ] && [[ "$_BSRC" != /dev/fd/* ]]; then
@@ -3824,7 +3844,7 @@ cat > "$INSTALL_DIR/.antiddos.sh.nxnew" << 'ANTIDDOS_SCRIPT'
 # checker flags as same-file pipelines. Both classes were audited
 # site-by-site during the fix waves (docs/FIX-PLAN.md).
 # ============================================================
-#  Anti-DDoS Protection Manager v3.12.0
+#  Anti-DDoS Protection Manager v3.13.0
 #
 #  Layers:
 #    1. Kernel (sysctl hardening + tight conntrack timeouts)
@@ -3848,7 +3868,7 @@ set -euo pipefail
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 CYAN='\033[0;36m'; WHITE='\033[1;37m'; DIM='\033[2m'; BOLD='\033[1m'; NC='\033[0m'
 
-SCRIPT_VERSION="3.12.0"
+SCRIPT_VERSION="3.13.0"
 LOG_FILE="/var/log/antiddos.log"
 STATE_FILE="/etc/antiddos/state.conf"
 BANNED_LIST="/etc/antiddos/banned.list"
@@ -4193,34 +4213,47 @@ detect_env() {
         grep -cv '127\.\|10\.\|192\.168\.\|172\.\(1[6-9]\|2[0-9]\|3[01]\)\.' || true)
     PUBLIC_IP_COUNT="${PUBLIC_IP_COUNT:-0}"
 
-    # Scale rate limits by RAM
+    # Scale rate limits by RAM.
+    # CONN_LIMIT_PER_IP tiers (v3.13) sit ABOVE the auto-ban
+    # daemon's watch gate (120 concurrent) on every tier, so the
+    # behavioural scorer engages before the kernel starts resetting
+    # connections - the connlimit is the hard backstop against
+    # connection-hold exhaustion, not the first responder. The old
+    # 50/100/200 tiers fired below the watch gate and reset
+    # legitimate shared IPs (CGNAT, office/home NAT, VPN egress),
+    # where one public IP routinely carries 100+ concurrent
+    # connections from many real users. BW tiers rose for the same
+    # reason: 50 Mbit/s starved a single legitimate proxy/download
+    # user on a small box; a per-IP ceiling exists to stop one
+    # source monopolising the link, not to ration normal use. On a
+    # slower link than the tier value the cap simply never fires.
     if [ "$RAM_MB" -ge 4096 ]; then
         SYN_LIMIT="2000/sec"; SYN_BURST="4000"
         UDP_LIMIT="500/sec";  UDP_BURST="1000"
         ICMP_LIMIT="100/sec"; ICMP_BURST="200"
-        CONN_LIMIT_PER_IP="200"
-        NEW_CONN_RATE="200/sec"; NEW_CONN_BURST="400"
+        CONN_LIMIT_PER_IP="600"
+        NEW_CONN_RATE="400/sec"; NEW_CONN_BURST="800"
         # HTTP_REQ_RATE: packets on ESTABLISHED TCP per IP
         # A heavy download = ~1500byte packets = ~800 pkt/s per Gbps
         # Normal user with 100Mbps fiber download = ~80 pkt/s — set 2000 to be safe
         HTTP_REQ_RATE="2000/sec"; HTTP_REQ_BURST="4000"
-        BW_PER_IP_MBIT="200"
+        BW_PER_IP_MBIT="500"
     elif [ "$RAM_MB" -ge 2048 ]; then
         SYN_LIMIT="1000/sec"; SYN_BURST="2000"
         UDP_LIMIT="300/sec";  UDP_BURST="600"
         ICMP_LIMIT="50/sec";  ICMP_BURST="100"
-        CONN_LIMIT_PER_IP="100"
-        NEW_CONN_RATE="100/sec"; NEW_CONN_BURST="200"
+        CONN_LIMIT_PER_IP="300"
+        NEW_CONN_RATE="200/sec"; NEW_CONN_BURST="400"
         HTTP_REQ_RATE="1000/sec"; HTTP_REQ_BURST="2000"
-        BW_PER_IP_MBIT="100"
+        BW_PER_IP_MBIT="250"
     else
         SYN_LIMIT="500/sec";  SYN_BURST="1000"
         UDP_LIMIT="150/sec";  UDP_BURST="300"
         ICMP_LIMIT="25/sec";  ICMP_BURST="50"
-        CONN_LIMIT_PER_IP="50"
-        NEW_CONN_RATE="50/sec"; NEW_CONN_BURST="100"
+        CONN_LIMIT_PER_IP="150"
+        NEW_CONN_RATE="100/sec"; NEW_CONN_BURST="200"
         HTTP_REQ_RATE="500/sec"; HTTP_REQ_BURST="1000"
-        BW_PER_IP_MBIT="50"
+        BW_PER_IP_MBIT="100"
     fi
 }
 
@@ -4427,9 +4460,9 @@ apply_iptables() {
         # Each connection ~1-5 Mbps for proxy; 60 conns ≈ 60-300 Mbps cap
         ipt_add INPUT -p tcp \
             -m conntrack --ctstate NEW \
-            -m connlimit --connlimit-above 60 --connlimit-mask 32 \
+            -m connlimit --connlimit-above "$CONN_LIMIT_PER_IP" --connlimit-mask 32 \
             -j DROP 2>/dev/null && \
-            success "Per-IP bandwidth cap: connlimit fallback (max 60 conns/IP — kernel too old for byte-mode)" || \
+            success "Per-IP bandwidth cap: connlimit fallback (max $CONN_LIMIT_PER_IP conns/IP — kernel too old for byte-mode)" || \
             warn "Per-IP bandwidth cap: both byte-mode and connlimit fallback failed"
     fi
 
