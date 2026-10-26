@@ -43,6 +43,15 @@ show_stats() {
     echo -e "  Download (proxy -> client): ${GREEN}$(_fmt "$OUT_B")${NC}"
     echo -e "  Upload   (client -> proxy): ${GREEN}$(_fmt "$IN_B")${NC}"
 
+    # Cumulative totals (v3.17.0): the kernel counters above reset
+    # on rule recreation and reboot; the accumulator's state file
+    # is the recorded history. Absent before the first 5-minute run.
+    if [ -f /etc/3proxy/traffic-total.state ]; then
+        _TOT_IN=$(awk '{print $3}' /etc/3proxy/traffic-total.state 2>/dev/null || true)
+        _TOT_OUT=$(awk '{print $4}' /etc/3proxy/traffic-total.state 2>/dev/null || true)
+        echo -e "  Total recorded (cumulative): Download ${GREEN}$(_fmt "${_TOT_OUT:-0}")${NC} / Upload ${GREEN}$(_fmt "${_TOT_IN:-0}")${NC}"
+    fi
+
     # tc stats
     MAIN_IF=$(ip route show default 2>/dev/null | awk '/default/{print $5}' | head -1)
     if [ -n "$MAIN_IF" ] && command -v tc >/dev/null 2>&1; then

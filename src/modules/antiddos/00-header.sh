@@ -79,5 +79,6 @@ sep()     { echo -e "${CYAN}═════════════════�
 # @include lib/self-ips.sh
 # @include lib/config.sh
 # @include lib/install-binary.sh
+# @include lib/proxy-stats.sh
 
 # Detect environment

@@ -126,6 +126,13 @@ uninstall_proxy() {
         echo -e "${GREEN}Original apt sources restored from backup.${NC}"
     fi
 
+    # ── Remove traffic accumulator (v3.17.0) ─────────────
+    systemctl stop    nx-proxy-traffic-accum.timer 2>/dev/null || true
+    systemctl disable nx-proxy-traffic-accum.timer 2>/dev/null || true
+    rm -f /etc/systemd/system/nx-proxy-traffic-accum.service
+    rm -f /etc/systemd/system/nx-proxy-traffic-accum.timer
+    rm -f /usr/local/bin/nx-proxy-traffic-accum
+
     # ── Remove systemd service files ─────────────────────
     rm -f "$SERVICE_FILE"
     [ -f /etc/antiddos/state.conf ] || rm -f /etc/systemd/system/tc-proxy-limit.service

@@ -388,6 +388,13 @@ apply_iptables() {
     ipt_add INPUT -f -j DROP
     success "Fragmented packets: dropped"
 
+    # v3.17.0: re-pin the proxy counters on top BEFORE saving. Every
+    # -I insert above shadows the target-less stats rules (a plain
+    # insert-once counter silently undercounted in the field), and
+    # the saved order is the boot-restored order. No-op when the
+    # proxy is absent or the rules are already pinned.
+    nx_pin_proxy_stats_rules "$(nx_proxy_port_from_config)"
+
     # Save rules (static only - transient bans/f2b chains excluded, BUG-012)
     save_static_rules "$IPTABLES_SAVE_FILE"
     chmod 600 "$IPTABLES_SAVE_FILE"

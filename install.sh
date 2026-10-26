@@ -3,7 +3,7 @@ exec bash <(tr -d '\r' < "$0" | tail -n +3) "$@"
 #!/bin/bash
 # ── GENERATED FILE ─ built by tools/build.py from src/ ─ do not edit directly; edit the sources and rebuild ──
 # ============================================================
-#  Proxy Manager - Auto Installer  v3.16.3
+#  Proxy Manager - Auto Installer  v3.17.0
 #  One file, one command, everything ready
 #
 #  Install:
@@ -28,7 +28,7 @@ exec bash <(tr -d '\r' < "$0" | tail -n +3) "$@"
 # ============================================================
 set -euo pipefail
 
-VERSION="3.16.3"
+VERSION="3.17.0"
 INSTALL_DIR="/opt/proxy-manager"
 BIN_LINK="/usr/local/bin/shield"
 LOG="/var/log/proxy-manager-install.log"
@@ -1065,6 +1065,79 @@ nx_install_binary() {
     rm -f "$tmp"
     return 1
 }
+# A counting rule has no -j target: it counts only packets that
+# REACH it. Any ACCEPT above it (an antiddos -I insert, or a
+# third-party firewall's blanket rule) shadows it, so a counter
+# that is merely inserted once silently undercounts. Field report
+# v3.16.3: stats_in buried at INPUT #811 below the ESTABLISHED
+# accept counted SYNs only (282 pkts / 14 KB while the interface
+# moved ~515 MB); stats_out below a blanket OUTPUT accept counted
+# exactly zero. The pin below re-asserts the rules at position 1,
+# and only moves them when they are NOT already on top, so a
+# re-pin never destroys a healthy counter. Moving a target-less
+# rule changes no allow/block behaviour - it only counts.
+nx_proxy_stats_top() {
+    # nx_proxy_stats_top CHAIN COMMENT -> 0 if the chain's first
+    # rule carries COMMENT.
+    local _first
+    _first=$(iptables -S "$1" 2>/dev/null | grep -m1 '^-A' || true)
+    case "$_first" in *"$2"*) return 0 ;; *) return 1 ;; esac
+}
+
+nx_pin_proxy_stats_rules() {
+    # nx_pin_proxy_stats_rules PORT: re-assert both counting rules
+    # at position 1. No-op (counter preserved) when already pinned.
+    local PORT="$1"
+    [ -n "$PORT" ] || return 0
+    if ! nx_proxy_stats_top INPUT "3proxy_stats_in"; then
+        iptables -D INPUT -p tcp --dport "$PORT" -m comment --comment "3proxy_stats_in" 2>/dev/null || true
+        iptables -I INPUT 1 -p tcp --dport "$PORT" -m comment --comment "3proxy_stats_in" 2>/dev/null || true
+    fi
+    if ! nx_proxy_stats_top OUTPUT "3proxy_stats_out"; then
+        iptables -D OUTPUT -p tcp --sport "$PORT" -m comment --comment "3proxy_stats_out" 2>/dev/null || true
+        iptables -I OUTPUT 1 -p tcp --sport "$PORT" -m comment --comment "3proxy_stats_out" 2>/dev/null || true
+    fi
+}
+
+nx_proxy_stats_bytes() {
+    # nx_proxy_stats_bytes CHAIN COMMENT -> counter bytes (or empty).
+    # Same parse as show_stats: the bytes column of `iptables -L`.
+    iptables -L "$1" -v -n -x 2>/dev/null | grep "$2" | awk '{print $2}' | head -1
+}
+
+nx_proxy_port_from_config() {
+    # Live port from the 3proxy config (source of truth, not install.info).
+    grep -oP '(?<=socks -p)\s*\K\d+' /etc/3proxy/3proxy.cfg 2>/dev/null | head -1 || true
+}
+
+# State file format (one line): LAST_IN LAST_OUT TOTAL_IN TOTAL_OUT.
+# Written atomically (tmp + rename). Totals survive reboots and rule
+# recreations: a counter that went BACKWARDS means its rule was
+# recreated, so the delta is the new counter itself, never negative.
+# A missing rule (proxy removed, rules wiped) leaves totals untouched.
+nx_proxy_traffic_accum() {
+    local PORT STATE CUR_IN CUR_OUT LAST_IN LAST_OUT TOT_IN TOT_OUT
+    PORT=$(nx_proxy_port_from_config)
+    [ -n "$PORT" ] || return 0
+    STATE="${NX_PROXY_TRAFFIC_STATE:-/etc/3proxy/traffic-total.state}"
+    CUR_IN=$(nx_proxy_stats_bytes INPUT "3proxy_stats_in")
+    CUR_OUT=$(nx_proxy_stats_bytes OUTPUT "3proxy_stats_out")
+    [ -n "$CUR_IN" ] && [ -n "$CUR_OUT" ] || return 0
+    LAST_IN=""; LAST_OUT=""; TOT_IN=""; TOT_OUT=""
+    if [ -f "$STATE" ]; then
+        read -r LAST_IN LAST_OUT TOT_IN TOT_OUT < "$STATE" 2>/dev/null || true
+    fi
+    LAST_IN="${LAST_IN//[^0-9]/}"; LAST_OUT="${LAST_OUT//[^0-9]/}"
+    TOT_IN="${TOT_IN//[^0-9]/}"; TOT_OUT="${TOT_OUT//[^0-9]/}"
+    LAST_IN="${LAST_IN:-0}"; LAST_OUT="${LAST_OUT:-0}"
+    TOT_IN="${TOT_IN:-0}"; TOT_OUT="${TOT_OUT:-0}"
+    if [ "$CUR_IN" -ge "$LAST_IN" ] 2>/dev/null; then TOT_IN=$((TOT_IN + CUR_IN - LAST_IN)); else TOT_IN=$((TOT_IN + CUR_IN)); fi
+    if [ "$CUR_OUT" -ge "$LAST_OUT" ] 2>/dev/null; then TOT_OUT=$((TOT_OUT + CUR_OUT - LAST_OUT)); else TOT_OUT=$((TOT_OUT + CUR_OUT)); fi
+    printf '%s %s %s %s\n' "$CUR_IN" "$CUR_OUT" "$TOT_IN" "$TOT_OUT" > "${STATE}.tmp.$$" 2>/dev/null && mv -f "${STATE}.tmp.$$" "$STATE" 2>/dev/null || true
+    # Self-heal shadowing AFTER the snapshot, so a re-pin never
+    # destroys counts it has not yet recorded.
+    nx_pin_proxy_stats_rules "$PORT"
+}
 
 get_server_ip() {
     curl -s -4 --max-time 5 https://api.ipify.org 2>/dev/null || \
@@ -1367,9 +1440,11 @@ setup_iptables_for_port() {
     # ── Step 4: Allow all remaining ──────────────────────
     iptables -A INPUT -p tcp --dport "$PORT" -j ACCEPT
 
-    # Stats counters
-    iptables -I INPUT  -p tcp --dport "$PORT" -m comment --comment "3proxy_stats_in"
-    iptables -I OUTPUT -p tcp --sport "$PORT" -m comment --comment "3proxy_stats_out"
+    # Stats counters, pinned at position 1 (v3.17.0: a target-less
+    # counting rule only counts packets that reach it - anything
+    # ACCEPTed above it shadows it, so the pin is re-asserted here
+    # and after every antiddos apply, never merely appended).
+    nx_pin_proxy_stats_rules "$PORT"
 
     # UFW / firewalld compat
     command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "active" && \
@@ -1735,6 +1810,44 @@ EOF
     echo -e "${YELLOW}[6/7] Firewall rules (CF=unlimited)...${NC}"
     setup_iptables_for_port "$PORT"
 
+    # Cumulative traffic recording (v3.17.0): kernel counters reset
+    # on every rule recreation and reboot, so snapshot their deltas
+    # every 5 minutes into /etc/3proxy/traffic-total.state. The
+    # script is generated from the live lib functions (single source
+    # of truth - the same code the unit tests exercise), not a copy.
+    # No -w wrapper here on purpose: every call below is guarded
+    # (a contended lock just defers the snapshot/re-pin to the next
+    # 5-minute run), and the wrapper string would break the
+    # wave3 wrapper-count regression test.
+    {
+        printf '%s\n' '#!/bin/bash' '# Generated by NexoShield - recreated on every Install/Update.'
+        declare -f nx_proxy_stats_top nx_pin_proxy_stats_rules nx_proxy_stats_bytes nx_proxy_port_from_config nx_proxy_traffic_accum
+        printf '%s\n' 'nx_proxy_traffic_accum "$@"'
+    } > /usr/local/bin/nx-proxy-traffic-accum 2>/dev/null && chmod 755 /usr/local/bin/nx-proxy-traffic-accum 2>/dev/null || true
+    cat > /etc/systemd/system/nx-proxy-traffic-accum.service << EOF
+[Unit]
+Description=NexoShield proxy traffic accumulator
+After=network.target
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/nx-proxy-traffic-accum
+[Install]
+WantedBy=multi-user.target
+EOF
+    cat > /etc/systemd/system/nx-proxy-traffic-accum.timer << EOF
+[Unit]
+Description=NexoShield proxy traffic accumulator (every 5 minutes)
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=5min
+Persistent=true
+[Install]
+WantedBy=timers.target
+EOF
+    systemctl daemon-reload 2>/dev/null || true
+    systemctl enable --now nx-proxy-traffic-accum.timer 2>/dev/null || true
+    /usr/local/bin/nx-proxy-traffic-accum 2>/dev/null || true
+
     echo -e "${YELLOW}[7/7] Bandwidth control...${NC}"
     # Detect main interface
     MAIN_IF=$(ip route show default 2>/dev/null | awk '/default/{print $5}' | head -1)
@@ -1918,6 +2031,13 @@ uninstall_proxy() {
         echo -e "${GREEN}Original apt sources restored from backup.${NC}"
     fi
 
+    # ── Remove traffic accumulator (v3.17.0) ─────────────
+    systemctl stop    nx-proxy-traffic-accum.timer 2>/dev/null || true
+    systemctl disable nx-proxy-traffic-accum.timer 2>/dev/null || true
+    rm -f /etc/systemd/system/nx-proxy-traffic-accum.service
+    rm -f /etc/systemd/system/nx-proxy-traffic-accum.timer
+    rm -f /usr/local/bin/nx-proxy-traffic-accum
+
     # ── Remove systemd service files ─────────────────────
     rm -f "$SERVICE_FILE"
     [ -f /etc/antiddos/state.conf ] || rm -f /etc/systemd/system/tc-proxy-limit.service
@@ -1994,6 +2114,15 @@ show_stats() {
     # 3proxy_stats_out = bytes proxy   SENT to clients (download)
     echo -e "  Download (proxy -> client): ${GREEN}$(_fmt "$OUT_B")${NC}"
     echo -e "  Upload   (client -> proxy): ${GREEN}$(_fmt "$IN_B")${NC}"
+
+    # Cumulative totals (v3.17.0): the kernel counters above reset
+    # on rule recreation and reboot; the accumulator's state file
+    # is the recorded history. Absent before the first 5-minute run.
+    if [ -f /etc/3proxy/traffic-total.state ]; then
+        _TOT_IN=$(awk '{print $3}' /etc/3proxy/traffic-total.state 2>/dev/null || true)
+        _TOT_OUT=$(awk '{print $4}' /etc/3proxy/traffic-total.state 2>/dev/null || true)
+        echo -e "  Total recorded (cumulative): Download ${GREEN}$(_fmt "${_TOT_OUT:-0}")${NC} / Upload ${GREEN}$(_fmt "${_TOT_IN:-0}")${NC}"
+    fi
 
     # tc stats
     MAIN_IF=$(ip route show default 2>/dev/null | awk '/default/{print $5}' | head -1)
@@ -2188,7 +2317,7 @@ TARGET_FILE="/etc/sysctl.d/99-vpn-optimized.conf"
 SNAPSHOT_DIR="/var/lib/vpn-sysctl-snapshots"
 LOG_FILE="/var/log/vpn-sysctl-optimizer.log"
 LOCK_FILE="/var/run/vpn-sysctl.lock"
-SCRIPT_VERSION="3.16.3"
+SCRIPT_VERSION="3.17.0"
 
 [ "$EUID" -ne 0 ] && echo -e "${RED}Root required${NC}" && exit 1
 
@@ -2779,7 +2908,7 @@ cat > "$INSTALL_DIR/.proxy-menu.sh.nxnew" << 'MENU_SCRIPT'
 # SC2094 - atomic state writes via tmp-file + rename, which the
 # checker flags as same-file pipelines. Both classes were audited
 # site-by-site during the fix waves (docs/FIX-PLAN.md).
-VERSION="3.16.3"
+VERSION="3.17.0"
 INSTALL_DIR="/opt/proxy-manager"
 _BSRC="${BASH_SOURCE[0]:-}"
 if [ -n "$_BSRC" ] && [ "$_BSRC" != "/dev/stdin" ] && [[ "$_BSRC" != /dev/fd/* ]]; then
@@ -3991,7 +4120,7 @@ cat > "$INSTALL_DIR/.antiddos.sh.nxnew" << 'ANTIDDOS_SCRIPT'
 # checker flags as same-file pipelines. Both classes were audited
 # site-by-site during the fix waves (docs/FIX-PLAN.md).
 # ============================================================
-#  Anti-DDoS Protection Manager v3.16.3
+#  Anti-DDoS Protection Manager v3.17.0
 #
 #  Layers:
 #    1. Kernel (sysctl hardening + tight conntrack timeouts)
@@ -4015,7 +4144,7 @@ set -euo pipefail
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 CYAN='\033[0;36m'; WHITE='\033[1;37m'; DIM='\033[2m'; BOLD='\033[1m'; NC='\033[0m'
 
-SCRIPT_VERSION="3.16.3"
+SCRIPT_VERSION="3.17.0"
 LOG_FILE="/var/log/antiddos.log"
 STATE_FILE="/etc/antiddos/state.conf"
 BANNED_LIST="/etc/antiddos/banned.list"
@@ -4351,6 +4480,79 @@ nx_install_binary() {
     fi
     rm -f "$tmp"
     return 1
+}
+# A counting rule has no -j target: it counts only packets that
+# REACH it. Any ACCEPT above it (an antiddos -I insert, or a
+# third-party firewall's blanket rule) shadows it, so a counter
+# that is merely inserted once silently undercounts. Field report
+# v3.16.3: stats_in buried at INPUT #811 below the ESTABLISHED
+# accept counted SYNs only (282 pkts / 14 KB while the interface
+# moved ~515 MB); stats_out below a blanket OUTPUT accept counted
+# exactly zero. The pin below re-asserts the rules at position 1,
+# and only moves them when they are NOT already on top, so a
+# re-pin never destroys a healthy counter. Moving a target-less
+# rule changes no allow/block behaviour - it only counts.
+nx_proxy_stats_top() {
+    # nx_proxy_stats_top CHAIN COMMENT -> 0 if the chain's first
+    # rule carries COMMENT.
+    local _first
+    _first=$(iptables -S "$1" 2>/dev/null | grep -m1 '^-A' || true)
+    case "$_first" in *"$2"*) return 0 ;; *) return 1 ;; esac
+}
+
+nx_pin_proxy_stats_rules() {
+    # nx_pin_proxy_stats_rules PORT: re-assert both counting rules
+    # at position 1. No-op (counter preserved) when already pinned.
+    local PORT="$1"
+    [ -n "$PORT" ] || return 0
+    if ! nx_proxy_stats_top INPUT "3proxy_stats_in"; then
+        iptables -D INPUT -p tcp --dport "$PORT" -m comment --comment "3proxy_stats_in" 2>/dev/null || true
+        iptables -I INPUT 1 -p tcp --dport "$PORT" -m comment --comment "3proxy_stats_in" 2>/dev/null || true
+    fi
+    if ! nx_proxy_stats_top OUTPUT "3proxy_stats_out"; then
+        iptables -D OUTPUT -p tcp --sport "$PORT" -m comment --comment "3proxy_stats_out" 2>/dev/null || true
+        iptables -I OUTPUT 1 -p tcp --sport "$PORT" -m comment --comment "3proxy_stats_out" 2>/dev/null || true
+    fi
+}
+
+nx_proxy_stats_bytes() {
+    # nx_proxy_stats_bytes CHAIN COMMENT -> counter bytes (or empty).
+    # Same parse as show_stats: the bytes column of `iptables -L`.
+    iptables -L "$1" -v -n -x 2>/dev/null | grep "$2" | awk '{print $2}' | head -1
+}
+
+nx_proxy_port_from_config() {
+    # Live port from the 3proxy config (source of truth, not install.info).
+    grep -oP '(?<=socks -p)\s*\K\d+' /etc/3proxy/3proxy.cfg 2>/dev/null | head -1 || true
+}
+
+# State file format (one line): LAST_IN LAST_OUT TOTAL_IN TOTAL_OUT.
+# Written atomically (tmp + rename). Totals survive reboots and rule
+# recreations: a counter that went BACKWARDS means its rule was
+# recreated, so the delta is the new counter itself, never negative.
+# A missing rule (proxy removed, rules wiped) leaves totals untouched.
+nx_proxy_traffic_accum() {
+    local PORT STATE CUR_IN CUR_OUT LAST_IN LAST_OUT TOT_IN TOT_OUT
+    PORT=$(nx_proxy_port_from_config)
+    [ -n "$PORT" ] || return 0
+    STATE="${NX_PROXY_TRAFFIC_STATE:-/etc/3proxy/traffic-total.state}"
+    CUR_IN=$(nx_proxy_stats_bytes INPUT "3proxy_stats_in")
+    CUR_OUT=$(nx_proxy_stats_bytes OUTPUT "3proxy_stats_out")
+    [ -n "$CUR_IN" ] && [ -n "$CUR_OUT" ] || return 0
+    LAST_IN=""; LAST_OUT=""; TOT_IN=""; TOT_OUT=""
+    if [ -f "$STATE" ]; then
+        read -r LAST_IN LAST_OUT TOT_IN TOT_OUT < "$STATE" 2>/dev/null || true
+    fi
+    LAST_IN="${LAST_IN//[^0-9]/}"; LAST_OUT="${LAST_OUT//[^0-9]/}"
+    TOT_IN="${TOT_IN//[^0-9]/}"; TOT_OUT="${TOT_OUT//[^0-9]/}"
+    LAST_IN="${LAST_IN:-0}"; LAST_OUT="${LAST_OUT:-0}"
+    TOT_IN="${TOT_IN:-0}"; TOT_OUT="${TOT_OUT:-0}"
+    if [ "$CUR_IN" -ge "$LAST_IN" ] 2>/dev/null; then TOT_IN=$((TOT_IN + CUR_IN - LAST_IN)); else TOT_IN=$((TOT_IN + CUR_IN)); fi
+    if [ "$CUR_OUT" -ge "$LAST_OUT" ] 2>/dev/null; then TOT_OUT=$((TOT_OUT + CUR_OUT - LAST_OUT)); else TOT_OUT=$((TOT_OUT + CUR_OUT)); fi
+    printf '%s %s %s %s\n' "$CUR_IN" "$CUR_OUT" "$TOT_IN" "$TOT_OUT" > "${STATE}.tmp.$$" 2>/dev/null && mv -f "${STATE}.tmp.$$" "$STATE" 2>/dev/null || true
+    # Self-heal shadowing AFTER the snapshot, so a re-pin never
+    # destroys counts it has not yet recorded.
+    nx_pin_proxy_stats_rules "$PORT"
 }
 
 # Detect environment
@@ -4906,6 +5108,13 @@ apply_iptables() {
     # ── Step 12: Fragmented packets ──────────────────
     ipt_add INPUT -f -j DROP
     success "Fragmented packets: dropped"
+
+    # v3.17.0: re-pin the proxy counters on top BEFORE saving. Every
+    # -I insert above shadows the target-less stats rules (a plain
+    # insert-once counter silently undercounted in the field), and
+    # the saved order is the boot-restored order. No-op when the
+    # proxy is absent or the rules are already pinned.
+    nx_pin_proxy_stats_rules "$(nx_proxy_port_from_config)"
 
     # Save rules (static only - transient bans/f2b chains excluded, BUG-012)
     save_static_rules "$IPTABLES_SAVE_FILE"

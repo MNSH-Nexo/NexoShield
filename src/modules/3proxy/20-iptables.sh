@@ -116,9 +116,11 @@ setup_iptables_for_port() {
     # ── Step 4: Allow all remaining ──────────────────────
     iptables -A INPUT -p tcp --dport "$PORT" -j ACCEPT
 
-    # Stats counters
-    iptables -I INPUT  -p tcp --dport "$PORT" -m comment --comment "3proxy_stats_in"
-    iptables -I OUTPUT -p tcp --sport "$PORT" -m comment --comment "3proxy_stats_out"
+    # Stats counters, pinned at position 1 (v3.17.0: a target-less
+    # counting rule only counts packets that reach it - anything
+    # ACCEPTed above it shadows it, so the pin is re-asserted here
+    # and after every antiddos apply, never merely appended).
+    nx_pin_proxy_stats_rules "$PORT"
 
     # UFW / firewalld compat
     command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "active" && \

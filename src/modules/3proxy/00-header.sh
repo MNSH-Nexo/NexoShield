@@ -36,6 +36,7 @@ SERVICE_FILE="/etc/systemd/system/3proxy.service"
 # @include lib/server-ips.sh
 # @include lib/self-ips.sh
 # @include lib/install-binary.sh
+# @include lib/proxy-stats.sh
 
 get_server_ip() {
     curl -s -4 --max-time 5 https://api.ipify.org 2>/dev/null || \
