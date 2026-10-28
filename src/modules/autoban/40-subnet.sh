@@ -39,13 +39,31 @@ ban_subnet() {
     fi
     # Already banned? (state is the source of truth, Phase 1b)
     state_has_ip "$BANNED_LIST" "$cidr" && return 0
+    nx_state_lock
+    # nft overlap: members already individually banned would make the
+    # interval add fail (overlapping intervals). Supersede them
+    # first — kernel element + rule + state entry — so the range add
+    # succeeds. (Uses the daemon's own removal primitives, not
+    # nx_release_ban: that lives in antiddos.sh, a separate program.)
+    local _mip
+    while IFS=' ' read -r _mip _rest; do
+        [ -z "$_mip" ] && continue
+        case "$_mip" in */*) continue ;; esac
+        if ip_in_cidr "$_mip" "$cidr" 2>/dev/null; then
+            nx_ban_remove_fw "$_mip"
+            iptables -D INPUT -s "$_mip" -m comment --comment "auto-ban" -j DROP 2>/dev/null || true
+            state_del_ip "$BANNED_LIST" "$_mip"
+        fi
+    done < "$BANNED_LIST" 2>/dev/null || true
     # Phase 1c: subnet bans are short (guardrail vs shared-egress
     # collateral) and ride the same backend as single-IP bans.
     if ! nx_ban_apply "$cidr" $((${SUBNET_BAN_MINUTES:-60} * 60)) "subnet-ban"; then
         log " SUBNET BAN FAILED: $cidr - backend refused; state NOT recorded"
+        nx_state_unlock
         return 1
     fi
     echo "$cidr $(date +%s) $((${SUBNET_BAN_MINUTES:-60} * 60))" >> "$BANNED_LIST"
+    nx_state_unlock
     log " SUBNET BAN: $cidr | botnet distributed attack detected | unban: ${SUBNET_BAN_MINUTES:-60}min"
 }
 

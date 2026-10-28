@@ -3,7 +3,7 @@ exec bash <(tr -d '\r' < "$0" | tail -n +3) "$@"
 #!/bin/bash
 # ── GENERATED FILE ─ built by tools/build.py from src/ ─ do not edit directly; edit the sources and rebuild ──
 # ============================================================
-#  Proxy Manager - Auto Installer  v3.18.0
+#  Proxy Manager - Auto Installer  v3.19.0
 #  One file, one command, everything ready
 #
 #  Install:
@@ -28,7 +28,7 @@ exec bash <(tr -d '\r' < "$0" | tail -n +3) "$@"
 # ============================================================
 set -euo pipefail
 
-VERSION="3.18.0"
+VERSION="3.19.0"
 INSTALL_DIR="/opt/proxy-manager"
 BIN_LINK="/usr/local/bin/shield"
 LOG="/var/log/proxy-manager-install.log"
@@ -2716,7 +2716,7 @@ TARGET_FILE="/etc/sysctl.d/99-vpn-optimized.conf"
 SNAPSHOT_DIR="/var/lib/vpn-sysctl-snapshots"
 LOG_FILE="/var/log/vpn-sysctl-optimizer.log"
 LOCK_FILE="/var/run/vpn-sysctl.lock"
-SCRIPT_VERSION="3.18.0"
+SCRIPT_VERSION="3.19.0"
 
 [ "$EUID" -ne 0 ] && echo -e "${RED}Root required${NC}" && exit 1
 
@@ -3307,7 +3307,7 @@ cat > "$INSTALL_DIR/.proxy-menu.sh.nxnew" << 'MENU_SCRIPT'
 # SC2094 - atomic state writes via tmp-file + rename, which the
 # checker flags as same-file pipelines. Both classes were audited
 # site-by-site during the fix waves (docs/FIX-PLAN.md).
-VERSION="3.18.0"
+VERSION="3.19.0"
 INSTALL_DIR="/opt/proxy-manager"
 _BSRC="${BASH_SOURCE[0]:-}"
 if [ -n "$_BSRC" ] && [ "$_BSRC" != "/dev/stdin" ] && [[ "$_BSRC" != /dev/fd/* ]]; then
@@ -4604,7 +4604,7 @@ cat > "$INSTALL_DIR/.antiddos.sh.nxnew" << 'ANTIDDOS_SCRIPT'
 # checker flags as same-file pipelines. Both classes were audited
 # site-by-site during the fix waves (docs/FIX-PLAN.md).
 # ============================================================
-#  Anti-DDoS Protection Manager v3.18.0
+#  Anti-DDoS Protection Manager v3.19.0
 #
 #  Layers:
 #    1. Kernel (sysctl hardening + tight conntrack timeouts)
@@ -4628,7 +4628,7 @@ set -euo pipefail
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 CYAN='\033[0;36m'; WHITE='\033[1;37m'; DIM='\033[2m'; BOLD='\033[1m'; NC='\033[0m'
 
-SCRIPT_VERSION="3.18.0"
+SCRIPT_VERSION="3.19.0"
 LOG_FILE="/var/log/antiddos.log"
 STATE_FILE="/etc/antiddos/state.conf"
 BANNED_LIST="/etc/antiddos/banned.list"
@@ -5112,6 +5112,31 @@ nx_proxy_traffic_accum() {
     _rc=$?
     [ -n "${_lock_fd:-}" ] && exec {_lock_fd}>&- 2>/dev/null || true
     return "$_rc"
+}
+# Shared ban-state lock (L5): the admin release path must serialize
+# against the daemon's bans on the same lock path (see lib/state-lock.sh).
+NX_STATE_LOCK_FILE="${NX_STATE_LOCK_FILE:-/run/nexoshield/state.lock}"
+NX_STATE_LOCK_DEPTH=0
+nx_state_lock() {
+    if [ "${NX_STATE_LOCK_DEPTH:-0}" -gt 0 ]; then
+        NX_STATE_LOCK_DEPTH=$(( NX_STATE_LOCK_DEPTH + 1 ))
+        return 0
+    fi
+    mkdir -p /run/nexoshield 2>/dev/null || true
+    if command -v flock >/dev/null 2>&1; then
+        if exec 200>"$NX_STATE_LOCK_FILE" 2>/dev/null; then
+            flock -x -w 10 200 2>/dev/null || true
+        fi
+    fi
+    NX_STATE_LOCK_DEPTH=1
+}
+nx_state_unlock() {
+    [ "${NX_STATE_LOCK_DEPTH:-0}" -gt 0 ] || return 0
+    NX_STATE_LOCK_DEPTH=$(( NX_STATE_LOCK_DEPTH - 1 ))
+    if [ "$NX_STATE_LOCK_DEPTH" -eq 0 ]; then
+        flock -u 200 2>/dev/null || true
+        exec 200>&- 2>/dev/null || true
+    fi
 }
 
 # Detect environment
@@ -6684,6 +6709,32 @@ iptables() { command iptables -w 5 "$@"; }
 
 log() { echo "[$(date '+%H:%M:%S')] $*" | tee -a "$LOG"; }
 
+# Shared ban-state lock (L5): included here so the daemon and every
+# state helper serialize on the same path (see src/lib/state-lock.sh).
+NX_STATE_LOCK_FILE="${NX_STATE_LOCK_FILE:-/run/nexoshield/state.lock}"
+NX_STATE_LOCK_DEPTH=0
+nx_state_lock() {
+    if [ "${NX_STATE_LOCK_DEPTH:-0}" -gt 0 ]; then
+        NX_STATE_LOCK_DEPTH=$(( NX_STATE_LOCK_DEPTH + 1 ))
+        return 0
+    fi
+    mkdir -p /run/nexoshield 2>/dev/null || true
+    if command -v flock >/dev/null 2>&1; then
+        if exec 200>"$NX_STATE_LOCK_FILE" 2>/dev/null; then
+            flock -x -w 10 200 2>/dev/null || true
+        fi
+    fi
+    NX_STATE_LOCK_DEPTH=1
+}
+nx_state_unlock() {
+    [ "${NX_STATE_LOCK_DEPTH:-0}" -gt 0 ] || return 0
+    NX_STATE_LOCK_DEPTH=$(( NX_STATE_LOCK_DEPTH - 1 ))
+    if [ "$NX_STATE_LOCK_DEPTH" -eq 0 ]; then
+        flock -u 200 2>/dev/null || true
+        exec 200>&- 2>/dev/null || true
+    fi
+}
+
 # ── Exact state-file matching (BUG-003) ─────────────
 # State files are "IP field field..." per line. The ONLY correct match
 # is field 1 == IP, exactly. The old grep -qF "$ip" / sed "/$ip/d"
@@ -6697,9 +6748,13 @@ state_get_field() {  # <file> <ip> <field#> -> prints the field (or empty)
     [ -f "$1" ] || return 0
     awk -v x="$2" -v n="$3" '$1==x{print $n; exit}' "$1" 2>/dev/null
 }
-state_del_ip() {  # <file> <ip>  (atomic rewrite)
+state_del_ip() {  # <file> <ip>  (atomic rewrite, state-locked)
     [ -f "$1" ] || return 0
+    nx_state_lock
     awk -v x="$2" '$1!=x' "$1" > "$1.tmp.$$" 2>/dev/null && mv "$1.tmp.$$" "$1"
+    local _rc=$?
+    nx_state_unlock
+    return "$_rc"
 }
 
 # Convert IP to integer for CIDR comparison
@@ -7215,7 +7270,21 @@ ban_ip() {
         return 1
     fi
     is_exempt "$ip" && return 0
-    state_has_ip "$BANNED_LIST" "$ip" && return 0
+    # L5: the has-check + backend + append below must be atomic
+    # against a concurrent nx_release_ban rewrite, or the ban lands
+    # in the kernel but is lost from state (or duplicated).
+    nx_state_lock
+    if state_has_ip "$BANNED_LIST" "$ip"; then nx_state_unlock; return 0; fi
+    # Already blocked by a range ban? A covering /24 in state means
+    # the kernel already drops this IP; a single-IP element would
+    # fail on nft (interval overlap) and duplicate state. Treat as
+    # done — the range entry governs its expiry.
+    local _entry
+    while IFS=' ' read -r _entry _rest; do
+        case "$_entry" in
+            */*) ip_in_cidr "$ip" "$_entry" 2>/dev/null && { nx_state_unlock; return 0; } ;;
+        esac
+    done < "$BANNED_LIST" 2>/dev/null || true
     # Phase 1c: progressive duration (explicit $2 wins - manual paths).
     local DUR="${2:-$(rep_ban_duration_secs "$ip")}"
     local UNBAN_TIME
@@ -7225,9 +7294,11 @@ ban_ip() {
     # the next cycle instead of sitting in state while unenforced.
     if ! nx_ban_apply "$ip" "$DUR" "auto-ban"; then
         log " BAN FAILED: $ip - backend refused; state NOT recorded"
+        nx_state_unlock
         return 1
     fi
     echo "$ip $(date +%s) $DUR" >> "$BANNED_LIST"
+    nx_state_unlock
     # Remove ONLY this IP's throttle/hard-throttle tc filter.
     # NOTE: never run 'tc filter del dev "$IF" parent 1:' here — that deletes
     # EVERY filter including the Cloudflare + server-own whitelist, which would
@@ -7293,15 +7364,20 @@ ban_ip6() {
             return 1
         fi
     done
-    state_has_ip "$BANNED_LIST" "$ip" && return 0
+    # L5: same lock as ban_ip — the has-check + backend + append
+    # must be atomic against a concurrent release rewrite.
+    nx_state_lock
+    if state_has_ip "$BANNED_LIST" "$ip"; then nx_state_unlock; return 0; fi
     # M5: same refusal as ban_ip - no state for a refused ban. The
     # throttle cleanup runs only after a successful ban (as in
     # ban_ip): a failed ban must not also strip the throttle.
     if ! nx_ban_apply "$ip" "$DUR" "auto-ban"; then
         log " BAN FAILED (v6): $ip - backend refused; state NOT recorded"
+        nx_state_unlock
         return 1
     fi
     echo "$ip $(date +%s) $DUR" >> "$BANNED_LIST"
+    nx_state_unlock
     local _PRIO
     _PRIO=$(state_get_field "$THROTTLE_LIST" "$ip" 2)
     [ -n "$_PRIO" ] && tc filter del dev "$IF" parent 1: protocol ip6 prio "$_PRIO" 2>/dev/null || true
@@ -7956,10 +8032,19 @@ update_score() {
                 nx_hard_throttle "$ip"
                 log " GATE: $ip | score $REP_SCORE - ban deferred (host not stressed) -> hard throttle"
             else
-                log " REP-BAN: $ip | score $REP_SCORE (below $SCORE_BAN) -> ban (progressive)"
+                # M5 applied to strikes: ban_ip already refuses state
+                # for a refused ban, so a strike/probation must only
+                # follow a ban that actually landed — otherwise a
+                # degraded backend inflates strikes while the IP is
+                # still unblocked, and the loop retries without the
+                # phantom record.
                 nx_throttle "$ip"
-                nx_ban "$ip"
-                rep_on_ban "$ip"
+                if nx_ban "$ip"; then
+                    log " REP-BAN: $ip | score $REP_SCORE (below $SCORE_BAN) -> ban (progressive)"
+                    rep_on_ban "$ip"
+                else
+                    log " REP-BAN FAILED: $ip | score $REP_SCORE - ban refused, no strike recorded (retry next cycle)"
+                fi
             fi
         fi
     elif [ "$REP_SCORE" -lt "$SCORE_HARD" ]; then
@@ -8017,13 +8102,31 @@ ban_subnet() {
     fi
     # Already banned? (state is the source of truth, Phase 1b)
     state_has_ip "$BANNED_LIST" "$cidr" && return 0
+    nx_state_lock
+    # nft overlap: members already individually banned would make the
+    # interval add fail (overlapping intervals). Supersede them
+    # first — kernel element + rule + state entry — so the range add
+    # succeeds. (Uses the daemon's own removal primitives, not
+    # nx_release_ban: that lives in antiddos.sh, a separate program.)
+    local _mip
+    while IFS=' ' read -r _mip _rest; do
+        [ -z "$_mip" ] && continue
+        case "$_mip" in */*) continue ;; esac
+        if ip_in_cidr "$_mip" "$cidr" 2>/dev/null; then
+            nx_ban_remove_fw "$_mip"
+            iptables -D INPUT -s "$_mip" -m comment --comment "auto-ban" -j DROP 2>/dev/null || true
+            state_del_ip "$BANNED_LIST" "$_mip"
+        fi
+    done < "$BANNED_LIST" 2>/dev/null || true
     # Phase 1c: subnet bans are short (guardrail vs shared-egress
     # collateral) and ride the same backend as single-IP bans.
     if ! nx_ban_apply "$cidr" $((${SUBNET_BAN_MINUTES:-60} * 60)) "subnet-ban"; then
         log " SUBNET BAN FAILED: $cidr - backend refused; state NOT recorded"
+        nx_state_unlock
         return 1
     fi
     echo "$cidr $(date +%s) $((${SUBNET_BAN_MINUTES:-60} * 60))" >> "$BANNED_LIST"
+    nx_state_unlock
     log " SUBNET BAN: $cidr | botnet distributed attack detected | unban: ${SUBNET_BAN_MINUTES:-60}min"
 }
 
@@ -8201,6 +8304,7 @@ reapply_throttles
 reconcile_bans
 
 CYCLE=0
+NX_WIN_OFF=0
 while true; do
     nx_maybe_reload_scoring_config
     nx_update_stress
@@ -8222,19 +8326,29 @@ while true; do
     # sample also counted TIME-WAIT/CLOSING states), and flows whose
     # LOCAL port is ephemeral (>=32768) are the server's own OUTBOUND
     # connections - the peer of an outbound flow is not an attacker.
+    # Exception (high-port fix): a high local port that something
+    # LISTENS on is a real service (e.g. a panel on 40000), not an
+    # ephemeral port — its peers are scored like any other.
+    # No head truncation here (top-100 fix): CONN_COUNT/SYN_COUNT
+    # stay complete for the subnet section and the sweeps; the
+    # per-peer scoring loop windows the ordered list instead.
+    LISTEN_PORTS=$(ss -tlnH 2>/dev/null | awk '{ split($4, L, ":"); print L[length(L)] }' | sort -u | paste -sd, - 2>/dev/null || true)
     declare -A CONN_COUNT
+    PEER_ORDER=()
     SS_OUT=$({ ss -tnH state established 2>/dev/null; ss -tnH state syn-recv 2>/dev/null; } | \
-        awk '{ split($4, L, ":"); lp = L[length(L)];
+        awk -v listen="$LISTEN_PORTS" 'BEGIN { n = split(listen, LP, ","); for (i = 1; i <= n; i++) listen_set[LP[i]] = 1 }
+               { split($4, L, ":"); lp = L[length(L)];
                if (lp !~ /^[0-9]+$/) next;
-               if (lp >= 32768) next;
+               if (lp >= 32768 && !(lp in listen_set)) next;
                print $5 }' | \
         nx_extract_peer_ips | \
-        sort | uniq -c | sort -rn | head -100 || true)
+        sort | uniq -c | sort -rn || true)
     if [ -n "$SS_OUT" ]; then
         while IFS= read -r line; do
             CNT=$(echo "$line" | awk '{print $1}')
             IP=$(echo "$line" | awk '{print $2}')
             [ -n "$IP" ] && [ -n "$CNT" ] && CONN_COUNT["$IP"]="$CNT"
+            [ -n "$IP" ] && PEER_ORDER+=("$IP")
         done <<< "$SS_OUT"
     fi
     # SYN-RECV per IP (scoring v2): half-open sockets are the SYN-flood
@@ -8242,12 +8356,13 @@ while true; do
     # so scoring could not tell a flood from honest load.
     declare -A SYN_COUNT
     SS_SYN=$(ss -tnH state syn-recv 2>/dev/null | \
-        awk '{ split($4, L, ":"); lp = L[length(L)];
+        awk -v listen="$LISTEN_PORTS" 'BEGIN { n = split(listen, LP, ","); for (i = 1; i <= n; i++) listen_set[LP[i]] = 1 }
+               { split($4, L, ":"); lp = L[length(L)];
                if (lp !~ /^[0-9]+$/) next;
-               if (lp >= 32768) next;
+               if (lp >= 32768 && !(lp in listen_set)) next;
                print $5 }' | \
         nx_extract_peer_ips | \
-        sort | uniq -c | sort -rn | head -100 || true)
+        sort | uniq -c | sort -rn || true)
     if [ -n "$SS_SYN" ]; then
         while IFS= read -r line; do
             CNT=$(echo "$line" | awk '{print $1}')
@@ -8261,8 +8376,30 @@ while true; do
     nx_load_event_counters
     nx_update_adaptive
 
-    # Process results — based on real connection count, not packets
-    for ip in "${!CONN_COUNT[@]}"; do
+    # Process results — based on real connection count, not packets.
+    # Rotating window (top-100 hole fix): at most 100 peers are
+    # scored per cycle (cycle-time bound), but the window ADVANCES
+    # each cycle, so every above-threshold peer is scored within
+    # ceil(N/100) cycles instead of peers ranked 101+ never being
+    # scored. Peers are count-ordered, so the heaviest are always in
+    # the first window (instant bans never wait); the delay only
+    # touches the lightest above-threshold peers, which the old code
+    # ignored forever. CONN_COUNT stays complete: the subnet section
+    # and the watch/throttle sweeps still see every peer.
+    _WIN_TOTAL=${#PEER_ORDER[@]}
+    WIN_PEERS=()
+    if [ "$_WIN_TOTAL" -le 100 ]; then
+        WIN_PEERS=("${PEER_ORDER[@]}")
+    else
+        [ "$NX_WIN_OFF" -ge "$_WIN_TOTAL" ] && NX_WIN_OFF=0
+        _WIN_I=0
+        while [ "$_WIN_I" -lt 100 ]; do
+            WIN_PEERS+=("${PEER_ORDER[$(( (NX_WIN_OFF + _WIN_I) % _WIN_TOTAL ))]}")
+            _WIN_I=$((_WIN_I + 1))
+        done
+        NX_WIN_OFF=$(( (NX_WIN_OFF + 100) % _WIN_TOTAL ))
+    fi
+    for ip in "${WIN_PEERS[@]}"; do
         count="${CONN_COUNT[$ip]}"
         [ "${count:-0}" -lt "${EFF_CONN_THRESHOLD:-$CONN_THRESHOLD}" ] && continue
 
@@ -8291,10 +8428,13 @@ while true; do
             if ! state_has_ip "$THROTTLE_LIST" "$ip"; then
                 nx_throttle "$ip"
             fi
-            nx_ban "$ip"
-            rep_on_ban "$ip"
-            state_del_ip "$WATCH_LIST" "$ip"
-            log " INSTANT BAN: $ip | ${count} active connections (>=${BAN_CONN_THRESHOLD})"
+            # M5 for strikes: only a ban that actually landed earns a
+            # strike and the log line; a refused ban retries next cycle.
+            if nx_ban "$ip"; then
+                rep_on_ban "$ip"
+                state_del_ip "$WATCH_LIST" "$ip"
+                log " INSTANT BAN: $ip | ${count} active connections (>=${BAN_CONN_THRESHOLD})"
+            fi
             continue
         fi
 
@@ -8309,10 +8449,13 @@ while true; do
                 # Watched for full period and still high
                 if state_has_ip "$THROTTLE_LIST" "$ip"; then
                     # Already throttled — now ban (ban_ip cleans the
-                    # throttle filter + its state entry itself)
-                    nx_ban "$ip"
-                    rep_on_ban "$ip"
-                    state_del_ip "$WATCH_LIST" "$ip"
+                    # throttle filter + its state entry itself). On a
+                    # refused ban the watch entry is KEPT, so the next
+                    # cycle retries immediately instead of re-watching.
+                    if nx_ban "$ip"; then
+                        rep_on_ban "$ip"
+                        state_del_ip "$WATCH_LIST" "$ip"
+                    fi
                 else
                     # Not yet throttled — throttle now
                     nx_throttle "$ip"
@@ -8441,7 +8584,7 @@ while true; do
     # Recovery for quiet IPs (D3): hot IPs were handled by update_score.
     reputation_sweep
 
-    unset CONN_COUNT SUBNET_COUNT SYN_COUNT
+    unset CONN_COUNT SUBNET_COUNT SUBNET_OFFENDERS SYN_COUNT
 done
 AUTOBAN_EOF
 
@@ -10512,6 +10655,10 @@ exempt_check() {
 # logic in the menu program (it cannot call this file).
 nx_release_ban() {
     local _ip="$1" _removed=0 _tf _prio _if _j
+    # L5: the whole release (kernel deletes + file rewrites) runs
+    # under the shared state lock, so a concurrent daemon ban cannot
+    # land between the read and the rewrite and get lost.
+    nx_state_lock
     if command -v nft >/dev/null 2>&1; then
         case "$_ip" in
             *:*) nft delete element inet nexoshield ban6 "{ $_ip }" >/dev/null 2>&1 && _removed=1 || true ;;
@@ -10538,18 +10685,19 @@ nx_release_ban() {
             _if=$(ip route show default 2>/dev/null | awk '/default/{print $5}' | head -1)
             [ -n "$_if" ] && tc filter del dev "$_if" parent 1: prio "$_prio" 2>/dev/null || true
         fi
-        awk -v x="$_ip" '$1!=x' "$_tf" > "$_tf.tmp" 2>/dev/null && mv "$_tf.tmp" "$_tf"
+        awk -v x="$_ip" '$1!=x' "$_tf" > "$_tf.tmp.$$" 2>/dev/null && mv "$_tf.tmp.$$" "$_tf"
     done
     if [ -f "$BANNED_LIST" ]; then
         awk -v x="$_ip" '$1==x{found=1} END{exit !found}' "$BANNED_LIST" 2>/dev/null && _removed=1 || true
-        awk -v x="$_ip" '$1!=x' "$BANNED_LIST" > "$BANNED_LIST.tmp" 2>/dev/null && \
-            mv "$BANNED_LIST.tmp" "$BANNED_LIST"
+        awk -v x="$_ip" '$1!=x' "$BANNED_LIST" > "$BANNED_LIST.tmp.$$" 2>/dev/null && \
+            mv "$BANNED_LIST.tmp.$$" "$BANNED_LIST"
     fi
     fail2ban-client status 2>/dev/null | grep "Jail list" | \
         sed 's/.*://;s/,/\n/g' | tr -d ' ' | while read -r _j; do
         [ -z "$_j" ] && continue
         fail2ban-client set "$_j" unbanip "$_ip" 2>/dev/null || true
     done
+    nx_state_unlock
     [ "$_removed" -eq 1 ]
 }
 

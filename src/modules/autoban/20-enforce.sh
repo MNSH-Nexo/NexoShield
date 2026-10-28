@@ -299,7 +299,21 @@ ban_ip() {
         return 1
     fi
     is_exempt "$ip" && return 0
-    state_has_ip "$BANNED_LIST" "$ip" && return 0
+    # L5: the has-check + backend + append below must be atomic
+    # against a concurrent nx_release_ban rewrite, or the ban lands
+    # in the kernel but is lost from state (or duplicated).
+    nx_state_lock
+    if state_has_ip "$BANNED_LIST" "$ip"; then nx_state_unlock; return 0; fi
+    # Already blocked by a range ban? A covering /24 in state means
+    # the kernel already drops this IP; a single-IP element would
+    # fail on nft (interval overlap) and duplicate state. Treat as
+    # done — the range entry governs its expiry.
+    local _entry
+    while IFS=' ' read -r _entry _rest; do
+        case "$_entry" in
+            */*) ip_in_cidr "$ip" "$_entry" 2>/dev/null && { nx_state_unlock; return 0; } ;;
+        esac
+    done < "$BANNED_LIST" 2>/dev/null || true
     # Phase 1c: progressive duration (explicit $2 wins - manual paths).
     local DUR="${2:-$(rep_ban_duration_secs "$ip")}"
     local UNBAN_TIME
@@ -309,9 +323,11 @@ ban_ip() {
     # the next cycle instead of sitting in state while unenforced.
     if ! nx_ban_apply "$ip" "$DUR" "auto-ban"; then
         log " BAN FAILED: $ip - backend refused; state NOT recorded"
+        nx_state_unlock
         return 1
     fi
     echo "$ip $(date +%s) $DUR" >> "$BANNED_LIST"
+    nx_state_unlock
     # Remove ONLY this IP's throttle/hard-throttle tc filter.
     # NOTE: never run 'tc filter del dev "$IF" parent 1:' here — that deletes
     # EVERY filter including the Cloudflare + server-own whitelist, which would
@@ -377,15 +393,20 @@ ban_ip6() {
             return 1
         fi
     done
-    state_has_ip "$BANNED_LIST" "$ip" && return 0
+    # L5: same lock as ban_ip — the has-check + backend + append
+    # must be atomic against a concurrent release rewrite.
+    nx_state_lock
+    if state_has_ip "$BANNED_LIST" "$ip"; then nx_state_unlock; return 0; fi
     # M5: same refusal as ban_ip - no state for a refused ban. The
     # throttle cleanup runs only after a successful ban (as in
     # ban_ip): a failed ban must not also strip the throttle.
     if ! nx_ban_apply "$ip" "$DUR" "auto-ban"; then
         log " BAN FAILED (v6): $ip - backend refused; state NOT recorded"
+        nx_state_unlock
         return 1
     fi
     echo "$ip $(date +%s) $DUR" >> "$BANNED_LIST"
+    nx_state_unlock
     local _PRIO
     _PRIO=$(state_get_field "$THROTTLE_LIST" "$ip" 2)
     [ -n "$_PRIO" ] && tc filter del dev "$IF" parent 1: protocol ip6 prio "$_PRIO" 2>/dev/null || true

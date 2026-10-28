@@ -151,6 +151,7 @@ reapply_throttles
 reconcile_bans
 
 CYCLE=0
+NX_WIN_OFF=0
 while true; do
     nx_maybe_reload_scoring_config
     nx_update_stress
@@ -172,19 +173,29 @@ while true; do
     # sample also counted TIME-WAIT/CLOSING states), and flows whose
     # LOCAL port is ephemeral (>=32768) are the server's own OUTBOUND
     # connections - the peer of an outbound flow is not an attacker.
+    # Exception (high-port fix): a high local port that something
+    # LISTENS on is a real service (e.g. a panel on 40000), not an
+    # ephemeral port — its peers are scored like any other.
+    # No head truncation here (top-100 fix): CONN_COUNT/SYN_COUNT
+    # stay complete for the subnet section and the sweeps; the
+    # per-peer scoring loop windows the ordered list instead.
+    LISTEN_PORTS=$(ss -tlnH 2>/dev/null | awk '{ split($4, L, ":"); print L[length(L)] }' | sort -u | paste -sd, - 2>/dev/null || true)
     declare -A CONN_COUNT
+    PEER_ORDER=()
     SS_OUT=$({ ss -tnH state established 2>/dev/null; ss -tnH state syn-recv 2>/dev/null; } | \
-        awk '{ split($4, L, ":"); lp = L[length(L)];
+        awk -v listen="$LISTEN_PORTS" 'BEGIN { n = split(listen, LP, ","); for (i = 1; i <= n; i++) listen_set[LP[i]] = 1 }
+               { split($4, L, ":"); lp = L[length(L)];
                if (lp !~ /^[0-9]+$/) next;
-               if (lp >= 32768) next;
+               if (lp >= 32768 && !(lp in listen_set)) next;
                print $5 }' | \
         nx_extract_peer_ips | \
-        sort | uniq -c | sort -rn | head -100 || true)
+        sort | uniq -c | sort -rn || true)
     if [ -n "$SS_OUT" ]; then
         while IFS= read -r line; do
             CNT=$(echo "$line" | awk '{print $1}')
             IP=$(echo "$line" | awk '{print $2}')
             [ -n "$IP" ] && [ -n "$CNT" ] && CONN_COUNT["$IP"]="$CNT"
+            [ -n "$IP" ] && PEER_ORDER+=("$IP")
         done <<< "$SS_OUT"
     fi
     # SYN-RECV per IP (scoring v2): half-open sockets are the SYN-flood
@@ -192,12 +203,13 @@ while true; do
     # so scoring could not tell a flood from honest load.
     declare -A SYN_COUNT
     SS_SYN=$(ss -tnH state syn-recv 2>/dev/null | \
-        awk '{ split($4, L, ":"); lp = L[length(L)];
+        awk -v listen="$LISTEN_PORTS" 'BEGIN { n = split(listen, LP, ","); for (i = 1; i <= n; i++) listen_set[LP[i]] = 1 }
+               { split($4, L, ":"); lp = L[length(L)];
                if (lp !~ /^[0-9]+$/) next;
-               if (lp >= 32768) next;
+               if (lp >= 32768 && !(lp in listen_set)) next;
                print $5 }' | \
         nx_extract_peer_ips | \
-        sort | uniq -c | sort -rn | head -100 || true)
+        sort | uniq -c | sort -rn || true)
     if [ -n "$SS_SYN" ]; then
         while IFS= read -r line; do
             CNT=$(echo "$line" | awk '{print $1}')
@@ -211,8 +223,30 @@ while true; do
     nx_load_event_counters
     nx_update_adaptive
 
-    # Process results — based on real connection count, not packets
-    for ip in "${!CONN_COUNT[@]}"; do
+    # Process results — based on real connection count, not packets.
+    # Rotating window (top-100 hole fix): at most 100 peers are
+    # scored per cycle (cycle-time bound), but the window ADVANCES
+    # each cycle, so every above-threshold peer is scored within
+    # ceil(N/100) cycles instead of peers ranked 101+ never being
+    # scored. Peers are count-ordered, so the heaviest are always in
+    # the first window (instant bans never wait); the delay only
+    # touches the lightest above-threshold peers, which the old code
+    # ignored forever. CONN_COUNT stays complete: the subnet section
+    # and the watch/throttle sweeps still see every peer.
+    _WIN_TOTAL=${#PEER_ORDER[@]}
+    WIN_PEERS=()
+    if [ "$_WIN_TOTAL" -le 100 ]; then
+        WIN_PEERS=("${PEER_ORDER[@]}")
+    else
+        [ "$NX_WIN_OFF" -ge "$_WIN_TOTAL" ] && NX_WIN_OFF=0
+        _WIN_I=0
+        while [ "$_WIN_I" -lt 100 ]; do
+            WIN_PEERS+=("${PEER_ORDER[$(( (NX_WIN_OFF + _WIN_I) % _WIN_TOTAL ))]}")
+            _WIN_I=$((_WIN_I + 1))
+        done
+        NX_WIN_OFF=$(( (NX_WIN_OFF + 100) % _WIN_TOTAL ))
+    fi
+    for ip in "${WIN_PEERS[@]}"; do
         count="${CONN_COUNT[$ip]}"
         [ "${count:-0}" -lt "${EFF_CONN_THRESHOLD:-$CONN_THRESHOLD}" ] && continue
 
@@ -241,10 +275,13 @@ while true; do
             if ! state_has_ip "$THROTTLE_LIST" "$ip"; then
                 nx_throttle "$ip"
             fi
-            nx_ban "$ip"
-            rep_on_ban "$ip"
-            state_del_ip "$WATCH_LIST" "$ip"
-            log " INSTANT BAN: $ip | ${count} active connections (>=${BAN_CONN_THRESHOLD})"
+            # M5 for strikes: only a ban that actually landed earns a
+            # strike and the log line; a refused ban retries next cycle.
+            if nx_ban "$ip"; then
+                rep_on_ban "$ip"
+                state_del_ip "$WATCH_LIST" "$ip"
+                log " INSTANT BAN: $ip | ${count} active connections (>=${BAN_CONN_THRESHOLD})"
+            fi
             continue
         fi
 
@@ -259,10 +296,13 @@ while true; do
                 # Watched for full period and still high
                 if state_has_ip "$THROTTLE_LIST" "$ip"; then
                     # Already throttled — now ban (ban_ip cleans the
-                    # throttle filter + its state entry itself)
-                    nx_ban "$ip"
-                    rep_on_ban "$ip"
-                    state_del_ip "$WATCH_LIST" "$ip"
+                    # throttle filter + its state entry itself). On a
+                    # refused ban the watch entry is KEPT, so the next
+                    # cycle retries immediately instead of re-watching.
+                    if nx_ban "$ip"; then
+                        rep_on_ban "$ip"
+                        state_del_ip "$WATCH_LIST" "$ip"
+                    fi
                 else
                     # Not yet throttled — throttle now
                     nx_throttle "$ip"
@@ -391,5 +431,5 @@ while true; do
     # Recovery for quiet IPs (D3): hot IPs were handled by update_score.
     reputation_sweep
 
-    unset CONN_COUNT SUBNET_COUNT SYN_COUNT
+    unset CONN_COUNT SUBNET_COUNT SUBNET_OFFENDERS SYN_COUNT
 done

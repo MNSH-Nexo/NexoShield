@@ -90,5 +90,8 @@ sep()     { echo -e "${CYAN}═════════════════�
 # @include lib/config.sh
 # @include lib/install-binary.sh
 # @include lib/proxy-stats.sh
+# Shared ban-state lock (L5): the admin release path must serialize
+# against the daemon's bans on the same lock path (see lib/state-lock.sh).
+# @include lib/state-lock.sh
 
 # Detect environment

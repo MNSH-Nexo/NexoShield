@@ -275,6 +275,10 @@ exempt_check() {
 # logic in the menu program (it cannot call this file).
 nx_release_ban() {
     local _ip="$1" _removed=0 _tf _prio _if _j
+    # L5: the whole release (kernel deletes + file rewrites) runs
+    # under the shared state lock, so a concurrent daemon ban cannot
+    # land between the read and the rewrite and get lost.
+    nx_state_lock
     if command -v nft >/dev/null 2>&1; then
         case "$_ip" in
             *:*) nft delete element inet nexoshield ban6 "{ $_ip }" >/dev/null 2>&1 && _removed=1 || true ;;
@@ -301,18 +305,19 @@ nx_release_ban() {
             _if=$(ip route show default 2>/dev/null | awk '/default/{print $5}' | head -1)
             [ -n "$_if" ] && tc filter del dev "$_if" parent 1: prio "$_prio" 2>/dev/null || true
         fi
-        awk -v x="$_ip" '$1!=x' "$_tf" > "$_tf.tmp" 2>/dev/null && mv "$_tf.tmp" "$_tf"
+        awk -v x="$_ip" '$1!=x' "$_tf" > "$_tf.tmp.$$" 2>/dev/null && mv "$_tf.tmp.$$" "$_tf"
     done
     if [ -f "$BANNED_LIST" ]; then
         awk -v x="$_ip" '$1==x{found=1} END{exit !found}' "$BANNED_LIST" 2>/dev/null && _removed=1 || true
-        awk -v x="$_ip" '$1!=x' "$BANNED_LIST" > "$BANNED_LIST.tmp" 2>/dev/null && \
-            mv "$BANNED_LIST.tmp" "$BANNED_LIST"
+        awk -v x="$_ip" '$1!=x' "$BANNED_LIST" > "$BANNED_LIST.tmp.$$" 2>/dev/null && \
+            mv "$BANNED_LIST.tmp.$$" "$BANNED_LIST"
     fi
     fail2ban-client status 2>/dev/null | grep "Jail list" | \
         sed 's/.*://;s/,/\n/g' | tr -d ' ' | while read -r _j; do
         [ -z "$_j" ] && continue
         fail2ban-client set "$_j" unbanip "$_ip" 2>/dev/null || true
     done
+    nx_state_unlock
     [ "$_removed" -eq 1 ]
 }
 

@@ -10,6 +10,10 @@ iptables() { command iptables -w 5 "$@"; }
 
 log() { echo "[$(date '+%H:%M:%S')] $*" | tee -a "$LOG"; }
 
+# Shared ban-state lock (L5): included here so the daemon and every
+# state helper serialize on the same path (see src/lib/state-lock.sh).
+# @include lib/state-lock.sh
+
 # ── Exact state-file matching (BUG-003) ─────────────
 # State files are "IP field field..." per line. The ONLY correct match
 # is field 1 == IP, exactly. The old grep -qF "$ip" / sed "/$ip/d"
@@ -23,9 +27,13 @@ state_get_field() {  # <file> <ip> <field#> -> prints the field (or empty)
     [ -f "$1" ] || return 0
     awk -v x="$2" -v n="$3" '$1==x{print $n; exit}' "$1" 2>/dev/null
 }
-state_del_ip() {  # <file> <ip>  (atomic rewrite)
+state_del_ip() {  # <file> <ip>  (atomic rewrite, state-locked)
     [ -f "$1" ] || return 0
+    nx_state_lock
     awk -v x="$2" '$1!=x' "$1" > "$1.tmp.$$" 2>/dev/null && mv "$1.tmp.$$" "$1"
+    local _rc=$?
+    nx_state_unlock
+    return "$_rc"
 }
 
 # Convert IP to integer for CIDR comparison

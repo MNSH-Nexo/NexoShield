@@ -310,10 +310,19 @@ update_score() {
                 nx_hard_throttle "$ip"
                 log " GATE: $ip | score $REP_SCORE - ban deferred (host not stressed) -> hard throttle"
             else
-                log " REP-BAN: $ip | score $REP_SCORE (below $SCORE_BAN) -> ban (progressive)"
+                # M5 applied to strikes: ban_ip already refuses state
+                # for a refused ban, so a strike/probation must only
+                # follow a ban that actually landed — otherwise a
+                # degraded backend inflates strikes while the IP is
+                # still unblocked, and the loop retries without the
+                # phantom record.
                 nx_throttle "$ip"
-                nx_ban "$ip"
-                rep_on_ban "$ip"
+                if nx_ban "$ip"; then
+                    log " REP-BAN: $ip | score $REP_SCORE (below $SCORE_BAN) -> ban (progressive)"
+                    rep_on_ban "$ip"
+                else
+                    log " REP-BAN FAILED: $ip | score $REP_SCORE - ban refused, no strike recorded (retry next cycle)"
+                fi
             fi
         fi
     elif [ "$REP_SCORE" -lt "$SCORE_HARD" ]; then

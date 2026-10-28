@@ -21,7 +21,16 @@ pass=0; fail=0
 ok()  { pass=$((pass+1)); }
 bad() { fail=$((fail+1)); echo "  FAIL: $*"; }
 
-W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
+W=$(mktemp -d)
+# The menu under test creates /etc/antiddos on its Install path
+# (correct on a real install, pollution on a sandbox): without
+# cleanup, a full gate run would break the NEXT run's live-install
+# guards (audit-fixes, fix-round refuse when /etc/antiddos exists).
+# Remove ONLY what this suite created: if the dir pre-existed
+# (a live install), it is left untouched.
+ANTIDDOS_PREEXIST=0; [ -e /etc/antiddos ] && ANTIDDOS_PREEXIST=1
+cleanup() { rm -rf "$W"; [ "$ANTIDDOS_PREEXIST" = "0" ] && rm -rf /etc/antiddos; }
+trap cleanup EXIT
 python3 "$ROOT/tools/build.py" --emit-modules "$W/mod" >/dev/null 2>&1 || { echo "  FAIL: emit"; exit 1; }
 
 # ── Stubs ────────────────────────────────────────────────────
