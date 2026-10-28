@@ -149,10 +149,11 @@ apply_iptables() {
     fi
 
     # ── Step 4: Server own IPs → ACCEPT ──────────────
-    # E-4: get_server_ips is display-grade (public only) - private and
-    # secondary self addresses were missing here, so traffic from the
-    # server's own private IP still hit the flood limits. Enforcement
-    # uses the exhaustive list_self_ips (loopback excluded, see above).
+    # E-4: a display-grade public-only lookup was used here before -
+    # private and secondary self addresses were missing, so traffic
+    # from the server's own private IP still hit the flood limits.
+    # Enforcement uses the exhaustive list_self_ips (loopback
+    # excluded, see above).
     while IFS= read -r SIP; do
         [ -z "$SIP" ] && continue
         ipt_ins INPUT -s "$SIP/32" -m comment --comment "self_whitelist" -j ACCEPT
@@ -305,7 +306,10 @@ apply_iptables() {
     if [ "$CONNLIMIT_OK" -eq 1 ]; then
         # HTTP/HTTPS ports — lower connlimit
         for HTTP_PORT in 80 443 8080 8443; do
-            ss -tuln 2>/dev/null | grep -q ":${HTTP_PORT} " || continue
+            # NIT-2: TCP listeners only (-tln) - a UDP listener on
+            # the same number (e.g. QUIC on 443) must not trigger a
+            # TCP connlimit rule for that port.
+            ss -tln 2>/dev/null | grep -q ":${HTTP_PORT} " || continue
             ipt_add INPUT -p tcp --dport "$HTTP_PORT" \
                 -m connlimit --connlimit-above "$CONN_LIMIT_PER_IP" \
                 --connlimit-mask 32 -m comment --comment "nx_connlimit" \
@@ -393,6 +397,13 @@ apply_iptables() {
     # insert-once counter silently undercounted in the field), and
     # the saved order is the boot-restored order. No-op when the
     # proxy is absent or the rules are already pinned.
+    # Snapshot BEFORE the re-pin (MED-1): moving a shadowed rule
+    # deletes and recreates it, zeroing its counter, so traffic since
+    # the last 5-minute accumulator tick would otherwise be lost on
+    # every antiddos apply that finds the rules shadowed. The pin
+    # below is kept: the accumulator returns early (and does not
+    # pin) when the rules are missing, and the pin creates them.
+    nx_proxy_traffic_accum 2>/dev/null || true
     nx_pin_proxy_stats_rules "$(nx_proxy_port_from_config)"
 
     # Save rules (static only - transient bans/f2b chains excluded, BUG-012)
@@ -421,12 +432,12 @@ apply_ip6tables() {
     : > /etc/antiddos/exempt6.list 2>/dev/null || true
     local _r6 _s6 _w6
     for _r6 in "${CF6_RANGES[@]}"; do
-        ipt6_add INPUT -s "$_r6" -j ACCEPT
+        ipt6_add INPUT -s "$_r6" -m comment --comment "cf_whitelist" -j ACCEPT
         echo "$_r6" >> /etc/antiddos/exempt6.list
     done
     while IFS= read -r _s6; do
         [ -z "$_s6" ] && continue
-        ipt6_add INPUT -s "$_s6/128" -j ACCEPT
+        ipt6_add INPUT -s "$_s6/128" -m comment --comment "self_whitelist" -j ACCEPT
         echo "$_s6" >> /etc/antiddos/exempt6.list
     done < <(list_self_ips6)
     if [ -f "$WHITELIST_FILE" ]; then
@@ -434,25 +445,89 @@ apply_ip6tables() {
             _w6="${_w6%%#*}"; _w6="${_w6// /}"
             case "$_w6" in *:*) : ;; *) continue ;; esac
             [ -z "$_w6" ] && continue
-            ipt6_add INPUT -s "$_w6" -j ACCEPT
+            ipt6_add INPUT -s "$_w6" -m comment --comment "user_whitelist" -j ACCEPT
             echo "$_w6" >> /etc/antiddos/exempt6.list
         done < "$WHITELIST_FILE"
     fi
 
+    # M8 migration: pre-v3.18 v6 hashlimit rules used bare --hashlimit
+    # (which matches UNDER the rate) with -j DROP, so they dropped
+    # normal-rate traffic and passed floods. Delete any old-form rule
+    # (a *6 name without --hashlimit-above) before re-adding the
+    # fixed form; ipt6_add's -C check cannot see the spec change.
+    local _old6
+    for _old6 in $(ip6tables -S INPUT 2>/dev/null | grep -nE 'hashlimit-name (syn_limit6|udp_limit6|http_req_rate6|icmp_limit6)' | grep -v 'hashlimit-above' | cut -d: -f1 | sort -rn); do
+        ip6tables -D INPUT $((_old6 - 1)) 2>/dev/null || true
+    done
+
     # Request-rate policing BEFORE the established accept (same BUG-002
     # lesson as IPv4: below it, this rule could never fire)
+    # M8: --hashlimit-above, not bare --hashlimit (see the migration
+    # note above). The 300/min web cap itself is deliberate - it is a
+    # coarse per-IP web-port cap with no v4 counterpart, so its value
+    # is kept; the tiered established-packet cap is added below.
     ipt6_add INPUT -p tcp -m multiport --dports 80,443 \
         -m hashlimit --hashlimit-name http_req_rate6 --hashlimit-mode srcip \
-        --hashlimit 300/min --hashlimit-burst 100 -j DROP
+        --hashlimit-above 300/min --hashlimit-burst 100 -j DROP
 
     ipt6_add INPUT -m conntrack --ctstate INVALID -j DROP
+
+    # M8: per-IP bandwidth cap + HTTP burst cap, mirrors of the v4
+    # Step 2a/2b rules. They MUST sit above the ESTABLISHED accept
+    # (BUG-002): below it, established packets never reach them.
+    if ip6tables -A INPUT -p tcp \
+        -m hashlimit \
+        --hashlimit-above "${BW_PER_IP_MBIT:-100}mbit/s" \
+        --hashlimit-burst "$(( ${BW_PER_IP_MBIT:-100} * 2 ))mbit" \
+        --hashlimit-mode srcip \
+        --hashlimit-name bw_per_ip6_test \
+        --hashlimit-htable-expire 5000 \
+        -j DROP 2>/dev/null; then
+        ip6tables -D INPUT -p tcp \
+            -m hashlimit \
+            --hashlimit-above "${BW_PER_IP_MBIT:-100}mbit/s" \
+            --hashlimit-burst "$(( ${BW_PER_IP_MBIT:-100} * 2 ))mbit" \
+            --hashlimit-mode srcip \
+            --hashlimit-name bw_per_ip6_test \
+            --hashlimit-htable-expire 5000 \
+            -j DROP 2>/dev/null || true
+        ipt6_add INPUT -p tcp \
+            -m conntrack --ctstate ESTABLISHED,RELATED \
+            -m hashlimit \
+            --hashlimit-above "${BW_PER_IP_MBIT:-100}mbit/s" \
+            --hashlimit-burst "$(( ${BW_PER_IP_MBIT:-100} * 2 ))mbit" \
+            --hashlimit-mode srcip \
+            --hashlimit-name bw_per_ip6 \
+            --hashlimit-htable-expire 5000 \
+            -j DROP
+    fi
+    ipt6_add INPUT -p tcp \
+        -m conntrack --ctstate ESTABLISHED \
+        -m hashlimit \
+        --hashlimit-above "${HTTP_REQ_RATE:-500/sec}" \
+        --hashlimit-burst "${HTTP_REQ_BURST:-1000}" \
+        --hashlimit-mode srcip \
+        --hashlimit-name http_req_est6 \
+        --hashlimit-htable-expire 10000 \
+        -j DROP
+
     ipt6_add INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
 
-    # Flood limits
+    # Flood limits (M8: tiered values + --hashlimit-above direction)
     ipt6_add INPUT -p tcp --syn -m hashlimit --hashlimit-name syn_limit6 \
-        --hashlimit-mode srcip --hashlimit 200/sec --hashlimit-burst 400 -j DROP
+        --hashlimit-mode srcip --hashlimit-above "${SYN_LIMIT:-500/sec}" --hashlimit-burst "${SYN_BURST:-1000}" -j DROP
     ipt6_add INPUT -p udp -m hashlimit --hashlimit-name udp_limit6 \
-        --hashlimit-mode srcip --hashlimit 1000/sec --hashlimit-burst 2000 -j DROP
+        --hashlimit-mode srcip --hashlimit-above "${UDP_LIMIT:-150/sec}" --hashlimit-burst "${UDP_BURST:-300}" -j DROP
+    # UDP amplification ports (mirror of v4 Step 6)
+    for REFLECT_PORT in 19 111 137 161 1900 5353 11211; do
+        ipt6_add INPUT -p udp --sport "$REFLECT_PORT" \
+            -m hashlimit \
+            --hashlimit-above 10/sec \
+            --hashlimit-burst 20 \
+            --hashlimit-mode srcip \
+            --hashlimit-name "udp_reflect6_${REFLECT_PORT}" \
+            -j DROP
+    done
     # ICMPv6: NDP must keep working (it is IPv6's ARP) - accept it,
     # rate-limit echo requests, accept the rest.
     ipt6_add INPUT -p icmpv6 --icmpv6-type 133 -j ACCEPT
@@ -460,15 +535,42 @@ apply_ip6tables() {
     ipt6_add INPUT -p icmpv6 --icmpv6-type 136 -j ACCEPT
     ipt6_add INPUT -p icmpv6 --icmpv6-type echo-request \
         -m hashlimit --hashlimit-name icmp_limit6 --hashlimit-mode srcip \
-        --hashlimit 50/sec --hashlimit-burst 100 -j DROP
+        --hashlimit-above "${ICMP_LIMIT:-25/sec}" --hashlimit-burst "${ICMP_BURST:-50}" -j DROP
     ipt6_add INPUT -p icmpv6 -j ACCEPT
 
     # Connection limit per host (mask 128) with the same LOG prefix the
     # conn-flood fail2ban jail matches
+    # M9: the LOG rule carries the same -m limit as v4 (10/min, burst
+    # 20) - without it, every excess SYN under a v6 flood writes a
+    # kern.log line (log-volume DoS + jail hammering).
     ipt6_add INPUT -p tcp --syn -m connlimit --connlimit-above "$CONN_LIMIT_PER_IP" \
-        --connlimit-mask 128 -j LOG --log-prefix "[CONNLIMIT DROP] " --log-level 4
+        --connlimit-mask 128 -m limit --limit 10/min --limit-burst 20 \
+        -j LOG --log-prefix "[CONNLIMIT DROP] " --log-level 4
     ipt6_add INPUT -p tcp --syn -m connlimit --connlimit-above "$CONN_LIMIT_PER_IP" \
         --connlimit-mask 128 -m comment --comment "nx_connlimit" -j DROP
+
+    # M8: new-connection rate, RST flood, bogus NEW non-SYN and
+    # fragments - mirrors of the v4 Step 8/9/11/12 rules.
+    ipt6_add INPUT -p tcp \
+        -m conntrack --ctstate NEW \
+        -m hashlimit \
+        --hashlimit-above "${NEW_CONN_RATE:-100/sec}" \
+        --hashlimit-burst "${NEW_CONN_BURST:-200}" \
+        --hashlimit-mode srcip \
+        --hashlimit-name new_conn_rate6 \
+        --hashlimit-htable-expire 60000 \
+        -j DROP
+    ipt6_add INPUT -p tcp --tcp-flags RST RST \
+        -m hashlimit \
+        --hashlimit-above 200/sec \
+        --hashlimit-burst 400 \
+        --hashlimit-mode srcip \
+        --hashlimit-name rst_flood6 \
+        -j DROP
+    ipt6_add INPUT -p tcp ! --syn -m conntrack --ctstate NEW -j DROP
+    # The v6 equivalent of iptables -f (second and further fragments):
+    # a fragment header that is NOT the first fragment.
+    ipt6_add INPUT -m frag ! --fragfirst -j DROP
 
     # Scan signatures: LOG ([NX-SCAN], feeds the portscan jail) + DROP
     ipt6_add INPUT -p tcp --tcp-flags ALL NONE \
@@ -497,7 +599,11 @@ nx_delete_matching6() {
     command -v ip6tables >/dev/null 2>&1 || return 0
     ip6tables -L "$_c" >/dev/null 2>&1 || return 0
     while true; do
-        _n=$(ip6tables -S "$_c" 2>/dev/null | grep -nE "$_p" | head -1 | cut -d: -f1 || true)
+        # -- : patterns starting with a dash ('--comment ...')
+        # would otherwise be parsed as grep options (see
+        # nx_delete_matching - the same bug killed the '-j CT'
+        # remove and the first version of flush_autobans).
+        _n=$(ip6tables -S "$_c" 2>/dev/null | grep -nE -- "$_p" | head -1 | cut -d: -f1 || true)
         [ -z "$_n" ] && break
         ip6tables -D "$_c" $((_n - 1)) 2>/dev/null || break
     done

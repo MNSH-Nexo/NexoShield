@@ -13,12 +13,17 @@ A=src/modules/antiddos/70-whitelist-main.sh
 # BUG-008: flush delegates to the engine; engine deletes by -S numbers
 has "$M/60-autoban-main.sh" '--flush-autobans'
 has "$A" 'flush_autobans()'
-has "$A" "nx_delete_matching INPUT '--comment \"auto-ban\"'"
+# v3.18.0 (F1): the call carries the table now - the old 2-arg form
+# passed the pattern as the chain and deleted nothing.
+has "$A" "nx_delete_matching filter INPUT '--comment \"auto-ban\"'"
 hasnt "$M/60-autoban-main.sh" 'grep -q \x27"auto-ban"\x27'
 # BUG-038: exact unban deletes + exact state edit, both programs.
 # Since v3.7 the menu side lives in the shared nx_unban_ip (U-2);
 # the guard follows it there and checks both screens delegate.
-has "$A" 'awk -v x="$UIP"'
+# v3.18.0 (H2/H3): the antiddos side now delegates to the shared
+# nx_release_ban helper, which carries the exact awk edit.
+has "$A" 'nx_release_ban "$UIP"'
+has "$A" 'awk -v x="$_ip"'
 has "$M/05-ui.sh" 'awk -v x="$_ip"'
 has "$M/05-ui.sh" 'nx_unban_ip()'
 has "$M/50-antiddos-menu.sh" 'nx_unban_ip "$UIP"'

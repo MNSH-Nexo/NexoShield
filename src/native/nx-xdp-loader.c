@@ -52,7 +52,17 @@ static int parse_cidr(const char *text, int *family, int *prefix, uint8_t *addr)
     snprintf(buf, sizeof buf, "%s", text);
     char *slash = strchr(buf, '/');
     int pfx = -1;
-    if (slash) { *slash = 0; pfx = atoi(slash + 1); }
+    if (slash) {
+        /* L1: the old atoi() accepted junk - "/abc" became /0 (a
+         * whole-Internet ban), "/-1" silently became /32, and
+         * "/32junk" passed. A prefix must be all digits in range;
+         * anything else is a bad line, not a guessed entry. */
+        char *end = NULL;
+        long v = strtol(slash + 1, &end, 10);
+        if (end == slash + 1 || *end != '\0' || v < 0) return -1;
+        *slash = 0;
+        pfx = (int)v;
+    }
     if (strchr(buf, ':')) {
         if (inet_pton(AF_INET6, buf, addr) != 1) return -1;
         if (pfx < 0) pfx = 128;

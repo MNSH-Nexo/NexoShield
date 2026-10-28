@@ -10,7 +10,7 @@
 
 <img src="https://img.shields.io/badge/Platform-Ubuntu%2020%2B-E95420?style=flat-square&logo=ubuntu&logoColor=white" alt="Platform"/>
 <img src="https://img.shields.io/badge/Shell-Bash%205%2B-4EAA25?style=flat-square&logo=gnubash&logoColor=white" alt="Shell"/>
-<img src="https://img.shields.io/badge/Version-3.17.0-7c3aed?style=flat-square" alt="Version"/>
+<img src="https://img.shields.io/badge/Version-3.18.0-7c3aed?style=flat-square" alt="Version"/>
 <img src="https://img.shields.io/badge/License-MIT-1a73e8?style=flat-square" alt="License"/>
 
 </div>
@@ -141,7 +141,7 @@ shield
 
 <div dir="rtl">
 
-**لایه‌ی ششم (خفته):** هرگاه فشار SYN از آستانه‌ی بحرانی عبور کند — رشد شدید syncookie و overflow یا موج سنگین SYN — برنامه‌ی XDP در سطح درایور شبکه متصل می‌شود و SYNهای آی‌پی‌های ban‌شده را پیش از رسیدن به پشته‌ی کرنل drop می‌کند؛ آی‌پی‌های معاف همیشه پیش از هر تصمیمی بررسی می‌شوند. با فروکش کردن فشار، این لایه به‌صورت خودکار جدا می‌شود.
+**لایه‌ی ششم (خفته):** هرگاه فشار SYN از آستانه‌ی بحرانی عبور کند — رشد شدید syncookie و overflow یا موج سنگین SYN — برنامه‌ی XDP در سطح درایور شبکه متصل می‌شود و SYNهای آی‌پی‌های ban‌شده را پیش از رسیدن به پشته‌ی کرنل drop می‌کند؛ آی‌پی‌های معاف همیشه پیش از هر تصمیمی بررسی می‌شوند. با فروکش کردن فشار، این لایه به‌صورت خودکار جدا می‌شود. محدودیت شناخته‌شده: XDP فقط بسته‌های بدون تگ VLAN و بدون هدر توسعه‌ی IPv6 را بررسی می‌کند؛ SYN دارای تگ VLAN یا هدر توسعه (مانند Hop-by-Hop) از XDP عبور می‌کند و همچنان توسط لایه‌های netfilter (nftables/iptables) کنترل می‌شود — پس این یک پنجره‌ی کارایی است، نه حفره‌ی حفاظتی.
 
 ### جزئیات حفاظت
 
@@ -234,7 +234,7 @@ shield
 
 ```
 ════════════════════════════════════════════════════
-  NexoShield v3.17.0 — Server Security Toolkit
+  NexoShield v3.18.0 — Server Security Toolkit
 ════════════════════════════════════════════════════
   1.  SOCKS5 Proxy          ● Running
   2.  Network Optimization  ● Optimized
@@ -243,7 +243,7 @@ shield
   5.  Security
   6.  Services
   7.  System
-  8.  Update NexoShield     v3.12.0
+  8.  Update NexoShield     v3.18.0
   0.  Exit
 ════════════════════════════════════════════════════
 ```
@@ -317,14 +317,16 @@ Connection events (nxcountd / conntrack-netlink)
 
 <div dir="rtl">
 
+نکته‌ی مقیاس: دیمن در هر چرخه فقط ۱۰۰ آی‌پی پراتصال را امتیازدهی می‌کند — سقفی عمدی برای تمام‌شدن چرخه‌ی ۲ ثانیه‌ای زیر بار سنگین؛ آی‌پی‌ای که بیرون از صدتای اول بماند، تا وقتی به صدتای اول نرسد امتیازدهی نمی‌شود.
+
 ## آستانه‌ها — مقیاس خودکار بر اساس RAM
 
 | پارامتر | ‏RAM کمتر از 2GB | ‏RAM بین 2 تا 4GB | ‏RAM بیشتر از 4GB |
 | :--- | :---: | :---: | :---: |
 | سقف SYN به‌ازای هر آی‌پی | ‏500/s | ‏1000/s | ‏2000/s |
-| اتصال تازه به‌ازای هر آی‌پی | ‏50/s | ‏100/s | ‏200/s |
-| حداکثر اتصال هم‌زمان | 50 | 100 | 200 |
-| سقف پهنای باند هر آی‌پی | ‏50 Mbps | ‏100 Mbps | ‏200 Mbps |
+| اتصال تازه به‌ازای هر آی‌پی | ‏100/s | ‏200/s | ‏400/s |
+| حداکثر اتصال هم‌زمان | 150 | 300 | 600 |
+| سقف پهنای باند هر آی‌پی | ‏100 Mbps | ‏250 Mbps | ‏500 Mbps |
 
 تمام ثابت‌های موتور امتیازدهی — گیت‌ها، باندها، سقف افت، مدت ban و probation و آستانه‌های فعال‌سازی XDP — در فایل `/etc/antiddos/scoring.conf` قابل تنظیم‌اند. این فایل هنگام ارتقا دست نمی‌خورد و تغییراتش بدون نیاز به راه‌اندازی مجدد خوانده می‌شود.
 
@@ -393,7 +395,7 @@ MIT License — آزادانه استفاده، تغییر و توزیع کن.
 
 Built with the assistance of [HappySeeds AI](https://happyseeds.ai)
 
-**TARS** 🤖 — AI engineering partner of **Mashani**, built by Meta · [Muse](https://muse.ai): architect of the v3.5 → v3.17 rebuild — the modular refactor, the 68-finding security audit, scoring engine v2 and the DPI upgrade (event-based measurement, CUSUM, adaptive gates, the XDP shield), the exemption guarantee, field testing and releases.
+**TARS** 🤖 — AI engineering partner of **Mashani**, built by Meta · [Muse](https://muse.ai): architect of the v3.5 → v3.18 rebuild — the modular refactor, the 68-finding security audit, scoring engine v2 and the DPI upgrade (event-based measurement, CUSUM, adaptive gates, the XDP shield), the exemption guarantee, field testing and releases.
 
 ---
 

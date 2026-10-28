@@ -15,15 +15,56 @@
 # NX_SCORE_FILE); production defaults are the real paths.
 NX_STATE_DIR="${NX_STATE_DIR:-/etc/antiddos}"
 NX_SCORE_FILE="${NX_SCORE_FILE:-/var/lib/antiddos/scores/reputation.dat}"
-# The daemon's LIVE throttle state is /tmp/autoban_throttle; the
+# The daemon's LIVE throttle state is /run/nexoshield/autoban_throttle; the
 # persistent mirror (U-11) is /etc/antiddos/throttled.list. Displays
 # read the live file, falling back to the mirror right after a
 # reboot before the daemon has restored its state.
-NX_THROTTLE_LIST="${NX_THROTTLE_LIST:-/tmp/autoban_throttle}"
+NX_THROTTLE_LIST="${NX_THROTTLE_LIST:-/run/nexoshield/autoban_throttle}"
 NX_THROTTLE_MIRROR="${NX_THROTTLE_MIRROR:-/etc/antiddos/throttled.list}"
 nx_throttle_file() {
     if [ -f "$NX_THROTTLE_LIST" ]; then echo "$NX_THROTTLE_LIST";
     elif [ -f "$NX_THROTTLE_MIRROR" ]; then echo "$NX_THROTTLE_MIRROR"; fi
+}
+
+# nx_valid_ip_or_cidr <value> — menu-program twin of antiddos's
+# validator (the menu cannot call that file). v4 octets are range
+# checked and leading zeros rejected (L10: "010.0.0.1" is octal to
+# some parsers, so it must never validate as 10.0.0.1); v6 uses the
+# same charset/group rules as the antiddos validator, embedded-v4
+# forms rejected.
+nx_valid_ip_or_cidr() {
+    local input="${1:-}" addr mask o
+    case "$input" in
+        */*) addr="${input%%/*}"; mask="${input#*/}" ;;
+        *)   addr="$input"; mask="" ;;
+    esac
+    case "$addr" in
+        *:*)
+            case "$addr" in *[!0-9a-fA-F:.]*|*:::*|*.*) return 1 ;; esac
+            case "$addr" in *::*) case "${addr#*::}" in *::*) return 1 ;; esac ;; esac
+            if [ -n "$mask" ]; then
+                case "$mask" in ''|*[!0-9]*) return 1 ;; esac
+                [ "${#mask}" -le 3 ] || return 1
+                (( 10#$mask <= 128 )) || return 1
+            fi
+            return 0 ;;
+    esac
+    case "$addr" in ""|.*|*.|*..*|*[!0-9.]*) return 1 ;; esac
+    local o1 o2 o3 o4 extra
+    IFS='.' read -r o1 o2 o3 o4 extra <<< "$addr"
+    [ -z "${extra:-}" ] || return 1
+    for o in "$o1" "$o2" "$o3" "$o4"; do
+        case "$o" in ""|*[!0-9]*) return 1 ;; esac
+        [ "${#o}" -le 3 ] || return 1
+        case "$o" in 0?*) return 1 ;; esac
+        (( 10#$o <= 255 )) || return 1
+    done
+    if [ -n "$mask" ]; then
+        case "$mask" in ''|*[!0-9]*) return 1 ;; esac
+        [ "${#mask}" -le 2 ] || return 1
+        (( 10#$mask <= 32 )) || return 1
+    fi
+    return 0
 }
 
 # nx_unban_ip <ip> - the ONE unban path (U-2). The Security screen's
@@ -32,34 +73,45 @@ nx_throttle_file() {
 # banned.list - so the "unbanned" IP was re-banned at the next
 # daemon reconcile. Exact tagged deletes, exact state edits,
 # throttle-filter cleanup, fail2ban unban - shared by every screen.
+# F11: validates its input (return 2 when invalid) and reports
+# honestly - return 0 only when something was actually removed, 1
+# when the IP was found nowhere - so callers never print
+# "unblocked (all layers)" for a no-op.
 nx_unban_ip() {
-    local _ip="$1" _tf _prio _if _j
+    local _ip="$1" _tf _prio _if _j _removed=0
+    nx_valid_ip_or_cidr "$_ip" || return 2
     # Phase 1b: if the daemon's nft backend holds this ban, remove the
     # set element too (the iptables deletes below stay as belt-and-braces).
     if command -v nft >/dev/null 2>&1; then
         case "$_ip" in
-            *:*) nft delete element inet nexoshield ban6 "{ $_ip }" >/dev/null 2>&1 || true ;;
-            *)   nft delete element inet nexoshield ban4 "{ $_ip }" >/dev/null 2>&1 || true ;;
+            *:*) nft delete element inet nexoshield ban6 "{ $_ip }" >/dev/null 2>&1 && _removed=1 || true ;;
+            *)   nft delete element inet nexoshield ban4 "{ $_ip }" >/dev/null 2>&1 && _removed=1 || true ;;
         esac
     fi
     case "$_ip" in
         *:*)
-            ip6tables -D INPUT -s "$_ip" -m comment --comment "auto-ban" -j DROP 2>/dev/null || true ;;
+            ip6tables -D INPUT -s "$_ip" -m comment --comment "auto-ban" -j DROP 2>/dev/null && _removed=1 || true ;;
         *)
-            iptables -D INPUT -s "$_ip" -m comment --comment "auto-ban" -j DROP 2>/dev/null || \
-            iptables -D INPUT -s "$_ip" -m comment --comment "subnet-ban" -j DROP 2>/dev/null || \
-            iptables -D INPUT -s "$_ip" -j DROP 2>/dev/null || true ;;
+            if iptables -D INPUT -s "$_ip" -m comment --comment "auto-ban" -j DROP 2>/dev/null; then
+                _removed=1
+            elif iptables -D INPUT -s "$_ip" -m comment --comment "subnet-ban" -j DROP 2>/dev/null; then
+                _removed=1
+            elif iptables -D INPUT -s "$_ip" -j DROP 2>/dev/null; then
+                _removed=1
+            fi ;;
     esac
     for _tf in "$NX_THROTTLE_LIST" "$NX_THROTTLE_MIRROR"; do
         [ -f "$_tf" ] || continue
         _prio=$(awk -v x="$_ip" '$1==x{print $2}' "$_tf" 2>/dev/null | head -1)
         if [ -n "$_prio" ]; then
+            _removed=1
             _if=$(ip route show default 2>/dev/null | awk '/default/{print $5}' | head -1)
             [ -n "$_if" ] && tc filter del dev "$_if" parent 1: prio "$_prio" 2>/dev/null || true
         fi
         awk -v x="$_ip" '$1!=x' "$_tf" > "$_tf.nxtmp" 2>/dev/null && mv "$_tf.nxtmp" "$_tf"
     done
     if [ -f "$NX_STATE_DIR/banned.list" ]; then
+        awk -v x="$_ip" '$1==x{found=1} END{exit !found}' "$NX_STATE_DIR/banned.list" 2>/dev/null && _removed=1 || true
         awk -v x="$_ip" '$1!=x' "$NX_STATE_DIR/banned.list" > "$NX_STATE_DIR/banned.list.nxtmp" 2>/dev/null && \
             mv "$NX_STATE_DIR/banned.list.nxtmp" "$NX_STATE_DIR/banned.list"
     fi
@@ -68,6 +120,7 @@ nx_unban_ip() {
         [ -z "$_j" ] && continue
         fail2ban-client set "$_j" unbanip "$_ip" 2>/dev/null || true
     done
+    [ "$_removed" -eq 1 ]
 }
 
 ui_input() {

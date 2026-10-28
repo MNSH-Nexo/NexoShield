@@ -19,9 +19,14 @@ detect_env() {
     MAIN_IF=$(ip route show default 2>/dev/null | awk '/default/{print $5}' | head -1)
     MAIN_IF=${MAIN_IF:-eth0}
 
-    # Count public IPs (for rp_filter decision)
+    # Count public IPs (for rp_filter decision). The exclusion list is
+    # every non-public range, including CGNAT 100.64/10 (L13: it used
+    # to be counted as public, skewing the multi-IP decision). The
+    # address is extracted first so the match is anchored (an
+    # unanchored "10\." also matched 110.x public addresses).
     PUBLIC_IP_COUNT=$(ip -4 addr show 2>/dev/null | grep 'inet ' | \
-        grep -cv '127\.\|10\.\|192\.168\.\|172\.\(1[6-9]\|2[0-9]\|3[01]\)\.' || true)
+        grep -oP '(?<=inet )[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | \
+        grep -cv '^(127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|100\.64\.)' || true)
     PUBLIC_IP_COUNT="${PUBLIC_IP_COUNT:-0}"
 
     # Scale rate limits by RAM.

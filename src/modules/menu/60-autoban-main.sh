@@ -42,11 +42,13 @@ _autoban_control() {
 }
 
 # ── CLI (v3.7): scriptable views, no menu ─────────────────
+# F6: unknown flags error out instead of silently opening the menu.
 case "${1:-}" in
     --status)  nx_status_plain; exit 0 ;;
     --bans)    nx_bans_plain; exit 0 ;;
     --version) echo "NexoShield v$VERSION"; exit 0 ;;
-    --help)    echo "Usage: proxy-menu.sh [--status|--bans|--version]  (no flag = interactive menu)"; exit 0 ;;
+    --help)    echo "Usage: shield [--status|--bans|--version]  (no flag = interactive menu)"; exit 0 ;;
+    *)  if [ -n "${1:-}" ]; then echo "Unknown option: $1" >&2; exit 2; fi ;;
 esac
 
 # ── Main Menu (dashboard home, v3.7) ──────────────────────

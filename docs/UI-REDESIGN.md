@@ -53,7 +53,7 @@ fixed a family of stale-state bugs (full register in the commit):
   dead `-L` comment scrape as U-1; it reads state files now.
 - **U-10** — the log viewer's 3proxy entry resolves the dated log.
 - **U-11 (the audit's most valuable find)** — the daemon's throttle
-  state lives in `/tmp/autoban_throttle`, while the generated
+  state lives in `/run/nexoshield/autoban_throttle`, while the generated
   `tc-setup.sh` has always restored throttles after reboot from
   `/etc/antiddos/throttled.list` — a file *nothing ever wrote*. The
   restore path was dead and every reboot silently dropped all

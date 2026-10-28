@@ -34,11 +34,32 @@ _nx_cfg_warn() {
     [ -n "${_NX_CFG_WARNED[$1]:-}" ] && return 0
     _NX_CFG_WARNED[$1]=1
     if declare -F log >/dev/null 2>&1; then
-        log " CONFIG: ignoring invalid value for '$1' in $NX_CONFIG_FILE (using default)"
+        log " CONFIG: ignoring ${2:-invalid value} for '$1' in $NX_CONFIG_FILE (using default)"
     else
-        echo "CONFIG: ignoring invalid value for '$1' in $NX_CONFIG_FILE (using default)" >&2
+        echo "CONFIG: ignoring ${2:-invalid value} for '$1' in $NX_CONFIG_FILE (using default)" >&2
     fi
 }
+
+# L7: sane ranges for every documented scoring key (min:max). A
+# value outside its range is ignored with a warning and the default
+# is used instead - a typo like conn_threshold=-5 or score_ban=500
+# must never silently disarm or invert a gate. Unknown keys are
+# unchecked (nx_cfg stays generic). Floats compare via awk.
+declare -A _NX_CFG_RANGE=(
+    [score_ban]="0:100" [score_hard]="0:100" [score_throttle]="0:100" [score_suspect]="0:100"
+    [score_recover_per_min]="0:1000" [probation_recover_per_min]="0:1000" [score_drop_cap_per_min]="0:1000"
+    [probation_score]="0:100" [probation_seconds]="0:86400"
+    [churn_allow_per_sec]="0:100000" [churn_weight]="0:1000" [churn_cap]="0:100"
+    [sust_divisor]="1:100000" [sust_cap]="0:100"
+    [syn_min]="0:100000" [syn_ratio]="0:1" [syn_weight]="0:1000" [syn_cap]="0:100"
+    [conn_threshold]="0:1000000" [ban_conn_threshold]="0:1000000" [observe_seconds]="0:3600"
+    [ban_base_minutes]="1:10080" [ban_max_minutes]="1:43200" [ban_hours_fallback]="0:168"
+    [subnet_threshold]="0:1000000" [subnet_ban_threshold]="0:1000000"
+    [subnet_min_offenders]="1:100000" [subnet_ban_minutes]="1:10080"
+    [stress_gate]="0:1" [adaptive_enabled]="0:1"
+    [xdp_syncookie_rate]="0:10000000" [xdp_overflow_rate]="0:10000000" [xdp_syn_rate]="0:10000000"
+    [xdp_calm_seconds]="0:86400"
+)
 
 nx_cfg() {
     local key="$1" def="$2" raw=""
@@ -53,6 +74,16 @@ nx_cfg() {
     fi
     if [ -n "$raw" ]; then
         if [[ "$raw" =~ ^-?[0-9]+([.][0-9]+)?$ ]]; then
+            local _range="${_NX_CFG_RANGE[$key]:-}"
+            if [ -n "$_range" ]; then
+                local _lo="${_range%%:*}" _hi="${_range#*:}"
+                if ! awk -v v="$raw" -v lo="$_lo" -v hi="$_hi" 'BEGIN{exit !(v>=lo && v<=hi)}' 2>/dev/null; then
+                    _nx_cfg_warn "$key" "out-of-range value '$raw' (allowed $_lo-$_hi)"
+                    _NX_CFG_CACHE[$key]="$def"
+                    printf '%s' "$def"
+                    return 0
+                fi
+            fi
             _NX_CFG_CACHE[$key]="$raw"
             printf '%s' "$raw"
             return 0

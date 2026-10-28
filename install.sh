@@ -3,7 +3,7 @@ exec bash <(tr -d '\r' < "$0" | tail -n +3) "$@"
 #!/bin/bash
 # ── GENERATED FILE ─ built by tools/build.py from src/ ─ do not edit directly; edit the sources and rebuild ──
 # ============================================================
-#  Proxy Manager - Auto Installer  v3.17.0
+#  Proxy Manager - Auto Installer  v3.18.0
 #  One file, one command, everything ready
 #
 #  Install:
@@ -28,7 +28,7 @@ exec bash <(tr -d '\r' < "$0" | tail -n +3) "$@"
 # ============================================================
 set -euo pipefail
 
-VERSION="3.17.0"
+VERSION="3.18.0"
 INSTALL_DIR="/opt/proxy-manager"
 BIN_LINK="/usr/local/bin/shield"
 LOG="/var/log/proxy-manager-install.log"
@@ -912,12 +912,7 @@ else
     echo "WARN: /etc/antiddos/cloudflare-ipv4.list missing - CF whitelist empty" >&2
 fi
 
-get_server_ips() {
-    # All public IPs of this server (for auto-whitelist)
-    ip -4 addr show 2>/dev/null | grep 'inet ' | \
-        grep -v '127\.\|10\.\|192\.168\.\|172\.\(1[6-9]\|2[0-9]\|3[01]\)\.' | \
-        awk '{print $2}' | cut -d/ -f1
-}
+# (intentionally empty: the only function this lib held was removed - see above)
 list_self_ips() {
     { ip -4 addr show 2>/dev/null | grep -oP '(?<=inet )\d+\.\d+\.\d+\.\d+'
       hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'
@@ -1077,11 +1072,23 @@ nx_install_binary() {
 # re-pin never destroys a healthy counter. Moving a target-less
 # rule changes no allow/block behaviour - it only counts.
 nx_proxy_stats_top() {
-    # nx_proxy_stats_top CHAIN COMMENT -> 0 if the chain's first
-    # rule carries COMMENT.
+    # nx_proxy_stats_top CHAIN COMMENT [PORT] -> 0 if the chain's
+    # first rule carries COMMENT (and, when PORT is given, the
+    # matching --dport/--sport PORT). LOW-2: a stale other-port
+    # rule at position 1 used to satisfy the comment-only check, so
+    # the pin became a no-op and the accumulator read the wrong
+    # counter. The trailing-space/EOL alternatives keep port 1080
+    # from matching 10801.
     local _first
     _first=$(iptables -S "$1" 2>/dev/null | grep -m1 '^-A' || true)
-    case "$_first" in *"$2"*) return 0 ;; *) return 1 ;; esac
+    case "$_first" in *"$2"*) ;; *) return 1 ;; esac
+    if [ -n "${3:-}" ]; then
+        case "$_first" in
+            *"--dport ${3} "*|*"--dport ${3}"|*"--sport ${3} "*|*"--sport ${3}") ;;
+            *) return 1 ;;
+        esac
+    fi
+    return 0
 }
 
 nx_pin_proxy_stats_rules() {
@@ -1089,20 +1096,26 @@ nx_pin_proxy_stats_rules() {
     # at position 1. No-op (counter preserved) when already pinned.
     local PORT="$1"
     [ -n "$PORT" ] || return 0
-    if ! nx_proxy_stats_top INPUT "3proxy_stats_in"; then
+    if ! nx_proxy_stats_top INPUT "3proxy_stats_in" "$PORT"; then
         iptables -D INPUT -p tcp --dport "$PORT" -m comment --comment "3proxy_stats_in" 2>/dev/null || true
         iptables -I INPUT 1 -p tcp --dport "$PORT" -m comment --comment "3proxy_stats_in" 2>/dev/null || true
     fi
-    if ! nx_proxy_stats_top OUTPUT "3proxy_stats_out"; then
+    if ! nx_proxy_stats_top OUTPUT "3proxy_stats_out" "$PORT"; then
         iptables -D OUTPUT -p tcp --sport "$PORT" -m comment --comment "3proxy_stats_out" 2>/dev/null || true
         iptables -I OUTPUT 1 -p tcp --sport "$PORT" -m comment --comment "3proxy_stats_out" 2>/dev/null || true
     fi
 }
 
 nx_proxy_stats_bytes() {
-    # nx_proxy_stats_bytes CHAIN COMMENT -> counter bytes (or empty).
-    # Same parse as show_stats: the bytes column of `iptables -L`.
-    iptables -L "$1" -v -n -x 2>/dev/null | grep "$2" | awk '{print $2}' | head -1
+    # nx_proxy_stats_bytes CHAIN COMMENT [PORT] -> counter bytes
+    # (or empty). Same parse as show_stats: the bytes column of
+    # `iptables -L`. With PORT, the row must also carry dpt:/spt:
+    # PORT (the [^0-9] guard keeps 1080 from matching 10801).
+    if [ -n "${3:-}" ]; then
+        iptables -L "$1" -v -n -x 2>/dev/null | grep "$2" | grep -E "(dpt|spt):${3}([^0-9]|$)" | awk '{print $2}' | head -1
+    else
+        iptables -L "$1" -v -n -x 2>/dev/null | grep "$2" | awk '{print $2}' | head -1
+    fi
 }
 
 nx_proxy_port_from_config() {
@@ -1116,13 +1129,31 @@ nx_proxy_port_from_config() {
 # recreated, so the delta is the new counter itself, never negative.
 # A missing rule (proxy removed, rules wiped) leaves totals untouched.
 nx_proxy_traffic_accum() {
-    local PORT STATE CUR_IN CUR_OUT LAST_IN LAST_OUT TOT_IN TOT_OUT
+    # LOW-3: the timer, the pin callers and a manual run can overlap
+    # (two writers interleaving read-compute-write would lose a
+    # delta). A non-blocking lock defers a contended run to the
+    # next 5-minute tick instead of blocking the caller - the
+    # snapshot is periodic, never urgent. No flock binary: proceed
+    # unlocked (the old behaviour), never fail the caller.
+    local PORT STATE CUR_IN CUR_OUT LAST_IN LAST_OUT TOT_IN TOT_OUT _lock_fd _rc
     PORT=$(nx_proxy_port_from_config)
     [ -n "$PORT" ] || return 0
     STATE="${NX_PROXY_TRAFFIC_STATE:-/etc/3proxy/traffic-total.state}"
-    CUR_IN=$(nx_proxy_stats_bytes INPUT "3proxy_stats_in")
-    CUR_OUT=$(nx_proxy_stats_bytes OUTPUT "3proxy_stats_out")
-    [ -n "$CUR_IN" ] && [ -n "$CUR_OUT" ] || return 0
+    if command -v flock >/dev/null 2>&1; then
+        exec {_lock_fd}>"${STATE}.lock" 2>/dev/null || _lock_fd=""
+        if [ -n "$_lock_fd" ]; then
+            flock -n "$_lock_fd" 2>/dev/null || { exec {_lock_fd}>&- 2>/dev/null || true; return 0; }
+        fi
+    fi
+    CUR_IN=$(nx_proxy_stats_bytes INPUT "3proxy_stats_in" "$PORT")
+    CUR_OUT=$(nx_proxy_stats_bytes OUTPUT "3proxy_stats_out" "$PORT")
+    # Release the lock on every exit path: a leaked fd would hold
+    # the lock in a long-lived caller (the menu process, the test
+    # harness) and starve every later run.
+    if [ -z "$CUR_IN" ] || [ -z "$CUR_OUT" ]; then
+        [ -n "${_lock_fd:-}" ] && exec {_lock_fd}>&- 2>/dev/null || true
+        return 0
+    fi
     LAST_IN=""; LAST_OUT=""; TOT_IN=""; TOT_OUT=""
     if [ -f "$STATE" ]; then
         read -r LAST_IN LAST_OUT TOT_IN TOT_OUT < "$STATE" 2>/dev/null || true
@@ -1137,12 +1168,28 @@ nx_proxy_traffic_accum() {
     # Self-heal shadowing AFTER the snapshot, so a re-pin never
     # destroys counts it has not yet recorded.
     nx_pin_proxy_stats_rules "$PORT"
+    _rc=$?
+    [ -n "${_lock_fd:-}" ] && exec {_lock_fd}>&- 2>/dev/null || true
+    return "$_rc"
 }
 
 get_server_ip() {
-    curl -s -4 --max-time 5 https://api.ipify.org 2>/dev/null || \
-    curl -s -4 --max-time 5 https://ifconfig.me 2>/dev/null || \
-    hostname -I 2>/dev/null | awk '{print $1}'
+    # Display only (the socks5:// line) - never enforcement, which
+    # uses list_self_ips_all. NIT-3: the old hostname -I fallback
+    # took the FIRST address, which on NAT/cloud boxes is often a
+    # private address useless to the reader - prefer a public IPv4
+    # from the local list, and only then fall back to the first.
+    local _ip
+    _ip=$(curl -s -4 --max-time 5 https://api.ipify.org 2>/dev/null || \
+          curl -s -4 --max-time 5 https://ifconfig.me 2>/dev/null || true)
+    if [ -z "$_ip" ]; then
+        _ip=$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | \
+              grep -v -E '^(127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|100\.64\.)' | head -1 || true)
+    fi
+    if [ -z "$_ip" ]; then
+        _ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+    fi
+    printf '%s' "$_ip"
 }
 
 get_server_ipv6() { curl -s -6 --max-time 5 https://api64.ipify.org 2>/dev/null || true; }
@@ -1207,6 +1254,21 @@ setup_tc() {
         done < /etc/antiddos/whitelist.list
     fi
 
+    # HIGH-2: re-apply live daemon throttles (BUG-022) - same loop as
+    # the antiddos live rebuild and the boot script: the qdisc delete
+    # above destroyed every recorded throttle filter, and the live
+    # path never restored them (only the boot script did).
+    while read -r TIP TPRIO _TS TBAND; do
+        [ -z "$TIP" ] && continue
+        TFLOW=1:30; [ "$TBAND" = "hard" ] && TFLOW=1:40
+        case "$TIP" in
+            *:*) tc filter add dev "$IF" parent 1: protocol ip6 prio $TPRIO \
+                     u32 match ip6 dst "$TIP" flowid $TFLOW 2>/dev/null || true ;;
+            *)   tc filter add dev "$IF" parent 1: protocol ip prio $TPRIO \
+                     u32 match ip dst "$TIP/32" flowid $TFLOW 2>/dev/null || true ;;
+        esac
+    done < <(cat "${THROTTLE_LIST:-/run/nexoshield/autoban_throttle}" /etc/antiddos/throttled.list 2>/dev/null | awk '!seen[$1]++')
+
     # ── WARP / WireGuard awareness ──────────────────────────
     # tc shapes the default-route interface. If a WireGuard/WARP tunnel is
     # present, its traffic egresses on a wg* device, so these filters would
@@ -1270,6 +1332,135 @@ if [ -f /etc/antiddos/cloudflare-ipv4.list ]; then
 else
     echo "WARN: /etc/antiddos/cloudflare-ipv4.list missing - CF whitelist empty" >&2
 fi
+list_self_ips() {
+    { ip -4 addr show 2>/dev/null | grep -oP '(?<=inet )\d+\.\d+\.\d+\.\d+'
+      hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'
+    } | sort -u | grep -v '^$'
+}
+
+# list_self_ips6 - every local IPv6 address (incl. ::1), one per line.
+list_self_ips6() {
+    { ip -6 addr show 2>/dev/null | grep -oP '(?<=inet6 )[0-9a-fA-F:]+'
+      echo "::1"
+    } | sort -u | grep -v '^$'
+}
+
+# ── Public-IP discovery for NAT / cloud servers ─────────────────
+# On cloud VMs (Azure, most NAT setups) the server's public IPv4
+# exists only in the provider's NAT - it is on NO interface, so
+# list_self_ips can never see it, yet it is unmistakably one of the
+# server's own addresses (FR-2). Discovery asks the cloud metadata
+# service (link-local, no internet involved); only when no metadata
+# service answers does it fall back to an external echo service.
+# Every candidate passes nx_is_public_ipv4: metadata/echo replies
+# are untrusted input, and a private/documentation/garbage answer
+# must never widen the immune set.
+NX_PUBLIC_IPS_FILE="${NX_PUBLIC_IPS_FILE:-/etc/antiddos/public-ips.list}"
+
+nx_is_public_ipv4() {
+    local ip="${1:-}" o1 o2 o3 o4 extra _o
+    case "$ip" in *[!0-9.]*) return 1 ;; esac
+    IFS='.' read -r o1 o2 o3 o4 extra <<< "$ip"
+    [ -z "${extra:-}" ] || return 1
+    for _o in "$o1" "$o2" "$o3" "$o4"; do
+        case "$_o" in ''|*[!0-9]*) return 1 ;; esac
+        [ "${#_o}" -le 3 ] || return 1
+        (( 10#$_o <= 255 )) || return 1
+    done
+    case "$o1" in
+        0|10|127) return 1 ;;
+        100) [ "$o2" -ge 64 ] && [ "$o2" -le 127 ] && return 1 ;;
+        169) [ "$o2" = 254 ] && return 1 ;;
+        172) [ "$o2" -ge 16 ] && [ "$o2" -le 31 ] && return 1 ;;
+        192) [ "$o2" = 168 ] && return 1
+             { [ "$o2" = 0 ] && { [ "$o3" = 0 ] || [ "$o3" = 2 ]; }; } && return 1 ;;
+        198) case "$o2" in 18|19|51) return 1 ;; esac ;;
+        203) { [ "$o2" = 0 ] && [ "$o3" = 113 ]; } && return 1 ;;
+    esac
+    [ "$o1" -ge 224 ] && return 1
+    return 0
+}
+
+nx_metadata_public_ips() {
+    command -v curl >/dev/null 2>&1 || return 0
+    local _ip _tok _base="http://169.254.169.254"
+    # Azure IMDS (first two addresses on the primary NIC)
+    for _idx in 0 1; do
+        _ip=$(curl -s -m 2 -H "Metadata: true" \
+            "$_base/metadata/instance/network/interface/0/ipv4/ipAddress/$_idx/publicIpAddress?api-version=2021-02-01&format=text" 2>/dev/null)
+        nx_is_public_ipv4 "$_ip" && echo "$_ip"
+    done
+    # AWS EC2 IMDS (token first, plain fallback)
+    _tok=$(curl -s -m 2 -X PUT -H "X-aws-ec2-metadata-token-ttl-seconds: 60" \
+        "$_base/latest/api/token" 2>/dev/null)
+    if [ -n "$_tok" ]; then
+        _ip=$(curl -s -m 2 -H "X-aws-ec2-metadata-token: $_tok" \
+            "$_base/latest/meta-data/public-ipv4" 2>/dev/null)
+    else
+        _ip=$(curl -s -m 2 "$_base/latest/meta-data/public-ipv4" 2>/dev/null)
+    fi
+    nx_is_public_ipv4 "$_ip" && echo "$_ip"
+    # GCP
+    _ip=$(curl -s -m 2 -H "Metadata-Flavor: Google" \
+        "http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/access-configs/0/external-ip" 2>/dev/null)
+    nx_is_public_ipv4 "$_ip" && echo "$_ip"
+    # DigitalOcean
+    _ip=$(curl -s -m 2 "$_base/metadata/v1/interfaces/public/0/ipv4/address" 2>/dev/null)
+    nx_is_public_ipv4 "$_ip" && echo "$_ip"
+    # Hetzner Cloud
+    _ip=$(curl -s -m 2 "$_base/hetzner/v1/metadata/public-ipv4" 2>/dev/null)
+    nx_is_public_ipv4 "$_ip" && echo "$_ip"
+    return 0
+}
+
+nx_external_public_ip() {
+    command -v curl >/dev/null 2>&1 || return 0
+    local _ip _url
+    for _url in "https://api.ipify.org" "https://checkip.amazonaws.com" "https://ifconfig.me/ip"; do
+        _ip=$(curl -s -m 3 "$_url" 2>/dev/null | tr -d ' \r\n')
+        nx_is_public_ipv4 "$_ip" && { echo "$_ip"; return 0; }
+    done
+    return 0
+}
+
+# Echo the server's public IPv4s that are NOT on any interface
+# (metadata first; external echo only as a last resort).
+discover_public_ips() {
+    local _found _ip
+    _found=$(nx_metadata_public_ips | sort -u)
+    [ -z "$_found" ] && _found=$(nx_external_public_ip)
+    for _ip in $_found; do
+        list_self_ips | grep -qxF "$_ip" || echo "$_ip"
+    done
+}
+
+# Refresh the cache file; a failed/empty discovery NEVER wipes a
+# previously discovered set (an offline reinstall must not disarm
+# the immunity). Prints the discovered addresses when any exist.
+nx_refresh_public_ips_cache() {
+    local _found
+    _found=$(discover_public_ips)
+    if [ -n "$_found" ]; then
+        mkdir -p "$(dirname "$NX_PUBLIC_IPS_FILE")" 2>/dev/null || true
+        printf '%s\n' "$_found" > "$NX_PUBLIC_IPS_FILE.tmp" 2>/dev/null && \
+            mv "$NX_PUBLIC_IPS_FILE.tmp" "$NX_PUBLIC_IPS_FILE" 2>/dev/null || true
+        printf '%s\n' "$_found"
+    elif [ -f "$NX_PUBLIC_IPS_FILE" ]; then
+        cat "$NX_PUBLIC_IPS_FILE"
+    fi
+}
+
+# list_self_ips_all - interface addresses PLUS the cached
+# discovered public IPs. This is the feed every enforcement layer
+# uses for "the server's own addresses" (FR-2 complete: local,
+# private, secondary AND NAT-public).
+list_self_ips_all() {
+    { list_self_ips
+      if [ -r "$NX_PUBLIC_IPS_FILE" ]; then
+          grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' "$NX_PUBLIC_IPS_FILE" 2>/dev/null
+      fi
+    } | sort -u | grep -v '^$'
+}
 tc qdisc del dev "$IF" root 2>/dev/null || true
 tc qdisc add dev "$IF" root handle 1: htb default 20
 tc class add dev "$IF" parent 1: classid 1:1  htb rate __BW__ ceil __BW__
@@ -1284,8 +1475,7 @@ for CF in "${CF_RANGES[@]}"; do
     HANDLE=$((HANDLE + 1))
 done
 # Add server own IPs
-for SIP in $(ip -4 addr show 2>/dev/null | grep 'inet ' | \
-    grep -v '127\.\|10\.\|192\.168\.' | awk '{print $2}' | cut -d/ -f1); do
+for SIP in $(list_self_ips_all 2>/dev/null | grep -v '^127\.0\.0\.1$'); do
     tc filter add dev "$IF" parent 1: protocol ip prio $HANDLE \
         u32 match ip dst "$SIP/32" flowid 1:10 2>/dev/null || true
     HANDLE=$((HANDLE + 1))
@@ -1303,11 +1493,15 @@ fi
 # Re-apply live daemon throttles (BUG-022): a qdisc rebuild must not
 # silently drop enforcement state recorded by the auto-ban daemon.
 if [ -f /etc/antiddos/throttled.list ]; then
-    while read -r TIP TPRIO TTS TBAND; do
+    while read -r TIP TPRIO _TS TBAND; do
         [ -z "$TIP" ] && continue
         TFLOW=1:30; [ "$TBAND" = "hard" ] && TFLOW=1:40
-        tc filter add dev "$IF" parent 1: protocol ip prio $TPRIO \
-            u32 match ip dst "$TIP/32" flowid $TFLOW 2>/dev/null || true
+        case "$TIP" in
+            *:*) tc filter add dev "$IF" parent 1: protocol ip6 prio $TPRIO \
+                     u32 match ip6 dst "$TIP" flowid $TFLOW 2>/dev/null || true ;;
+            *)   tc filter add dev "$IF" parent 1: protocol ip prio $TPRIO \
+                     u32 match ip dst "$TIP/32" flowid $TFLOW 2>/dev/null || true ;;
+        esac
     done < /etc/antiddos/throttled.list
 fi
 TCEOF
@@ -1330,6 +1524,12 @@ TCEOF
 # linger (and the old port does not stay open behind us).
 remove_proxy_port_rules() {
     local PORT="$1"
+    # Snapshot BEFORE deleting (MED-1): the accumulator runs only
+    # every 5 minutes, so deleting the counting rules first would lose
+    # all traffic counted since the last tick (up to 5 minutes of
+    # proxy traffic). The config port is the vacated port here: this
+    # is called from install_proxy before the config is rewritten.
+    nx_proxy_traffic_accum 2>/dev/null || true
     iptables -D INPUT -p tcp --dport "$PORT" -j ACCEPT 2>/dev/null || true
     iptables -D INPUT -p tcp --dport "$PORT" \
         -m comment --comment "3proxy_stats_in" 2>/dev/null || true
@@ -1346,7 +1546,7 @@ remove_proxy_port_rules() {
             -m comment --comment "3proxy_self_allow" -j ACCEPT 2>/dev/null || true
     done < <(list_self_ips_all)
     local _rn
-    for _rn in $(iptables -S INPUT 2>/dev/null | grep -n "3proxy_$PORT" | cut -d: -f1 | sort -rn); do
+    for _rn in $(iptables -S INPUT 2>/dev/null | grep -n "3proxy_${PORT}[^0-9]" | cut -d: -f1 | sort -rn); do
         iptables -D INPUT $((_rn - 1)) 2>/dev/null || true
     done
     if [ -f /etc/antiddos/whitelist.list ]; then
@@ -1357,11 +1557,46 @@ remove_proxy_port_rules() {
                 -m comment --comment "3proxy_wl_allow" -j ACCEPT 2>/dev/null || true
         done < /etc/antiddos/whitelist.list
     fi
+    # LOW-5: mirror the ufw/firewalld cleanup setup and uninstall
+    # already do - a vacated port must not stay open behind us.
+    command -v ufw >/dev/null 2>&1 && ufw delete allow "$PORT"/tcp 2>/dev/null || true
+    command -v firewall-cmd >/dev/null 2>&1 && {
+        firewall-cmd --remove-port="${PORT}/tcp" --permanent 2>/dev/null || true
+        firewall-cmd --reload 2>/dev/null || true
+    }
+    # MED-3: the ruleset changed - refresh the persistent save so a
+    # reboot does not resurrect the vacated port's rules.
+    nx_3proxy_save_rules 2>/dev/null || true
+}
+
+# nx_3proxy_save_rules — persist the live ruleset (static filter only:
+# transient bans/f2b chains are runtime state, never baked into boot
+# persistence, BUG-012) so a 3proxy-only install survives a reboot
+# (MED-3). The save path is overridable for tests. The restore unit
+# itself is managed by install/uninstall, not here.
+nx_3proxy_save_rules() {
+    local _dir="${NX_3PROXY_SAVE_DIR:-/etc/iptables}"
+    command -v iptables-save >/dev/null 2>&1 || return 0
+    mkdir -p "$_dir" 2>/dev/null || return 0
+    iptables-save 2>/dev/null | grep -v -e '"auto-ban"' -e '"subnet-ban"' -e 'f2b-' -e 'fail2ban-' > "$_dir/rules.v4" 2>/dev/null || true
 }
 
 setup_iptables_for_port() {
     local PORT="$1"
 
+    # MED-5 (fail closed, mirroring antiddos BUG-027): with no
+    # Cloudflare ranges loaded, every rule below would treat CF IPs
+    # as ordinary traffic. Refuse to arm.
+    if [ "${#CF_RANGES[@]}" -eq 0 ]; then
+        echo -e "  ${RED}✗${NC}  Cloudflare range list is empty/missing - refusing to apply proxy iptables rules (CF would lose its exemption)" >&2
+        return 1
+    fi
+
+    # Snapshot BEFORE deleting (MED-1, see remove_proxy_port_rules):
+    # an Install/Update recreates the counting rules, which zeroes
+    # their kernel counters. Without this, traffic since the last
+    # 5-minute accumulator tick is lost on every update.
+    nx_proxy_traffic_accum 2>/dev/null || true
     # Remove old rules for this port
     iptables -D INPUT -p tcp --dport "$PORT" -j ACCEPT 2>/dev/null || true
     iptables -D INPUT -p tcp --dport "$PORT" \
@@ -1388,7 +1623,7 @@ setup_iptables_for_port() {
     # spec delete can miss the real rule; the recent-rule name is
     # the stable identifier)
     local _rn
-    for _rn in $(iptables -S INPUT 2>/dev/null | grep -n "3proxy_$PORT" | cut -d: -f1 | sort -rn); do
+    for _rn in $(iptables -S INPUT 2>/dev/null | grep -n "3proxy_${PORT}[^0-9]" | cut -d: -f1 | sort -rn); do
         iptables -D INPUT $((_rn - 1)) 2>/dev/null || true
     done
     # Remove old user-whitelist rules (spec mirrors the create below)
@@ -1452,6 +1687,10 @@ setup_iptables_for_port() {
     command -v firewall-cmd >/dev/null 2>&1 && \
         firewall-cmd --add-port="$PORT"/tcp --permanent >/dev/null 2>&1 && \
         firewall-cmd --reload >/dev/null 2>&1 || true
+
+    # MED-3: the ruleset changed - refresh the persistent save so a
+    # reboot does not lose the proxy's rules on a 3proxy-only box.
+    nx_3proxy_save_rules 2>/dev/null || true
 }
 
 # ── Run a command with visible "working" feedback ──────────
@@ -1519,9 +1758,13 @@ pick_apt_mirror() {
 # selected mirror. The original config is kept as *.bak so nothing is lost.
 configure_apt_mirror() {
     local os="$1" code="$2" mirror="$3"
-    [ -f /etc/apt/sources.list ] && cp -a /etc/apt/sources.list /etc/apt/sources.list.bak 2>/dev/null || true
+    # LOW-7: never overwrite an existing .bak - the first backup is
+    # the pre-NexoShield original; later runs must preserve it, or
+    # an uninstall restore would hand back OUR mirror list.
+    [ -f /etc/apt/sources.list ] && [ ! -f /etc/apt/sources.list.bak ] && \
+        cp -a /etc/apt/sources.list /etc/apt/sources.list.bak 2>/dev/null || true
     for _f in /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list; do
-        [ -e "$_f" ] && cp -a "$_f" "$_f.bak" 2>/dev/null || true
+        [ -e "$_f" ] && [ ! -f "$_f.bak" ] && cp -a "$_f" "$_f.bak" 2>/dev/null || true
     done
     # On modern Ubuntu the default is deb822 (ubuntu.sources); use classic list.
     rm -f /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || true
@@ -1539,7 +1782,10 @@ _port_held_by_other() {
     if ss -tlnp 2>/dev/null | grep -qE ":$P\b.*\"3proxy\""; then
         return 1
     fi
-    ss -tuln 2>/dev/null | grep -qE ":$P\b"
+    # NIT-2: TCP listeners only (-tln). A UDP listener on the same
+    # number is a different protocol namespace, not a conflict for
+    # a TCP proxy port.
+    ss -tln 2>/dev/null | grep -qE ":$P\b"
 }
 
 # pick_proxy_port: settle PORT for install/update.
@@ -1570,6 +1816,26 @@ pick_proxy_port() {
         echo -e "${RED}No free port found after 20 attempts (last tried: $PORT). Aborting - nothing was written.${NC}" >&2
         return 1
     fi
+    return 0
+}
+
+# regen_proxy_traffic_accum — regenerate the derived accumulator
+# script from the live lib functions (single source of truth). Used
+# by install_proxy and by the menu self-update (MED-7): the timer
+# executes this file directly, so after a self-update it would
+# otherwise keep running the previous version's lib code. Atomic
+# write (tmp + rename) so the timer never reads a half-written file.
+regen_proxy_traffic_accum() {
+    local _tmp
+    _tmp=$(mktemp 2>/dev/null || echo "")
+    [ -z "$_tmp" ] && return 1
+    {
+        printf '%s\n' '#!/bin/bash' '# Generated by NexoShield - recreated on every Install/Update.'
+        declare -f nx_proxy_stats_top nx_pin_proxy_stats_rules nx_proxy_stats_bytes nx_proxy_port_from_config nx_proxy_traffic_accum
+        printf '%s\n' 'nx_proxy_traffic_accum "$@"'
+    } > "$_tmp" 2>/dev/null || { rm -f "$_tmp"; return 1; }
+    chmod 755 "$_tmp" 2>/dev/null || true
+    mv "$_tmp" /usr/local/bin/nx-proxy-traffic-accum 2>/dev/null || { rm -f "$_tmp"; return 1; }
     return 0
 }
 
@@ -1675,9 +1941,24 @@ install_proxy() {
     fi
     cd /; rm -rf "$TMPDIR_BUILD"
 
+    # MED-4: fail closed when a required binary is absent after the
+    # steps above (dependency failures are tolerated with a warning,
+    # so a missing binary must not surface later as a half-installed
+    # proxy printing success).
+    if [ ! -x "$PROXY_BIN" ]; then
+        echo -e "${RED}3proxy binary missing at $PROXY_BIN after install - aborting.${NC}" >&2
+        return 1
+    fi
+    if ! command -v iptables >/dev/null 2>&1; then
+        echo -e "${RED}iptables binary missing after dependency install - aborting.${NC}" >&2
+        return 1
+    fi
+
     echo -e "${YELLOW}[3/7] Port configuration...${NC}"
-    _OLD_PORT=""
-    [ -f /etc/3proxy/install.info ] && _OLD_PORT=$(grep '^PORT=' /etc/3proxy/install.info 2>/dev/null | cut -d= -f2- || true)
+    # LOW-6: the live config is the primary port source (install.info
+    # can lag it); install.info stays as the fallback.
+    _OLD_PORT="$(nx_proxy_port_from_config 2>/dev/null || true)"
+    [ -z "$_OLD_PORT" ] && [ -f /etc/3proxy/install.info ] && _OLD_PORT=$(grep '^PORT=' /etc/3proxy/install.info 2>/dev/null | cut -d= -f2- || true)
     pick_proxy_port || return 1
     # A deliberate port change vacates the old port: drop its
     # firewall rules so the old port does not stay open behind us.
@@ -1735,9 +2016,29 @@ install_proxy() {
     chmod 750 "$PROXY_LOG_DIR"
     chgrp nexoproxy /etc/3proxy 2>/dev/null || true
     chmod 750 /etc/3proxy
-    echo "users $PROXY_USER:CL:$PROXY_PASS" > "$PROXY_USERS"
+    # LOW-11: preserve any other users in users.cfg (manual additions)
+    # - replace only the managed user's line instead of wiping the file.
+    if [ -f "$PROXY_USERS" ] && [ -n "$PROXY_USER" ]; then
+        grep -vF "users $PROXY_USER:CL:" "$PROXY_USERS" > "$PROXY_USERS.tmp" 2>/dev/null || true
+        echo "users $PROXY_USER:CL:$PROXY_PASS" >> "$PROXY_USERS.tmp"
+        mv "$PROXY_USERS.tmp" "$PROXY_USERS"
+    else
+        echo "users $PROXY_USER:CL:$PROXY_PASS" > "$PROXY_USERS"
+    fi
     chgrp nexoproxy "$PROXY_USERS" 2>/dev/null || true
     chmod 640 "$PROXY_USERS"
+
+    # HIGH-1: back up the working config + install.info BEFORE
+    # rewriting them, so a failed restart below can roll back to
+    # the previous working proxy instead of leaving it down.
+    _ROLLBACK_DIR=""
+    if [ -f "$PROXY_CONF" ] || [ -f /etc/3proxy/install.info ]; then
+        _ROLLBACK_DIR=$(mktemp -d 2>/dev/null || echo "")
+        if [ -n "$_ROLLBACK_DIR" ]; then
+            [ -f "$PROXY_CONF" ] && cp -a "$PROXY_CONF" "$_ROLLBACK_DIR/3proxy.cfg" 2>/dev/null || true
+            [ -f /etc/3proxy/install.info ] && cp -a /etc/3proxy/install.info "$_ROLLBACK_DIR/install.info" 2>/dev/null || true
+        fi
+    fi
 
     echo -e "${YELLOW}[5/7] Writing config...${NC}"
     cat > "$PROXY_CONF" << EOF
@@ -1808,7 +2109,44 @@ $PROXY_LOG_DIR/*.log {
 EOF
 
     echo -e "${YELLOW}[6/7] Firewall rules (CF=unlimited)...${NC}"
-    setup_iptables_for_port "$PORT"
+    setup_iptables_for_port "$PORT" || return 1
+    # MED-4: verify the rules actually landed. Failed creates used
+    # to be ignored (no set -e, no verification pass), so a lock
+    # held past the 5 s wait or a backend error left the install
+    # printing success with the port effectively closed (or CF
+    # traffic rate-limited). Fail closed instead.
+    if ! iptables -C INPUT -p tcp --dport "$PORT" -j ACCEPT 2>/dev/null; then
+        echo -e "${RED}Proxy port ACCEPT rule did not land - refusing to report success.${NC}" >&2
+        return 1
+    fi
+    if ! iptables -S INPUT 2>/dev/null | grep -qF '3proxy_stats_in' || \
+       ! iptables -S OUTPUT 2>/dev/null | grep -qF '3proxy_stats_out' || \
+       ! iptables -S INPUT 2>/dev/null | grep -qF "3proxy_${PORT}"; then
+        echo -e "${RED}Proxy stats/rate-limit rules did not land - refusing to report success.${NC}" >&2
+        return 1
+    fi
+
+    # MED-3: on a 3proxy-only box nothing persists the firewall rules
+    # (Anti-DDoS owns the restore service when it is installed). Give
+    # the proxy its own restore unit, self-disabling the moment
+    # Anti-DDoS appears (its service loads the same rules.v4 file).
+    if [ ! -f /etc/antiddos/state.conf ]; then
+        cat > /etc/systemd/system/nx-3proxy-restore.service << EOF
+[Unit]
+Description=NexoShield proxy firewall restore (3proxy-only installs)
+After=network-pre.target
+Before=network.target
+[Service]
+Type=oneshot
+ExecCondition=/bin/sh -c 'test ! -f /etc/antiddos/state.conf'
+ExecStart=/sbin/iptables-restore /etc/iptables/rules.v4
+RemainAfterExit=yes
+[Install]
+WantedBy=multi-user.target
+EOF
+        systemctl daemon-reload 2>/dev/null || true
+        systemctl enable nx-3proxy-restore.service >/dev/null 2>&1 || true
+    fi
 
     # Cumulative traffic recording (v3.17.0): kernel counters reset
     # on every rule recreation and reboot, so snapshot their deltas
@@ -1819,11 +2157,7 @@ EOF
     # (a contended lock just defers the snapshot/re-pin to the next
     # 5-minute run), and the wrapper string would break the
     # wave3 wrapper-count regression test.
-    {
-        printf '%s\n' '#!/bin/bash' '# Generated by NexoShield - recreated on every Install/Update.'
-        declare -f nx_proxy_stats_top nx_pin_proxy_stats_rules nx_proxy_stats_bytes nx_proxy_port_from_config nx_proxy_traffic_accum
-        printf '%s\n' 'nx_proxy_traffic_accum "$@"'
-    } > /usr/local/bin/nx-proxy-traffic-accum 2>/dev/null && chmod 755 /usr/local/bin/nx-proxy-traffic-accum 2>/dev/null || true
+    regen_proxy_traffic_accum 2>/dev/null || true
     cat > /etc/systemd/system/nx-proxy-traffic-accum.service << EOF
 [Unit]
 Description=NexoShield proxy traffic accumulator
@@ -1859,18 +2193,6 @@ EOF
         echo -e "${YELLOW}tc not available - bandwidth shaping skipped${NC}"
     fi
 
-    # Save install info
-    mkdir -p /etc/3proxy
-    cat > /etc/3proxy/install.info << EOF
-PORT=$PORT
-USER=$PROXY_USER
-PASS=$PROXY_PASS
-MAX_TOTAL_CONN=$MAX_TOTAL_CONN
-INSTALL_DATE=$(date)
-MAIN_IF=$MAIN_IF
-EOF
-    chmod 600 /etc/3proxy/install.info
-
     systemctl daemon-reload
     systemctl enable 3proxy >/dev/null 2>&1
     systemctl restart 3proxy
@@ -1883,8 +2205,46 @@ EOF
     if ! systemctl is-active 3proxy >/dev/null 2>&1; then
         echo -e "${RED}⚠ 3proxy failed to start! Checking logs...${NC}"
         journalctl -u 3proxy -n 20 --no-pager 2>/dev/null || true
+        if [ -n "$_ROLLBACK_DIR" ] && [ -f "$_ROLLBACK_DIR/3proxy.cfg" ]; then
+            echo -e "${YELLOW}Restoring the previous working configuration...${NC}"
+            # Remove the new port's rules FIRST, while the config
+            # still names the new port (so the snapshot-before-delete
+            # inside covers it), then restore the old config + rules.
+            remove_proxy_port_rules "$PORT" 2>/dev/null || true
+            cp -a "$_ROLLBACK_DIR/3proxy.cfg" "$PROXY_CONF" 2>/dev/null || true
+            [ -f "$_ROLLBACK_DIR/install.info" ] && cp -a "$_ROLLBACK_DIR/install.info" /etc/3proxy/install.info 2>/dev/null || true
+            # A port change already deleted the old port's rules: the
+            # restored service would listen behind no firewall rules
+            # unless they are re-applied for the restored port.
+            _RESTORED_PORT=$(grep -oP 'socks -p\K[0-9]+' "$PROXY_CONF" 2>/dev/null | head -1 || true)
+            [ -n "$_RESTORED_PORT" ] && setup_iptables_for_port "$_RESTORED_PORT" 2>/dev/null || true
+            systemctl restart 3proxy 2>/dev/null || true
+            sleep 2
+            if systemctl is-active 3proxy >/dev/null 2>&1; then
+                echo -e "${GREEN}Previous configuration restored and the old service is running again.${NC}"
+            else
+                echo -e "${RED}WARNING: the previous configuration could not be restarted either - manual intervention needed.${NC}"
+            fi
+        fi
+        [ -n "$_ROLLBACK_DIR" ] && rm -rf "$_ROLLBACK_DIR" 2>/dev/null || true
         return 1
     fi
+    [ -n "$_ROLLBACK_DIR" ] && rm -rf "$_ROLLBACK_DIR" 2>/dev/null || true
+
+    # LOW-12: install.info is written only AFTER the service-start
+    # check passes, so a failed install never leaves install.info
+    # describing a proxy that is not running.
+    # Save install info
+    mkdir -p /etc/3proxy
+    cat > /etc/3proxy/install.info << EOF
+PORT=$PORT
+USER=$PROXY_USER
+PASS=$PROXY_PASS
+MAX_TOTAL_CONN=$MAX_TOTAL_CONN
+INSTALL_DATE=$(date)
+MAIN_IF=$MAIN_IF
+EOF
+    chmod 600 /etc/3proxy/install.info
 
     sep
     echo -e "${GREEN}✓ 3proxy SOCKS5 installed!${NC}"; sep
@@ -1965,7 +2325,7 @@ uninstall_proxy() {
         # Rate-limit rules for this port - by enumeration (BUG-014:
         # older versions created them with varying hitcounts)
         local _rn
-        for _rn in $(iptables -S INPUT 2>/dev/null | grep -n "3proxy_${PORT}" | cut -d: -f1 | sort -rn); do
+        for _rn in $(iptables -S INPUT 2>/dev/null | grep -n "3proxy_${PORT}[^0-9]" | cut -d: -f1 | sort -rn); do
             iptables -D INPUT $((_rn - 1)) 2>/dev/null || true
         done
         # connlimit rule for this port
@@ -1994,16 +2354,34 @@ uninstall_proxy() {
         echo -e "${YELLOW}⚠ Could not detect port — skipping port-specific iptables rules${NC}"
     fi
 
-    # Remove auto-ban iptables rules (tagged with "auto-ban")
-    iptables -S INPUT 2>/dev/null | grep '"auto-ban"' | while read -r rule; do
-        # shellcheck disable=SC2086  # intentional: $rule expands to multiple iptables arguments
-        iptables -D INPUT ${rule#-A INPUT } 2>/dev/null || true
-    done
+    # MED-2: the ruleset changed - rewrite the persistent saves from
+    # the cleaned live state (same filter antiddos remove uses), or
+    # the next boot resurrects the removed proxy rules. The
+    # antiddos save is refreshed only if antiddos already owns one.
+    if [ -d /etc/iptables ]; then
+        iptables-save 2>/dev/null | grep -v -e '"auto-ban"' -e '"subnet-ban"' -e 'f2b-' -e 'fail2ban-' > /etc/iptables/rules.v4 2>/dev/null || true
+    fi
+    if [ -f /etc/antiddos/iptables-antiddos.rules ]; then
+        iptables-save 2>/dev/null | grep -v -e '"auto-ban"' -e '"subnet-ban"' -e 'f2b-' -e 'fail2ban-' > /etc/antiddos/iptables-antiddos.rules 2>/dev/null || true
+    fi
+
+    # LOW-1: NO auto-ban cleanup here. The loop this replaces fed
+    # `iptables -S` output (comments rendered quoted) through
+    # word-splitting, so it never matched anything - and making it
+    # work would mass-unban every daemon ban while the daemon keeps
+    # running. Daemon bans belong to the daemon (BUG-037): it
+    # expires them itself.
 
     # ── Remove tc bandwidth shaping ───────────────────────
     if [ ! -f /etc/antiddos/state.conf ]; then
         MAIN_IF=$(ip route show default 2>/dev/null | awk '/default/{print $5}' | head -1)
         MAIN_IF=${MAIN_IF:-eth0}
+        # LOW-13: the recorded pre-existing qdisc is dropped, not
+        # restored - exact restore is infeasible from the one-line
+        # record, so say so instead of silently dropping it.
+        if [ -s /etc/antiddos/tc-qdisc-before.txt ]; then
+            echo -e "${YELLOW}Note: the pre-existing qdisc ($(cat /etc/antiddos/tc-qdisc-before.txt 2>/dev/null)) is dropped on uninstall (exact restore is not possible from the one-line record).${NC}"
+        fi
         tc qdisc del dev "$MAIN_IF" root 2>/dev/null || true
         rm -f /etc/systemd/system/tc-proxy-limit.service
         rm -f /etc/network/if-up.d/tc-proxy-limit
@@ -2038,6 +2416,14 @@ uninstall_proxy() {
     rm -f /etc/systemd/system/nx-proxy-traffic-accum.timer
     rm -f /usr/local/bin/nx-proxy-traffic-accum
 
+    # ── Remove the proxy's own restore unit (MED-3) ──────
+    # Anti-DDoS's restore service, when present, owns rules.v4
+    # instead; this unit self-disables there, but uninstall removes
+    # it outright.
+    systemctl stop    nx-3proxy-restore.service 2>/dev/null || true
+    systemctl disable nx-3proxy-restore.service 2>/dev/null || true
+    rm -f /etc/systemd/system/nx-3proxy-restore.service
+
     # ── Remove systemd service files ─────────────────────
     rm -f "$SERVICE_FILE"
     [ -f /etc/antiddos/state.conf ] || rm -f /etc/systemd/system/tc-proxy-limit.service
@@ -2056,7 +2442,8 @@ uninstall_proxy() {
     rm -f  /etc/logrotate.d/3proxy
     # BUG-015: /etc/antiddos, /var/lib/antiddos, the daemon log and its
     # state files belong to the Anti-DDoS module and are NOT touched.
-    # Remove the nexoproxy user only if nothing else uses it.
+    # Remove the dedicated nexoproxy user (created by this module for
+    # the proxy service; the service is already stopped above).
     id nexoproxy >/dev/null 2>&1 && \
         userdel nexoproxy 2>/dev/null || true
 
@@ -2073,7 +2460,7 @@ uninstall_proxy() {
 }
 
 show_info() {
-    [ ! -f /etc/3proxy/install.info ] && echo -e "${RED}Not installed.${NC}" && return
+    [ ! -f /etc/3proxy/install.info ] && echo -e "${RED}Not installed.${NC}" && return 1
     local _INFO_USER _INFO_PASS _INFO_PORT
     _INFO_USER=$(grep '^USER=' /etc/3proxy/install.info 2>/dev/null | cut -d= -f2- || echo "?")
     _INFO_PASS=$(grep '^PASS=' /etc/3proxy/install.info 2>/dev/null | cut -d= -f2- || echo "?")
@@ -2092,9 +2479,12 @@ show_info() {
 
 show_stats() {
     PORT=$(get_current_port || true)
-    [ -z "$PORT" ] && echo -e "${RED}Not installed.${NC}" && return
+    [ -z "$PORT" ] && echo -e "${RED}Not installed.${NC}" && return 1
     sep; echo -e "  ${CYAN}Stats - port $PORT${NC}"; sep
-    ACTIVE=$(ss -tnp state established 2>/dev/null | grep -c ":$PORT " || true)
+    # LOW-10: count only flows whose LOCAL side is the proxy port.
+    # The old grep matched the peer side too (":$PORT " appears in
+    # either column), inflating the count with outbound flows.
+    ACTIVE=$(ss -tnp state established 2>/dev/null | awk -v p=":$PORT" '$5 ~ p"$" {c++} END {print c+0}')
     ACTIVE="${ACTIVE:-0}"
     echo -e "  Active connections: ${GREEN}$ACTIVE${NC}"
 
@@ -2251,28 +2641,37 @@ set_proxy_password() {
 }
 
 # ── CLI flags (called from proxy-menu.sh) ────────────────
+# MED-6: every flag propagates the action's exit code (the old code
+# exited 0 regardless, so wrappers and monitoring could not detect
+# a failed install/remove). F6: unknown flags error out instead of
+# silently falling through to the interactive menu.
 case "${1:-}" in
-    --install|-i) install_proxy;  exit 0 ;;
-    --remove|-r)  uninstall_proxy; exit 0 ;;
-    --stats|-s)   show_stats;      exit 0 ;;
-    --info)       show_info; printf '%s\n' "  Press Enter to continue..." >/dev/tty; read -r _PE </dev/tty 2>/dev/null || true; exit 0 ;;
-    --restart)    systemctl restart 3proxy 2>/dev/null && \
-                      echo -e "${GREEN}Restarted${NC}" || echo -e "${RED}Error${NC}"; exit 0 ;;
-    --stop)       systemctl stop 3proxy 2>/dev/null && \
-                      echo -e "${GREEN}Stopped${NC}" || echo -e "${RED}Error${NC}"; exit 0 ;;
-    --start)      systemctl start 3proxy 2>/dev/null && \
-                      echo -e "${GREEN}Started${NC}" || echo -e "${RED}Error${NC}"; exit 0 ;;
+    --install|-i) install_proxy;  exit $? ;;
+    --remove|-r)  uninstall_proxy; exit $? ;;
+    --stats|-s)   show_stats;      exit $? ;;
+    --info)       show_info; _rc=$?; printf '%s\n' "  Press Enter to continue..." >/dev/tty; read -r _PE </dev/tty 2>/dev/null || true; exit "$_rc" ;;
+    --restart)    if systemctl restart 3proxy 2>/dev/null; then echo -e "${GREEN}Restarted${NC}"; exit 0; else echo -e "${RED}Error${NC}"; exit 1; fi ;;
+    --stop)       if systemctl stop 3proxy 2>/dev/null; then echo -e "${GREEN}Stopped${NC}"; exit 0; else echo -e "${RED}Error${NC}"; exit 1; fi ;;
+    --start)      if systemctl start 3proxy 2>/dev/null; then echo -e "${GREEN}Started${NC}"; exit 0; else echo -e "${RED}Error${NC}"; exit 1; fi ;;
     --delete-user) delete_proxy_user; exit $? ;;
     --log)        tail -f "$PROXY_LOG_DIR"/access.log.* 2>/dev/null || \
-                      journalctl -u 3proxy -f --no-pager; exit 0 ;;
+                      journalctl -u 3proxy -f --no-pager; exit $? ;;
     --tc-status)  MAIN_IF=$(ip route show default 2>/dev/null | awk '/default/{print $5}' | head -1)
                   echo -e "${CYAN}tc classes on ${MAIN_IF:-eth0}:${NC}"
                   tc class show dev "${MAIN_IF:-eth0}" 2>/dev/null || echo "tc not configured"
                   printf '%s\n' "  Press Enter to continue..." >/dev/tty; read -r _PE </dev/tty 2>/dev/null || true; exit 0 ;;
     --change-pass) set_proxy_password; exit $? ;;
+    --regen-accumulator) regen_proxy_traffic_accum; exit $? ;;
+    *)  if [ -n "${1:-}" ]; then echo "Unknown option: $1 (usage: 3proxy-socks5.sh [--install|--remove|--stats|--info|--restart|--stop|--start|--log|--tc-status|--delete-user|--change-pass])" >&2; exit 2; fi ;;
 esac
 
 # Standalone mode (run directly without args): show own menu
+# LOW-8: without a terminal every /dev/tty read below fails
+# instantly and the loop spins forever - refuse plainly instead.
+if ! : </dev/tty 2>/dev/null; then
+    echo "3proxy menu requires a terminal (use CLI flags for scripting)." >&2
+    exit 1
+fi
 while true; do
     show_menu
     printf '%s' "  Enter choice: " >/dev/tty; read -r CH </dev/tty || CH=""
@@ -2317,7 +2716,7 @@ TARGET_FILE="/etc/sysctl.d/99-vpn-optimized.conf"
 SNAPSHOT_DIR="/var/lib/vpn-sysctl-snapshots"
 LOG_FILE="/var/log/vpn-sysctl-optimizer.log"
 LOCK_FILE="/var/run/vpn-sysctl.lock"
-SCRIPT_VERSION="3.17.0"
+SCRIPT_VERSION="3.18.0"
 
 [ "$EUID" -ne 0 ] && echo -e "${RED}Root required${NC}" && exit 1
 
@@ -2908,7 +3307,7 @@ cat > "$INSTALL_DIR/.proxy-menu.sh.nxnew" << 'MENU_SCRIPT'
 # SC2094 - atomic state writes via tmp-file + rename, which the
 # checker flags as same-file pipelines. Both classes were audited
 # site-by-site during the fix waves (docs/FIX-PLAN.md).
-VERSION="3.17.0"
+VERSION="3.18.0"
 INSTALL_DIR="/opt/proxy-manager"
 _BSRC="${BASH_SOURCE[0]:-}"
 if [ -n "$_BSRC" ] && [ "$_BSRC" != "/dev/stdin" ] && [[ "$_BSRC" != /dev/fd/* ]]; then
@@ -3010,15 +3409,56 @@ draw_header() {
 # NX_SCORE_FILE); production defaults are the real paths.
 NX_STATE_DIR="${NX_STATE_DIR:-/etc/antiddos}"
 NX_SCORE_FILE="${NX_SCORE_FILE:-/var/lib/antiddos/scores/reputation.dat}"
-# The daemon's LIVE throttle state is /tmp/autoban_throttle; the
+# The daemon's LIVE throttle state is /run/nexoshield/autoban_throttle; the
 # persistent mirror (U-11) is /etc/antiddos/throttled.list. Displays
 # read the live file, falling back to the mirror right after a
 # reboot before the daemon has restored its state.
-NX_THROTTLE_LIST="${NX_THROTTLE_LIST:-/tmp/autoban_throttle}"
+NX_THROTTLE_LIST="${NX_THROTTLE_LIST:-/run/nexoshield/autoban_throttle}"
 NX_THROTTLE_MIRROR="${NX_THROTTLE_MIRROR:-/etc/antiddos/throttled.list}"
 nx_throttle_file() {
     if [ -f "$NX_THROTTLE_LIST" ]; then echo "$NX_THROTTLE_LIST";
     elif [ -f "$NX_THROTTLE_MIRROR" ]; then echo "$NX_THROTTLE_MIRROR"; fi
+}
+
+# nx_valid_ip_or_cidr <value> — menu-program twin of antiddos's
+# validator (the menu cannot call that file). v4 octets are range
+# checked and leading zeros rejected (L10: "010.0.0.1" is octal to
+# some parsers, so it must never validate as 10.0.0.1); v6 uses the
+# same charset/group rules as the antiddos validator, embedded-v4
+# forms rejected.
+nx_valid_ip_or_cidr() {
+    local input="${1:-}" addr mask o
+    case "$input" in
+        */*) addr="${input%%/*}"; mask="${input#*/}" ;;
+        *)   addr="$input"; mask="" ;;
+    esac
+    case "$addr" in
+        *:*)
+            case "$addr" in *[!0-9a-fA-F:.]*|*:::*|*.*) return 1 ;; esac
+            case "$addr" in *::*) case "${addr#*::}" in *::*) return 1 ;; esac ;; esac
+            if [ -n "$mask" ]; then
+                case "$mask" in ''|*[!0-9]*) return 1 ;; esac
+                [ "${#mask}" -le 3 ] || return 1
+                (( 10#$mask <= 128 )) || return 1
+            fi
+            return 0 ;;
+    esac
+    case "$addr" in ""|.*|*.|*..*|*[!0-9.]*) return 1 ;; esac
+    local o1 o2 o3 o4 extra
+    IFS='.' read -r o1 o2 o3 o4 extra <<< "$addr"
+    [ -z "${extra:-}" ] || return 1
+    for o in "$o1" "$o2" "$o3" "$o4"; do
+        case "$o" in ""|*[!0-9]*) return 1 ;; esac
+        [ "${#o}" -le 3 ] || return 1
+        case "$o" in 0?*) return 1 ;; esac
+        (( 10#$o <= 255 )) || return 1
+    done
+    if [ -n "$mask" ]; then
+        case "$mask" in ''|*[!0-9]*) return 1 ;; esac
+        [ "${#mask}" -le 2 ] || return 1
+        (( 10#$mask <= 32 )) || return 1
+    fi
+    return 0
 }
 
 # nx_unban_ip <ip> - the ONE unban path (U-2). The Security screen's
@@ -3027,34 +3467,45 @@ nx_throttle_file() {
 # banned.list - so the "unbanned" IP was re-banned at the next
 # daemon reconcile. Exact tagged deletes, exact state edits,
 # throttle-filter cleanup, fail2ban unban - shared by every screen.
+# F11: validates its input (return 2 when invalid) and reports
+# honestly - return 0 only when something was actually removed, 1
+# when the IP was found nowhere - so callers never print
+# "unblocked (all layers)" for a no-op.
 nx_unban_ip() {
-    local _ip="$1" _tf _prio _if _j
+    local _ip="$1" _tf _prio _if _j _removed=0
+    nx_valid_ip_or_cidr "$_ip" || return 2
     # Phase 1b: if the daemon's nft backend holds this ban, remove the
     # set element too (the iptables deletes below stay as belt-and-braces).
     if command -v nft >/dev/null 2>&1; then
         case "$_ip" in
-            *:*) nft delete element inet nexoshield ban6 "{ $_ip }" >/dev/null 2>&1 || true ;;
-            *)   nft delete element inet nexoshield ban4 "{ $_ip }" >/dev/null 2>&1 || true ;;
+            *:*) nft delete element inet nexoshield ban6 "{ $_ip }" >/dev/null 2>&1 && _removed=1 || true ;;
+            *)   nft delete element inet nexoshield ban4 "{ $_ip }" >/dev/null 2>&1 && _removed=1 || true ;;
         esac
     fi
     case "$_ip" in
         *:*)
-            ip6tables -D INPUT -s "$_ip" -m comment --comment "auto-ban" -j DROP 2>/dev/null || true ;;
+            ip6tables -D INPUT -s "$_ip" -m comment --comment "auto-ban" -j DROP 2>/dev/null && _removed=1 || true ;;
         *)
-            iptables -D INPUT -s "$_ip" -m comment --comment "auto-ban" -j DROP 2>/dev/null || \
-            iptables -D INPUT -s "$_ip" -m comment --comment "subnet-ban" -j DROP 2>/dev/null || \
-            iptables -D INPUT -s "$_ip" -j DROP 2>/dev/null || true ;;
+            if iptables -D INPUT -s "$_ip" -m comment --comment "auto-ban" -j DROP 2>/dev/null; then
+                _removed=1
+            elif iptables -D INPUT -s "$_ip" -m comment --comment "subnet-ban" -j DROP 2>/dev/null; then
+                _removed=1
+            elif iptables -D INPUT -s "$_ip" -j DROP 2>/dev/null; then
+                _removed=1
+            fi ;;
     esac
     for _tf in "$NX_THROTTLE_LIST" "$NX_THROTTLE_MIRROR"; do
         [ -f "$_tf" ] || continue
         _prio=$(awk -v x="$_ip" '$1==x{print $2}' "$_tf" 2>/dev/null | head -1)
         if [ -n "$_prio" ]; then
+            _removed=1
             _if=$(ip route show default 2>/dev/null | awk '/default/{print $5}' | head -1)
             [ -n "$_if" ] && tc filter del dev "$_if" parent 1: prio "$_prio" 2>/dev/null || true
         fi
         awk -v x="$_ip" '$1!=x' "$_tf" > "$_tf.nxtmp" 2>/dev/null && mv "$_tf.nxtmp" "$_tf"
     done
     if [ -f "$NX_STATE_DIR/banned.list" ]; then
+        awk -v x="$_ip" '$1==x{found=1} END{exit !found}' "$NX_STATE_DIR/banned.list" 2>/dev/null && _removed=1 || true
         awk -v x="$_ip" '$1!=x' "$NX_STATE_DIR/banned.list" > "$NX_STATE_DIR/banned.list.nxtmp" 2>/dev/null && \
             mv "$NX_STATE_DIR/banned.list.nxtmp" "$NX_STATE_DIR/banned.list"
     fi
@@ -3063,6 +3514,7 @@ nx_unban_ip() {
         [ -z "$_j" ] && continue
         fail2ban-client set "$_j" unbanip "$_ip" 2>/dev/null || true
     done
+    [ "$_removed" -eq 1 ]
 }
 
 ui_input() {
@@ -3649,9 +4101,14 @@ menu_security() {
                    # fail2ban). The old inline copy deleted a rule
                    # spec the daemon never creates and never touched
                    # banned.list, so the IP was re-banned on the
-                   # daemon's next reconcile.
-                   nx_unban_ip "$UIP"
-                   ok "$UIP unblocked (all layers)"
+                   # daemon's next reconcile. F11: honest result.
+                   if nx_unban_ip "$UIP"; then
+                       ok "$UIP unblocked (all layers)"
+                   elif [ "$?" -eq 2 ]; then
+                       warn "Invalid IP/CIDR: $UIP"
+                   else
+                       warn "$UIP was not found in any layer (nothing removed)"
+                   fi
                else
                    warn "No IP entered"
                fi
@@ -3778,7 +4235,7 @@ nx_update_nexoshield() {
     fi
     if ! bash -n "$_tmp/install.sh" 2>/dev/null || \
        ! grep -q "NexoShield" "$_tmp/install.sh" || \
-       ! grep -q "^VERSION=\"$_latest\"" "$_tmp/install.sh"; then
+       ! grep -qF "VERSION=\"$_latest\"" "$_tmp/install.sh"; then
         warn "Downloaded installer failed verification - nothing was changed."
         rm -rf "$_tmp"; return 1
     fi
@@ -3794,7 +4251,25 @@ nx_update_nexoshield() {
         warn "Installer exited with an error - the previous install was left untouched."
         return 1
     fi
+    # MED-7: the installer swaps module scripts but does not activate
+    # them - services and rules still run the previous version until
+    # each module is re-applied. Regenerate the one derived file a
+    # timer executes directly (the accumulator script), and say
+    # plainly what still needs a re-run.
+    if [ -f /etc/3proxy/install.info ] && [ -x "$SCRIPT_DIR/3proxy-socks5.sh" ]; then
+        if "$SCRIPT_DIR/3proxy-socks5.sh" --regen-accumulator 2>/dev/null; then
+            echo -e "  ${DIM}Proxy traffic accumulator regenerated for v$_latest.${NC}"
+        else
+            warn "Could not regenerate the proxy traffic accumulator - re-run the proxy Install/Update to refresh it."
+        fi
+    fi
     ok "Updated to NexoShield v$_latest."
+    _STALE=""
+    [ -f /etc/3proxy/install.info ] && _STALE="3proxy"
+    [ -f /etc/antiddos/state.conf ] && _STALE="${_STALE:+$_STALE, }Anti-DDoS"
+    if [ -n "$_STALE" ]; then
+        echo -e "  ${YELLOW}Note: running services and firewall rules still use the previous version until you re-apply each installed module ($_STALE: re-run its Install/Update).${NC}"
+    fi
     if [ -z "${NX_UI_STDIN:-}" ] && ui_confirm "Restart the menu now to use v$_latest?"; then
         exec bash "$SCRIPT_DIR/proxy-menu.sh"
     fi
@@ -3932,8 +4407,15 @@ menu_antiddos() {
                    # The shared engine-grade unban (U-2): exact tagged
                    # deletes (BUG-038), exact state edits, throttle
                    # cleanup, fail2ban - one implementation everywhere.
-                   nx_unban_ip "$UIP"
-                   ok "$UIP unblocked (all layers)"
+                   # F11: honest result - success only when something
+                   # was actually removed.
+                   if nx_unban_ip "$UIP"; then
+                       ok "$UIP unblocked (all layers)"
+                   elif [ "$?" -eq 2 ]; then
+                       warn "Invalid IP/CIDR: $UIP"
+                   else
+                       warn "$UIP was not found in any layer (nothing removed)"
+                   fi
                else
                    warn "No IP entered"
                fi
@@ -4056,11 +4538,13 @@ _autoban_control() {
 }
 
 # ── CLI (v3.7): scriptable views, no menu ─────────────────
+# F6: unknown flags error out instead of silently opening the menu.
 case "${1:-}" in
     --status)  nx_status_plain; exit 0 ;;
     --bans)    nx_bans_plain; exit 0 ;;
     --version) echo "NexoShield v$VERSION"; exit 0 ;;
-    --help)    echo "Usage: proxy-menu.sh [--status|--bans|--version]  (no flag = interactive menu)"; exit 0 ;;
+    --help)    echo "Usage: shield [--status|--bans|--version]  (no flag = interactive menu)"; exit 0 ;;
+    *)  if [ -n "${1:-}" ]; then echo "Unknown option: $1" >&2; exit 2; fi ;;
 esac
 
 # ── Main Menu (dashboard home, v3.7) ──────────────────────
@@ -4120,7 +4604,7 @@ cat > "$INSTALL_DIR/.antiddos.sh.nxnew" << 'ANTIDDOS_SCRIPT'
 # checker flags as same-file pipelines. Both classes were audited
 # site-by-site during the fix waves (docs/FIX-PLAN.md).
 # ============================================================
-#  Anti-DDoS Protection Manager v3.17.0
+#  Anti-DDoS Protection Manager v3.18.0
 #
 #  Layers:
 #    1. Kernel (sysctl hardening + tight conntrack timeouts)
@@ -4144,7 +4628,7 @@ set -euo pipefail
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 CYAN='\033[0;36m'; WHITE='\033[1;37m'; DIM='\033[2m'; BOLD='\033[1m'; NC='\033[0m'
 
-SCRIPT_VERSION="3.17.0"
+SCRIPT_VERSION="3.18.0"
 LOG_FILE="/var/log/antiddos.log"
 STATE_FILE="/etc/antiddos/state.conf"
 BANNED_LIST="/etc/antiddos/banned.list"
@@ -4158,6 +4642,16 @@ WHITELIST_FILE="/etc/antiddos/whitelist.list"
 SELF_IPS_FILE="/etc/antiddos/self-ips.list"
 PUBLIC_IPS_FILE="/etc/antiddos/public-ips.list"
 EXEMPT_FILE="/etc/antiddos/exempt.list"
+
+# Daemon live state (F5): /run/nexoshield, not /tmp — /tmp entries are
+# world-writable, so a pre-planted symlink could make a root truncate
+# or append hit an attacker-chosen file. /run is root-owned tmpfs
+# (same volatility semantics as /tmp); the persistent mirrors stay
+# under /etc/antiddos. The daemon uses the same defaults.
+WATCH_LIST="${WATCH_LIST:-/run/nexoshield/autoban_watch}"
+THROTTLE_LIST="${THROTTLE_LIST:-/run/nexoshield/autoban_throttle}"
+SUBNET_WATCH_LIST="${SUBNET_WATCH_LIST:-/run/nexoshield/autoban_subnet_watch}"
+mkdir -p /run/nexoshield 2>/dev/null || true
 
 [ "$EUID" -ne 0 ] && echo -e "${RED}Root required${NC}" && exit 1
 
@@ -4207,12 +4701,7 @@ if [ -f /etc/antiddos/cloudflare-ipv6.list ]; then
 fi
 
 # Get all server's own public IPs (auto-whitelist)
-get_server_ips() {
-    # All public IPs of this server (for auto-whitelist)
-    ip -4 addr show 2>/dev/null | grep 'inet ' | \
-        grep -v '127\.\|10\.\|192\.168\.\|172\.\(1[6-9]\|2[0-9]\|3[01]\)\.' | \
-        awk '{print $2}' | cut -d/ -f1
-}
+# (intentionally empty: the only function this lib held was removed - see above)
 list_self_ips() {
     { ip -4 addr show 2>/dev/null | grep -oP '(?<=inet )\d+\.\d+\.\d+\.\d+'
       hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'
@@ -4368,11 +4857,32 @@ _nx_cfg_warn() {
     [ -n "${_NX_CFG_WARNED[$1]:-}" ] && return 0
     _NX_CFG_WARNED[$1]=1
     if declare -F log >/dev/null 2>&1; then
-        log " CONFIG: ignoring invalid value for '$1' in $NX_CONFIG_FILE (using default)"
+        log " CONFIG: ignoring ${2:-invalid value} for '$1' in $NX_CONFIG_FILE (using default)"
     else
-        echo "CONFIG: ignoring invalid value for '$1' in $NX_CONFIG_FILE (using default)" >&2
+        echo "CONFIG: ignoring ${2:-invalid value} for '$1' in $NX_CONFIG_FILE (using default)" >&2
     fi
 }
+
+# L7: sane ranges for every documented scoring key (min:max). A
+# value outside its range is ignored with a warning and the default
+# is used instead - a typo like conn_threshold=-5 or score_ban=500
+# must never silently disarm or invert a gate. Unknown keys are
+# unchecked (nx_cfg stays generic). Floats compare via awk.
+declare -A _NX_CFG_RANGE=(
+    [score_ban]="0:100" [score_hard]="0:100" [score_throttle]="0:100" [score_suspect]="0:100"
+    [score_recover_per_min]="0:1000" [probation_recover_per_min]="0:1000" [score_drop_cap_per_min]="0:1000"
+    [probation_score]="0:100" [probation_seconds]="0:86400"
+    [churn_allow_per_sec]="0:100000" [churn_weight]="0:1000" [churn_cap]="0:100"
+    [sust_divisor]="1:100000" [sust_cap]="0:100"
+    [syn_min]="0:100000" [syn_ratio]="0:1" [syn_weight]="0:1000" [syn_cap]="0:100"
+    [conn_threshold]="0:1000000" [ban_conn_threshold]="0:1000000" [observe_seconds]="0:3600"
+    [ban_base_minutes]="1:10080" [ban_max_minutes]="1:43200" [ban_hours_fallback]="0:168"
+    [subnet_threshold]="0:1000000" [subnet_ban_threshold]="0:1000000"
+    [subnet_min_offenders]="1:100000" [subnet_ban_minutes]="1:10080"
+    [stress_gate]="0:1" [adaptive_enabled]="0:1"
+    [xdp_syncookie_rate]="0:10000000" [xdp_overflow_rate]="0:10000000" [xdp_syn_rate]="0:10000000"
+    [xdp_calm_seconds]="0:86400"
+)
 
 nx_cfg() {
     local key="$1" def="$2" raw=""
@@ -4387,6 +4897,16 @@ nx_cfg() {
     fi
     if [ -n "$raw" ]; then
         if [[ "$raw" =~ ^-?[0-9]+([.][0-9]+)?$ ]]; then
+            local _range="${_NX_CFG_RANGE[$key]:-}"
+            if [ -n "$_range" ]; then
+                local _lo="${_range%%:*}" _hi="${_range#*:}"
+                if ! awk -v v="$raw" -v lo="$_lo" -v hi="$_hi" 'BEGIN{exit !(v>=lo && v<=hi)}' 2>/dev/null; then
+                    _nx_cfg_warn "$key" "out-of-range value '$raw' (allowed $_lo-$_hi)"
+                    _NX_CFG_CACHE[$key]="$def"
+                    printf '%s' "$def"
+                    return 0
+                fi
+            fi
             _NX_CFG_CACHE[$key]="$raw"
             printf '%s' "$raw"
             return 0
@@ -4493,11 +5013,23 @@ nx_install_binary() {
 # re-pin never destroys a healthy counter. Moving a target-less
 # rule changes no allow/block behaviour - it only counts.
 nx_proxy_stats_top() {
-    # nx_proxy_stats_top CHAIN COMMENT -> 0 if the chain's first
-    # rule carries COMMENT.
+    # nx_proxy_stats_top CHAIN COMMENT [PORT] -> 0 if the chain's
+    # first rule carries COMMENT (and, when PORT is given, the
+    # matching --dport/--sport PORT). LOW-2: a stale other-port
+    # rule at position 1 used to satisfy the comment-only check, so
+    # the pin became a no-op and the accumulator read the wrong
+    # counter. The trailing-space/EOL alternatives keep port 1080
+    # from matching 10801.
     local _first
     _first=$(iptables -S "$1" 2>/dev/null | grep -m1 '^-A' || true)
-    case "$_first" in *"$2"*) return 0 ;; *) return 1 ;; esac
+    case "$_first" in *"$2"*) ;; *) return 1 ;; esac
+    if [ -n "${3:-}" ]; then
+        case "$_first" in
+            *"--dport ${3} "*|*"--dport ${3}"|*"--sport ${3} "*|*"--sport ${3}") ;;
+            *) return 1 ;;
+        esac
+    fi
+    return 0
 }
 
 nx_pin_proxy_stats_rules() {
@@ -4505,20 +5037,26 @@ nx_pin_proxy_stats_rules() {
     # at position 1. No-op (counter preserved) when already pinned.
     local PORT="$1"
     [ -n "$PORT" ] || return 0
-    if ! nx_proxy_stats_top INPUT "3proxy_stats_in"; then
+    if ! nx_proxy_stats_top INPUT "3proxy_stats_in" "$PORT"; then
         iptables -D INPUT -p tcp --dport "$PORT" -m comment --comment "3proxy_stats_in" 2>/dev/null || true
         iptables -I INPUT 1 -p tcp --dport "$PORT" -m comment --comment "3proxy_stats_in" 2>/dev/null || true
     fi
-    if ! nx_proxy_stats_top OUTPUT "3proxy_stats_out"; then
+    if ! nx_proxy_stats_top OUTPUT "3proxy_stats_out" "$PORT"; then
         iptables -D OUTPUT -p tcp --sport "$PORT" -m comment --comment "3proxy_stats_out" 2>/dev/null || true
         iptables -I OUTPUT 1 -p tcp --sport "$PORT" -m comment --comment "3proxy_stats_out" 2>/dev/null || true
     fi
 }
 
 nx_proxy_stats_bytes() {
-    # nx_proxy_stats_bytes CHAIN COMMENT -> counter bytes (or empty).
-    # Same parse as show_stats: the bytes column of `iptables -L`.
-    iptables -L "$1" -v -n -x 2>/dev/null | grep "$2" | awk '{print $2}' | head -1
+    # nx_proxy_stats_bytes CHAIN COMMENT [PORT] -> counter bytes
+    # (or empty). Same parse as show_stats: the bytes column of
+    # `iptables -L`. With PORT, the row must also carry dpt:/spt:
+    # PORT (the [^0-9] guard keeps 1080 from matching 10801).
+    if [ -n "${3:-}" ]; then
+        iptables -L "$1" -v -n -x 2>/dev/null | grep "$2" | grep -E "(dpt|spt):${3}([^0-9]|$)" | awk '{print $2}' | head -1
+    else
+        iptables -L "$1" -v -n -x 2>/dev/null | grep "$2" | awk '{print $2}' | head -1
+    fi
 }
 
 nx_proxy_port_from_config() {
@@ -4532,13 +5070,31 @@ nx_proxy_port_from_config() {
 # recreated, so the delta is the new counter itself, never negative.
 # A missing rule (proxy removed, rules wiped) leaves totals untouched.
 nx_proxy_traffic_accum() {
-    local PORT STATE CUR_IN CUR_OUT LAST_IN LAST_OUT TOT_IN TOT_OUT
+    # LOW-3: the timer, the pin callers and a manual run can overlap
+    # (two writers interleaving read-compute-write would lose a
+    # delta). A non-blocking lock defers a contended run to the
+    # next 5-minute tick instead of blocking the caller - the
+    # snapshot is periodic, never urgent. No flock binary: proceed
+    # unlocked (the old behaviour), never fail the caller.
+    local PORT STATE CUR_IN CUR_OUT LAST_IN LAST_OUT TOT_IN TOT_OUT _lock_fd _rc
     PORT=$(nx_proxy_port_from_config)
     [ -n "$PORT" ] || return 0
     STATE="${NX_PROXY_TRAFFIC_STATE:-/etc/3proxy/traffic-total.state}"
-    CUR_IN=$(nx_proxy_stats_bytes INPUT "3proxy_stats_in")
-    CUR_OUT=$(nx_proxy_stats_bytes OUTPUT "3proxy_stats_out")
-    [ -n "$CUR_IN" ] && [ -n "$CUR_OUT" ] || return 0
+    if command -v flock >/dev/null 2>&1; then
+        exec {_lock_fd}>"${STATE}.lock" 2>/dev/null || _lock_fd=""
+        if [ -n "$_lock_fd" ]; then
+            flock -n "$_lock_fd" 2>/dev/null || { exec {_lock_fd}>&- 2>/dev/null || true; return 0; }
+        fi
+    fi
+    CUR_IN=$(nx_proxy_stats_bytes INPUT "3proxy_stats_in" "$PORT")
+    CUR_OUT=$(nx_proxy_stats_bytes OUTPUT "3proxy_stats_out" "$PORT")
+    # Release the lock on every exit path: a leaked fd would hold
+    # the lock in a long-lived caller (the menu process, the test
+    # harness) and starve every later run.
+    if [ -z "$CUR_IN" ] || [ -z "$CUR_OUT" ]; then
+        [ -n "${_lock_fd:-}" ] && exec {_lock_fd}>&- 2>/dev/null || true
+        return 0
+    fi
     LAST_IN=""; LAST_OUT=""; TOT_IN=""; TOT_OUT=""
     if [ -f "$STATE" ]; then
         read -r LAST_IN LAST_OUT TOT_IN TOT_OUT < "$STATE" 2>/dev/null || true
@@ -4553,6 +5109,9 @@ nx_proxy_traffic_accum() {
     # Self-heal shadowing AFTER the snapshot, so a re-pin never
     # destroys counts it has not yet recorded.
     nx_pin_proxy_stats_rules "$PORT"
+    _rc=$?
+    [ -n "${_lock_fd:-}" ] && exec {_lock_fd}>&- 2>/dev/null || true
+    return "$_rc"
 }
 
 # Detect environment
@@ -4575,9 +5134,14 @@ detect_env() {
     MAIN_IF=$(ip route show default 2>/dev/null | awk '/default/{print $5}' | head -1)
     MAIN_IF=${MAIN_IF:-eth0}
 
-    # Count public IPs (for rp_filter decision)
+    # Count public IPs (for rp_filter decision). The exclusion list is
+    # every non-public range, including CGNAT 100.64/10 (L13: it used
+    # to be counted as public, skewing the multi-IP decision). The
+    # address is extracted first so the match is anchored (an
+    # unanchored "10\." also matched 110.x public addresses).
     PUBLIC_IP_COUNT=$(ip -4 addr show 2>/dev/null | grep 'inet ' | \
-        grep -cv '127\.\|10\.\|192\.168\.\|172\.\(1[6-9]\|2[0-9]\|3[01]\)\.' || true)
+        grep -oP '(?<=inet )[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | \
+        grep -cv '^(127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|100\.64\.)' || true)
     PUBLIC_IP_COUNT="${PUBLIC_IP_COUNT:-0}"
 
     # Scale rate limits by RAM.
@@ -4870,10 +5434,11 @@ apply_iptables() {
     fi
 
     # ── Step 4: Server own IPs → ACCEPT ──────────────
-    # E-4: get_server_ips is display-grade (public only) - private and
-    # secondary self addresses were missing here, so traffic from the
-    # server's own private IP still hit the flood limits. Enforcement
-    # uses the exhaustive list_self_ips (loopback excluded, see above).
+    # E-4: a display-grade public-only lookup was used here before -
+    # private and secondary self addresses were missing, so traffic
+    # from the server's own private IP still hit the flood limits.
+    # Enforcement uses the exhaustive list_self_ips (loopback
+    # excluded, see above).
     while IFS= read -r SIP; do
         [ -z "$SIP" ] && continue
         ipt_ins INPUT -s "$SIP/32" -m comment --comment "self_whitelist" -j ACCEPT
@@ -5026,7 +5591,10 @@ apply_iptables() {
     if [ "$CONNLIMIT_OK" -eq 1 ]; then
         # HTTP/HTTPS ports — lower connlimit
         for HTTP_PORT in 80 443 8080 8443; do
-            ss -tuln 2>/dev/null | grep -q ":${HTTP_PORT} " || continue
+            # NIT-2: TCP listeners only (-tln) - a UDP listener on
+            # the same number (e.g. QUIC on 443) must not trigger a
+            # TCP connlimit rule for that port.
+            ss -tln 2>/dev/null | grep -q ":${HTTP_PORT} " || continue
             ipt_add INPUT -p tcp --dport "$HTTP_PORT" \
                 -m connlimit --connlimit-above "$CONN_LIMIT_PER_IP" \
                 --connlimit-mask 32 -m comment --comment "nx_connlimit" \
@@ -5114,6 +5682,13 @@ apply_iptables() {
     # insert-once counter silently undercounted in the field), and
     # the saved order is the boot-restored order. No-op when the
     # proxy is absent or the rules are already pinned.
+    # Snapshot BEFORE the re-pin (MED-1): moving a shadowed rule
+    # deletes and recreates it, zeroing its counter, so traffic since
+    # the last 5-minute accumulator tick would otherwise be lost on
+    # every antiddos apply that finds the rules shadowed. The pin
+    # below is kept: the accumulator returns early (and does not
+    # pin) when the rules are missing, and the pin creates them.
+    nx_proxy_traffic_accum 2>/dev/null || true
     nx_pin_proxy_stats_rules "$(nx_proxy_port_from_config)"
 
     # Save rules (static only - transient bans/f2b chains excluded, BUG-012)
@@ -5142,12 +5717,12 @@ apply_ip6tables() {
     : > /etc/antiddos/exempt6.list 2>/dev/null || true
     local _r6 _s6 _w6
     for _r6 in "${CF6_RANGES[@]}"; do
-        ipt6_add INPUT -s "$_r6" -j ACCEPT
+        ipt6_add INPUT -s "$_r6" -m comment --comment "cf_whitelist" -j ACCEPT
         echo "$_r6" >> /etc/antiddos/exempt6.list
     done
     while IFS= read -r _s6; do
         [ -z "$_s6" ] && continue
-        ipt6_add INPUT -s "$_s6/128" -j ACCEPT
+        ipt6_add INPUT -s "$_s6/128" -m comment --comment "self_whitelist" -j ACCEPT
         echo "$_s6" >> /etc/antiddos/exempt6.list
     done < <(list_self_ips6)
     if [ -f "$WHITELIST_FILE" ]; then
@@ -5155,25 +5730,89 @@ apply_ip6tables() {
             _w6="${_w6%%#*}"; _w6="${_w6// /}"
             case "$_w6" in *:*) : ;; *) continue ;; esac
             [ -z "$_w6" ] && continue
-            ipt6_add INPUT -s "$_w6" -j ACCEPT
+            ipt6_add INPUT -s "$_w6" -m comment --comment "user_whitelist" -j ACCEPT
             echo "$_w6" >> /etc/antiddos/exempt6.list
         done < "$WHITELIST_FILE"
     fi
 
+    # M8 migration: pre-v3.18 v6 hashlimit rules used bare --hashlimit
+    # (which matches UNDER the rate) with -j DROP, so they dropped
+    # normal-rate traffic and passed floods. Delete any old-form rule
+    # (a *6 name without --hashlimit-above) before re-adding the
+    # fixed form; ipt6_add's -C check cannot see the spec change.
+    local _old6
+    for _old6 in $(ip6tables -S INPUT 2>/dev/null | grep -nE 'hashlimit-name (syn_limit6|udp_limit6|http_req_rate6|icmp_limit6)' | grep -v 'hashlimit-above' | cut -d: -f1 | sort -rn); do
+        ip6tables -D INPUT $((_old6 - 1)) 2>/dev/null || true
+    done
+
     # Request-rate policing BEFORE the established accept (same BUG-002
     # lesson as IPv4: below it, this rule could never fire)
+    # M8: --hashlimit-above, not bare --hashlimit (see the migration
+    # note above). The 300/min web cap itself is deliberate - it is a
+    # coarse per-IP web-port cap with no v4 counterpart, so its value
+    # is kept; the tiered established-packet cap is added below.
     ipt6_add INPUT -p tcp -m multiport --dports 80,443 \
         -m hashlimit --hashlimit-name http_req_rate6 --hashlimit-mode srcip \
-        --hashlimit 300/min --hashlimit-burst 100 -j DROP
+        --hashlimit-above 300/min --hashlimit-burst 100 -j DROP
 
     ipt6_add INPUT -m conntrack --ctstate INVALID -j DROP
+
+    # M8: per-IP bandwidth cap + HTTP burst cap, mirrors of the v4
+    # Step 2a/2b rules. They MUST sit above the ESTABLISHED accept
+    # (BUG-002): below it, established packets never reach them.
+    if ip6tables -A INPUT -p tcp \
+        -m hashlimit \
+        --hashlimit-above "${BW_PER_IP_MBIT:-100}mbit/s" \
+        --hashlimit-burst "$(( ${BW_PER_IP_MBIT:-100} * 2 ))mbit" \
+        --hashlimit-mode srcip \
+        --hashlimit-name bw_per_ip6_test \
+        --hashlimit-htable-expire 5000 \
+        -j DROP 2>/dev/null; then
+        ip6tables -D INPUT -p tcp \
+            -m hashlimit \
+            --hashlimit-above "${BW_PER_IP_MBIT:-100}mbit/s" \
+            --hashlimit-burst "$(( ${BW_PER_IP_MBIT:-100} * 2 ))mbit" \
+            --hashlimit-mode srcip \
+            --hashlimit-name bw_per_ip6_test \
+            --hashlimit-htable-expire 5000 \
+            -j DROP 2>/dev/null || true
+        ipt6_add INPUT -p tcp \
+            -m conntrack --ctstate ESTABLISHED,RELATED \
+            -m hashlimit \
+            --hashlimit-above "${BW_PER_IP_MBIT:-100}mbit/s" \
+            --hashlimit-burst "$(( ${BW_PER_IP_MBIT:-100} * 2 ))mbit" \
+            --hashlimit-mode srcip \
+            --hashlimit-name bw_per_ip6 \
+            --hashlimit-htable-expire 5000 \
+            -j DROP
+    fi
+    ipt6_add INPUT -p tcp \
+        -m conntrack --ctstate ESTABLISHED \
+        -m hashlimit \
+        --hashlimit-above "${HTTP_REQ_RATE:-500/sec}" \
+        --hashlimit-burst "${HTTP_REQ_BURST:-1000}" \
+        --hashlimit-mode srcip \
+        --hashlimit-name http_req_est6 \
+        --hashlimit-htable-expire 10000 \
+        -j DROP
+
     ipt6_add INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
 
-    # Flood limits
+    # Flood limits (M8: tiered values + --hashlimit-above direction)
     ipt6_add INPUT -p tcp --syn -m hashlimit --hashlimit-name syn_limit6 \
-        --hashlimit-mode srcip --hashlimit 200/sec --hashlimit-burst 400 -j DROP
+        --hashlimit-mode srcip --hashlimit-above "${SYN_LIMIT:-500/sec}" --hashlimit-burst "${SYN_BURST:-1000}" -j DROP
     ipt6_add INPUT -p udp -m hashlimit --hashlimit-name udp_limit6 \
-        --hashlimit-mode srcip --hashlimit 1000/sec --hashlimit-burst 2000 -j DROP
+        --hashlimit-mode srcip --hashlimit-above "${UDP_LIMIT:-150/sec}" --hashlimit-burst "${UDP_BURST:-300}" -j DROP
+    # UDP amplification ports (mirror of v4 Step 6)
+    for REFLECT_PORT in 19 111 137 161 1900 5353 11211; do
+        ipt6_add INPUT -p udp --sport "$REFLECT_PORT" \
+            -m hashlimit \
+            --hashlimit-above 10/sec \
+            --hashlimit-burst 20 \
+            --hashlimit-mode srcip \
+            --hashlimit-name "udp_reflect6_${REFLECT_PORT}" \
+            -j DROP
+    done
     # ICMPv6: NDP must keep working (it is IPv6's ARP) - accept it,
     # rate-limit echo requests, accept the rest.
     ipt6_add INPUT -p icmpv6 --icmpv6-type 133 -j ACCEPT
@@ -5181,15 +5820,42 @@ apply_ip6tables() {
     ipt6_add INPUT -p icmpv6 --icmpv6-type 136 -j ACCEPT
     ipt6_add INPUT -p icmpv6 --icmpv6-type echo-request \
         -m hashlimit --hashlimit-name icmp_limit6 --hashlimit-mode srcip \
-        --hashlimit 50/sec --hashlimit-burst 100 -j DROP
+        --hashlimit-above "${ICMP_LIMIT:-25/sec}" --hashlimit-burst "${ICMP_BURST:-50}" -j DROP
     ipt6_add INPUT -p icmpv6 -j ACCEPT
 
     # Connection limit per host (mask 128) with the same LOG prefix the
     # conn-flood fail2ban jail matches
+    # M9: the LOG rule carries the same -m limit as v4 (10/min, burst
+    # 20) - without it, every excess SYN under a v6 flood writes a
+    # kern.log line (log-volume DoS + jail hammering).
     ipt6_add INPUT -p tcp --syn -m connlimit --connlimit-above "$CONN_LIMIT_PER_IP" \
-        --connlimit-mask 128 -j LOG --log-prefix "[CONNLIMIT DROP] " --log-level 4
+        --connlimit-mask 128 -m limit --limit 10/min --limit-burst 20 \
+        -j LOG --log-prefix "[CONNLIMIT DROP] " --log-level 4
     ipt6_add INPUT -p tcp --syn -m connlimit --connlimit-above "$CONN_LIMIT_PER_IP" \
         --connlimit-mask 128 -m comment --comment "nx_connlimit" -j DROP
+
+    # M8: new-connection rate, RST flood, bogus NEW non-SYN and
+    # fragments - mirrors of the v4 Step 8/9/11/12 rules.
+    ipt6_add INPUT -p tcp \
+        -m conntrack --ctstate NEW \
+        -m hashlimit \
+        --hashlimit-above "${NEW_CONN_RATE:-100/sec}" \
+        --hashlimit-burst "${NEW_CONN_BURST:-200}" \
+        --hashlimit-mode srcip \
+        --hashlimit-name new_conn_rate6 \
+        --hashlimit-htable-expire 60000 \
+        -j DROP
+    ipt6_add INPUT -p tcp --tcp-flags RST RST \
+        -m hashlimit \
+        --hashlimit-above 200/sec \
+        --hashlimit-burst 400 \
+        --hashlimit-mode srcip \
+        --hashlimit-name rst_flood6 \
+        -j DROP
+    ipt6_add INPUT -p tcp ! --syn -m conntrack --ctstate NEW -j DROP
+    # The v6 equivalent of iptables -f (second and further fragments):
+    # a fragment header that is NOT the first fragment.
+    ipt6_add INPUT -m frag ! --fragfirst -j DROP
 
     # Scan signatures: LOG ([NX-SCAN], feeds the portscan jail) + DROP
     ipt6_add INPUT -p tcp --tcp-flags ALL NONE \
@@ -5218,7 +5884,11 @@ nx_delete_matching6() {
     command -v ip6tables >/dev/null 2>&1 || return 0
     ip6tables -L "$_c" >/dev/null 2>&1 || return 0
     while true; do
-        _n=$(ip6tables -S "$_c" 2>/dev/null | grep -nE "$_p" | head -1 | cut -d: -f1 || true)
+        # -- : patterns starting with a dash ('--comment ...')
+        # would otherwise be parsed as grep options (see
+        # nx_delete_matching - the same bug killed the '-j CT'
+        # remove and the first version of flush_autobans).
+        _n=$(ip6tables -S "$_c" 2>/dev/null | grep -nE -- "$_p" | head -1 | cut -d: -f1 || true)
         [ -z "$_n" ] && break
         ip6tables -D "$_c" $((_n - 1)) 2>/dev/null || break
     done
@@ -5510,15 +6180,36 @@ setup_autoban() {
 
 LOG="/var/log/auto-ban.log"
 BANNED_LIST="/etc/antiddos/banned.list"
-WATCH_LIST="/tmp/autoban_watch"
-THROTTLE_LIST="/tmp/autoban_throttle"
+# F5: live state lives under /run/nexoshield (root-owned tmpfs), not
+# /tmp — /tmp entries are world-writable, so a pre-planted symlink
+# could make a root truncate or append hit an attacker-chosen file.
+# Volatility semantics are unchanged (both are tmpfs, cleared on
+# reboot); the persistent mirrors stay under /etc/antiddos.
+mkdir -p /run/nexoshield 2>/dev/null || true
+# L6: single-instance guard. Two daemons would double-apply bans,
+# double-count strikes and fight over state files. The lock is held
+# for the process lifetime; a second instance exits instead of
+# running. If the lock file cannot be created (or no flock binary
+# exists), the daemon proceeds unguarded - the old behaviour -
+# rather than refusing to start. This runs before log() exists
+# (defined in 10-ip-utils.sh), so failures print to stderr.
+if command -v flock >/dev/null 2>&1; then
+    if exec 9>/run/nexoshield/auto-ban.lock 2>/dev/null; then
+        if ! flock -n 9 2>/dev/null; then
+            echo "auto-ban: another instance is running, exiting" >&2
+            exit 1
+        fi
+    fi
+fi
+WATCH_LIST="/run/nexoshield/autoban_watch"
+THROTTLE_LIST="/run/nexoshield/autoban_throttle"
 # U-11: persistent mirror of the throttle state. The live file sits
-# in /tmp (fast, volatile); the generated tc-setup.sh has always
+# in /run (fast, volatile); the generated tc-setup.sh has always
 # re-applied throttles from /etc/antiddos/throttled.list after a
 # reboot - but nothing ever WROTE that file, so the restore path was
 # dead and every reboot silently dropped all throttles. The daemon
-# now mirrors tmp -> etc once per cycle and restores etc -> tmp at
-# startup when the tmp file is gone.
+# now mirrors run -> etc once per cycle and restores etc -> run at
+# startup when the run file is gone.
 THROTTLE_MIRROR="/etc/antiddos/throttled.list"
 # User whitelist — IPs/CIDRs exempt from ALL anti-DDoS limits.
 # Managed by the user via the menu (never auto-modified). One per line.
@@ -5561,11 +6252,32 @@ _nx_cfg_warn() {
     [ -n "${_NX_CFG_WARNED[$1]:-}" ] && return 0
     _NX_CFG_WARNED[$1]=1
     if declare -F log >/dev/null 2>&1; then
-        log " CONFIG: ignoring invalid value for '$1' in $NX_CONFIG_FILE (using default)"
+        log " CONFIG: ignoring ${2:-invalid value} for '$1' in $NX_CONFIG_FILE (using default)"
     else
-        echo "CONFIG: ignoring invalid value for '$1' in $NX_CONFIG_FILE (using default)" >&2
+        echo "CONFIG: ignoring ${2:-invalid value} for '$1' in $NX_CONFIG_FILE (using default)" >&2
     fi
 }
+
+# L7: sane ranges for every documented scoring key (min:max). A
+# value outside its range is ignored with a warning and the default
+# is used instead - a typo like conn_threshold=-5 or score_ban=500
+# must never silently disarm or invert a gate. Unknown keys are
+# unchecked (nx_cfg stays generic). Floats compare via awk.
+declare -A _NX_CFG_RANGE=(
+    [score_ban]="0:100" [score_hard]="0:100" [score_throttle]="0:100" [score_suspect]="0:100"
+    [score_recover_per_min]="0:1000" [probation_recover_per_min]="0:1000" [score_drop_cap_per_min]="0:1000"
+    [probation_score]="0:100" [probation_seconds]="0:86400"
+    [churn_allow_per_sec]="0:100000" [churn_weight]="0:1000" [churn_cap]="0:100"
+    [sust_divisor]="1:100000" [sust_cap]="0:100"
+    [syn_min]="0:100000" [syn_ratio]="0:1" [syn_weight]="0:1000" [syn_cap]="0:100"
+    [conn_threshold]="0:1000000" [ban_conn_threshold]="0:1000000" [observe_seconds]="0:3600"
+    [ban_base_minutes]="1:10080" [ban_max_minutes]="1:43200" [ban_hours_fallback]="0:168"
+    [subnet_threshold]="0:1000000" [subnet_ban_threshold]="0:1000000"
+    [subnet_min_offenders]="1:100000" [subnet_ban_minutes]="1:10080"
+    [stress_gate]="0:1" [adaptive_enabled]="0:1"
+    [xdp_syncookie_rate]="0:10000000" [xdp_overflow_rate]="0:10000000" [xdp_syn_rate]="0:10000000"
+    [xdp_calm_seconds]="0:86400"
+)
 
 nx_cfg() {
     local key="$1" def="$2" raw=""
@@ -5580,6 +6292,16 @@ nx_cfg() {
     fi
     if [ -n "$raw" ]; then
         if [[ "$raw" =~ ^-?[0-9]+([.][0-9]+)?$ ]]; then
+            local _range="${_NX_CFG_RANGE[$key]:-}"
+            if [ -n "$_range" ]; then
+                local _lo="${_range%%:*}" _hi="${_range#*:}"
+                if ! awk -v v="$raw" -v lo="$_lo" -v hi="$_hi" 'BEGIN{exit !(v>=lo && v<=hi)}' 2>/dev/null; then
+                    _nx_cfg_warn "$key" "out-of-range value '$raw' (allowed $_lo-$_hi)"
+                    _NX_CFG_CACHE[$key]="$def"
+                    printf '%s' "$def"
+                    return 0
+                fi
+            fi
             _NX_CFG_CACHE[$key]="$raw"
             printf '%s' "$raw"
             return 0
@@ -5660,8 +6382,9 @@ EOF
 # Bands (see research: adaptive/graduated enforcement beats one-shot ban):
 #  100-80 NORMAL    no action (only watched if above CONN_THRESHOLD)
 #   79-60 SUSPECT   watch only, no penalty
-#   59-40 THROTTLED move to class 1:30 (100Mbps)
-#   39-20 HARD      move to class 1:40 (50Mbps)
+#   59-40 THROTTLED move to class 1:30 (nominal 100Mbps - setup_tc
+#               scales the tree to LINK/10 on sub-gigabit links)
+#   39-20 HARD      move to class 1:40 (nominal 50Mbps - LINK/20)
 #   <20  BANNED     ban_ip (progressive 30m-7d)
 # (values assigned by nx_load_scoring_config below)
 # Scoring model v2 (docs/SCORING.md): every score movement is rated in
@@ -5689,7 +6412,10 @@ EOF
 # Set CONN_THRESHOLD well above ANY legitimate user so normal speed is never
 # limited, but far below a flood. OBSERVE allows brief legit spikes (a download
 # manager burst) to pass untouched before any action.
-THROTTLE_MBPS=100    # throttle bandwidth in Mbps (must match tc class 1:30 = 100mbit)
+THROTTLE_MBPS=100    # Nominal 1-Gbit-tree value for tc class 1:30;
+                     # setup_tc scales the class to LINK/10 on
+                     # sub-gigabit links, so this is a band label,
+                     # not a guaranteed rate on slow links.
 # CONN_THRESHOLD / BAN_CONN_THRESHOLD / OBSERVE_SECONDS / BAN_HOURS are
 # assigned by nx_load_scoring_config below (defaults 120 / 300 / 45 / 4).
 # Sample cadence. 2s (was 4s): churn rate is already normalized per-second, so
@@ -5709,7 +6435,7 @@ SAMPLE_INTERVAL=2    # seconds per measurement
 # A very heavy CGNAT node (many legit users) could reach ~400.
 # Botnet with 50 IPs × 100+ conns = 5000 → way above threshold.
 # SUBNET_THRESHOLD / SUBNET_BAN_THRESHOLD assigned below (defaults 400 / 1000).
-SUBNET_WATCH_LIST="/tmp/autoban_subnet_watch"
+SUBNET_WATCH_LIST="/run/nexoshield/autoban_subnet_watch"
 touch "$SUBNET_WATCH_LIST" 2>/dev/null || true
 
 # ── Scoring config loader (Phase 1a) ─────────────────────────────
@@ -6080,6 +6806,16 @@ nx_ban() { case "$1" in *:*) ban_ip6 "$1" ;; *) ban_ip "$1" ;; esac; }
 nx_throttle() { case "$1" in *:*) throttle_ip6 "$1" ;; *) throttle_ip "$1" ;; esac; }
 nx_hard_throttle() { case "$1" in *:*) hard_throttle_ip6 "$1" ;; *) hard_throttle_ip "$1" ;; esac; }
 
+# nx_extract_peer_ips — peer column (stdin) -> one IP per line, v4+v6.
+# Single-pass extraction (H1): the old `{ grep v4; grep v6; }` pair ran
+# on one stdin, so the second grep always read EOF and no IPv6 peer
+# ever entered the daemon's counters. A v4-mapped ::ffff:a.b.c.d peer
+# is normalized back to its v4 form, preserving the old counting.
+nx_extract_peer_ips() {
+    grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+|\[[0-9a-fA-F:]+\]' | tr -d '[]' | \
+        sed -E 's/^::ffff:([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)$/\1/'
+}
+
 # subnet_overlaps_cf <a.b.c> — TRUE range-overlap test between a /24 and
 # every CF range (BUG-011: the old check tested only the .1 address, so
 # a CF range starting mid-/24 was missed).
@@ -6175,8 +6911,8 @@ is_exempt() {
 
 # Reserved tc filter priority bands (must never overlap):
 #   whitelist (CF + server-own + user)  : 10 .. <10000  (allocated in tc-setup.sh)
-#   throttle (100Mbps class 1:30)       : 10000 ..
-#   hard-throttle (50Mbps class 1:40)   : 20000 ..
+#   throttle (nominal 100Mbps class 1:30) : 10000 ..
+#   hard-throttle (nominal 50Mbps class 1:40): 20000 ..
 # This guarantees a throttle filter can NEVER collide with a Cloudflare/server
 # whitelist filter, so CF and the server itself stay exempt even at ban time
 # (ban_ip deletes only the recorded throttle-band prio).
@@ -6270,7 +7006,7 @@ throttle_ip() {
 # not yet confirmed as an attack. Keeps the connection open (legit heavy user
 # stays online) while crushing throughput so a flood can't starve the box.
 # Class 1:40 must exist (added by install alongside 1:30). If it does not,
-# fall back to 100Mbps class 1:30 rather than failing.
+# fall back to the (nominal 100Mbps) class 1:30 rather than failing.
 hard_throttle_ip() {
     local ip="$1"
     is_exempt "$ip" && return 0
@@ -6484,7 +7220,13 @@ ban_ip() {
     local DUR="${2:-$(rep_ban_duration_secs "$ip")}"
     local UNBAN_TIME
     UNBAN_TIME=$(date -d "+${DUR} seconds" '+%H:%M:%S' 2>/dev/null || echo "N/A")
-    nx_ban_apply "$ip" "$DUR" "auto-ban"
+    # M5: never record state for a ban the kernel refused - ban_subnet
+    # already refuses this way, and an unrecorded ban is retried by
+    # the next cycle instead of sitting in state while unenforced.
+    if ! nx_ban_apply "$ip" "$DUR" "auto-ban"; then
+        log " BAN FAILED: $ip - backend refused; state NOT recorded"
+        return 1
+    fi
     echo "$ip $(date +%s) $DUR" >> "$BANNED_LIST"
     # Remove ONLY this IP's throttle/hard-throttle tc filter.
     # NOTE: never run 'tc filter del dev "$IF" parent 1:' here — that deletes
@@ -6548,16 +7290,22 @@ ban_ip6() {
     for _s6 in "${SELF6_IPS[@]}"; do
         if ip6_in_cidr "$ip" "$_s6/128"; then
             log " REFUSED: $ip is a server IPv6 address (self-IP immunity)"
-            return 0
+            return 1
         fi
     done
     state_has_ip "$BANNED_LIST" "$ip" && return 0
+    # M5: same refusal as ban_ip - no state for a refused ban. The
+    # throttle cleanup runs only after a successful ban (as in
+    # ban_ip): a failed ban must not also strip the throttle.
+    if ! nx_ban_apply "$ip" "$DUR" "auto-ban"; then
+        log " BAN FAILED (v6): $ip - backend refused; state NOT recorded"
+        return 1
+    fi
+    echo "$ip $(date +%s) $DUR" >> "$BANNED_LIST"
     local _PRIO
     _PRIO=$(state_get_field "$THROTTLE_LIST" "$ip" 2)
     [ -n "$_PRIO" ] && tc filter del dev "$IF" parent 1: protocol ip6 prio "$_PRIO" 2>/dev/null || true
     state_del_ip "$THROTTLE_LIST" "$ip"
-    nx_ban_apply "$ip" "$DUR" "auto-ban"
-    echo "$ip $(date +%s) $DUR" >> "$BANNED_LIST"
     log " BANNED (v6): $ip for $((DUR / 60))min (progressive)"
 }
 #
@@ -6574,17 +7322,28 @@ NX_EV_OK=0
 NX_EV_BASE=""
 NX_EV_TOT_DSYN=0
 NX_EV_TOT_DEST=0
+# L4: nxcountd's own loss counters (emitted in the header since
+# Phase 2 but never read). NX_EV_DROPPED is the cumulative count of
+# netlink messages the helper dropped (ENOBUFS) and
+# NX_EV_FLOWS_DROPPED the flows lost with them; NX_EV_DROP_DELTA is
+# the increase since the previous cycle. A nonzero delta is logged
+# so a lossy cycle is never silently read as "low arrivals".
+NX_EV_DROPPED=0
+NX_EV_FLOWS_DROPPED=0
+NX_EV_DROP_DELTA=0
 NX_EV_DT=2
 _NX_EV_PREV_TS=""
 _NX_EV_PREV_TOTSYN=""
 _NX_EV_PREV_TOTEST=""
+_NX_EV_PREV_DROPPED=""
+_NX_EV_PREV_FLOWS_DROPPED=""
 
 nx_load_event_counters() {
     NX_EV_OK=0
     NX_EV_TOT_DSYN=0
     NX_EV_TOT_DEST=0
     [ -f "$NX_COUNTERS_FILE" ] || return 0
-    local hdr kv ts="" base="" totsyn="" totest="" now
+    local hdr kv ts="" base="" totsyn="" totest="" now dropped="" flows_dropped=""
     hdr=$(head -n 1 "$NX_COUNTERS_FILE" 2>/dev/null) || return 0
     case "$hdr" in "# nxcountd 1 "*) ;; *) return 0 ;; esac
     for kv in $hdr; do
@@ -6593,6 +7352,8 @@ nx_load_event_counters() {
             base=*) base="${kv#base=}" ;;
             totalsyn=*) totsyn="${kv#totalsyn=}" ;;
             totalest=*) totest="${kv#totalest=}" ;;
+            dropped=*) dropped="${kv#dropped=}" ;;
+            flows_dropped=*) flows_dropped="${kv#flows_dropped=}" ;;
         esac
     done
     ts="${ts//[^0-9]/}"; [ -n "$ts" ] || return 0
@@ -6606,6 +7367,8 @@ nx_load_event_counters() {
         NX_EV_BASE="$base"
         EV_PSYN=(); EV_PEST=()
         _NX_EV_PREV_TOTSYN=""
+        _NX_EV_PREV_DROPPED=""
+        _NX_EV_PREV_FLOWS_DROPPED=""
         log " EVENTS: nxcountd counters (re)based - arrival windows re-arming"
     fi
     totsyn="${totsyn//[^0-9]/}"; totest="${totest//[^0-9]/}"
@@ -6617,6 +7380,22 @@ nx_load_event_counters() {
     fi
     _NX_EV_PREV_TOTSYN="${totsyn:-}"
     _NX_EV_PREV_TOTEST="${totest:-}"
+    # L4: surface the helper's loss counters (same delta discipline
+    # as the arrival totals - clamped, re-based on restart).
+    dropped="${dropped//[^0-9]/}"; flows_dropped="${flows_dropped//[^0-9]/}"
+    NX_EV_DROPPED="${dropped:-0}"; NX_EV_FLOWS_DROPPED="${flows_dropped:-0}"
+    NX_EV_DROP_DELTA=0
+    if [ -n "$_NX_EV_PREV_DROPPED" ] && [ -n "$dropped" ]; then
+        NX_EV_DROP_DELTA=$(( dropped - _NX_EV_PREV_DROPPED ))
+        [ "$NX_EV_DROP_DELTA" -lt 0 ] && NX_EV_DROP_DELTA=0
+        if [ "$NX_EV_DROP_DELTA" -gt 0 ]; then
+            local _fd=$(( ${flows_dropped:-0} - ${_NX_EV_PREV_FLOWS_DROPPED:-0} ))
+            [ "$_fd" -lt 0 ] && _fd=0
+            log " EVENTS: nxcountd lost $NX_EV_DROP_DELTA netlink messages ($_fd flows) since last cycle - arrival counts are a lower bound (cumulative: $NX_EV_DROPPED messages, $NX_EV_FLOWS_DROPPED flows)"
+        fi
+    fi
+    _NX_EV_PREV_DROPPED="${dropped:-}"
+    _NX_EV_PREV_FLOWS_DROPPED="${flows_dropped:-}"
     if [ -n "$_NX_EV_PREV_TS" ]; then
         local _ddt=$(( ts - _NX_EV_PREV_TS ))
         [ "$_ddt" -ge 1 ] && [ "$_ddt" -le 30 ] && NX_EV_DT="$_ddt"
@@ -6734,6 +7513,7 @@ _NX_XDP_WIN_START=0
 _NX_XDP_OVF_WIN=0
 _NX_XDP_SCOOK_WIN=0
 _NX_XDP_BANS_MT=0
+_NX_XDP_LAST_DROPS=""
 
 nx_xdp_init() {
     if [ -x "$NX_XDP_BIN" ] && [ -f "$NX_XDP_OBJ" ]; then
@@ -6779,6 +7559,7 @@ nx_xdp_attach() {
         "$NX_XDP_BIN" sync-exempt "$NX_XDP_EXEMPT_FILE" >/dev/null 2>&1 || true
         NX_XDP_ATTACHED="$NX_XDP_IFACE"
         _NX_XDP_CALM_SINCE=0
+        _NX_XDP_LAST_DROPS=""
         _NX_XDP_BANS_MT=$(stat -c %Y "$BANNED_LIST" 2>/dev/null || echo 0)
         log " XDP: emergency shield ATTACHED on $NX_XDP_IFACE ($reason) - line-rate SYN relief active"
     else
@@ -6788,16 +7569,25 @@ nx_xdp_attach() {
 }
 
 nx_xdp_detach() {
-    "$NX_XDP_BIN" unload "$NX_XDP_ATTACHED" >> "${LOG_FILE:-/dev/null}" 2>&1 || true
-    log " XDP: shield detached from $NX_XDP_ATTACHED ($1)"
-    NX_XDP_ATTACHED=""
-    _NX_XDP_HOT=0
-    _NX_XDP_CALM_SINCE=0
+    # L16: the old code cleared NX_XDP_ATTACHED even when the unload
+    # failed, so the daemon believed the shield was gone while it was
+    # still attached - and never retried. Keep the attached state on
+    # failure (fail-closed: the shield keeps dropping) and retry
+    # after a fresh calm window.
+    if "$NX_XDP_BIN" unload "$NX_XDP_ATTACHED" >> "${LOG_FILE:-/dev/null}" 2>&1; then
+        log " XDP: shield detached from $NX_XDP_ATTACHED ($1)"
+        NX_XDP_ATTACHED=""
+        _NX_XDP_HOT=0
+        _NX_XDP_CALM_SINCE=0
+    else
+        log " XDP: detach FAILED on $NX_XDP_ATTACHED - keeping shield attached, will retry"
+        _NX_XDP_CALM_SINCE=$(date +%s)
+    fi
 }
 
 nx_xdp_tick() {
     [ "$NX_XDP_AVAILABLE" = "1" ] || return 0
-    local now rate=0 mt
+    local now rate=0 mt _nxdrops
     now=$(date +%s)
     [ "$_NX_XDP_WIN_START" -eq 0 ] && _NX_XDP_WIN_START=$now
     _NX_XDP_OVF_WIN=$(( _NX_XDP_OVF_WIN + ${NX_OVF_DELTA:-0} ))
@@ -6831,6 +7621,17 @@ nx_xdp_tick() {
                 "$NX_XDP_BIN" sync-bans "$NX_XDP_BANS_FILE" >/dev/null 2>&1 || true
                 "$NX_XDP_BIN" sync-exempt "$NX_XDP_EXEMPT_FILE" >/dev/null 2>&1 || true
             fi
+        fi
+        # M6: the old calm test ignored what the shield was actually
+        # doing - a flood whose SYNs all die in XDP leaves no
+        # overflows, no syncookies and a low netfilter SYN rate, so
+        # the shield detached mid-flood and re-attached in a loop.
+        # A rising drops counter means the flood is NOT over: reset
+        # the calm timer. An unreadable counter changes nothing.
+        _nxdrops=$("$NX_XDP_BIN" stats 2>/dev/null | sed -n 's/.*drops=\([0-9]*\).*/\1/p' | head -1)
+        if [ -n "$_nxdrops" ]; then
+            [ "$_nxdrops" != "$_NX_XDP_LAST_DROPS" ] && _NX_XDP_CALM_SINCE=0
+            _NX_XDP_LAST_DROPS="$_nxdrops"
         fi
         if [ "${NX_OVF_DELTA:-0}" -eq 0 ] && [ "${NX_SYNCOOK_DELTA:-0}" -eq 0 ] && [ "$rate" -lt 500 ]; then
             [ "$_NX_XDP_CALM_SINCE" -eq 0 ] && _NX_XDP_CALM_SINCE=$now
@@ -7309,26 +8110,42 @@ reconcile_bans() {
 # remove it and log loudly. "Never block our own IPs" is a monitored
 # invariant, not a hope.
 self_guard() {
-    local _sip _esc _rule
+    local _sip _esc _n _removed=0
     for _sip in "${SELF_IPS[@]}"; do
         [ -z "$_sip" ] && continue
         _esc=$(printf '%s' "$_sip" | sed 's/\./\\./g')
-        while IFS= read -r _rule; do
-            [ -z "$_rule" ] && continue
-            # _rule is an "INPUT ..." spec derived from iptables -S output.
-            # shellcheck disable=SC2086  # word splitting IS the mechanism
-            iptables -D $_rule 2>/dev/null && \
-                log " SELF-GUARD: removed DROP rule hitting own IP $_sip"
-        done < <(iptables -S INPUT 2>/dev/null | grep -E -- "-s ${_esc}(/32)?[[:space:]]" | grep -- '-j DROP' | sed 's/^-A /INPUT /')
+        # M3: delete by RULE NUMBER, not by re-parsing the spec. The
+        # old word-split delete passed the -S rendering's literal
+        # quote characters (every daemon ban is comment-tagged), so
+        # it never matched a real rule; -S line 1 is the policy, so
+        # rule number = line number - 1 (same math as
+        # nx_delete_matching). The DROP must end the line, or a
+        # comment merely mentioning "-j DROP" would false-match.
+        while true; do
+            _n=$(iptables -S INPUT 2>/dev/null | grep -nE -- "-s ${_esc}(/32)?[[:space:]].*-j DROP$" | head -1 | cut -d: -f1 || true)
+            [ -z "$_n" ] && break
+            iptables -D INPUT $((_n - 1)) 2>/dev/null || break
+            _removed=1
+            log " SELF-GUARD: removed DROP rule hitting own IP $_sip"
+        done
+        nx_ban_remove_fw "$_sip"
         state_del_ip "$BANNED_LIST" "$_sip"
     done
-    # IPv6 self sweep (Wave 9): the same hard guarantee for v6
-    local _sip6
+    # IPv6 self sweep (Wave 9): the same hard guarantee for v6,
+    # including the comment-tagged rules the old bare -C/-D sweep
+    # never matched, plus the nft ban6 set.
+    local _sip6 _esc6
     for _sip6 in "${SELF6_IPS[@]}"; do
-        if ip6tables -C INPUT -s "$_sip6" -j DROP 2>/dev/null; then
-            ip6tables -D INPUT -s "$_sip6" -j DROP 2>/dev/null || true
+        [ -z "$_sip6" ] && continue
+        _esc6=$(printf '%s' "$_sip6" | sed 's/\./\\./g')
+        while true; do
+            _n=$(ip6tables -S INPUT 2>/dev/null | grep -nE -- "-s ${_esc6}(/128)?[[:space:]].*-j DROP$" | head -1 | cut -d: -f1 || true)
+            [ -z "$_n" ] && break
+            ip6tables -D INPUT $((_n - 1)) 2>/dev/null || break
+            _removed=1
             log " SELF-GUARD: removed DROP rule for own IPv6 $_sip6"
-        fi
+        done
+        nx_ban_remove_fw "$_sip6"
         state_del_ip "$BANNED_LIST" "$_sip6"
     done
     if [ -f "$THROTTLE_LIST" ]; then
@@ -7338,8 +8155,23 @@ self_guard() {
                 _prio=$(state_get_field "$THROTTLE_LIST" "$_sip" 2)
                 [ -n "$_prio" ] && tc filter del dev "$IF" parent 1: prio "$_prio" 2>/dev/null || true
                 state_del_ip "$THROTTLE_LIST" "$_sip"
+                _removed=1
                 log " SELF-GUARD: removed throttle state for own IP $_sip"
             fi
+        done
+    fi
+    # L8: a self IP blocked in fail2ban is the same violation, but
+    # asking fail2ban every cycle is expensive - sweep the jails only
+    # when this call actually removed something above.
+    if [ "$_removed" -eq 1 ] && command -v fail2ban-client >/dev/null 2>&1; then
+        local _j
+        fail2ban-client status 2>/dev/null | grep "Jail list" | \
+            sed 's/.*://;s/,/\n/g' | tr -d ' ' | while read -r _j; do
+            [ -z "$_j" ] && continue
+            for _sip in "${SELF_IPS[@]}" "${SELF6_IPS[@]}"; do
+                [ -z "$_sip" ] && continue
+                fail2ban-client set "$_j" unbanip "$_sip" 2>/dev/null || true
+            done
         done
     fi
 }
@@ -7359,7 +8191,7 @@ nx_xdp_init
 
 # Restore throttle filters recorded before a restart/reboot (the qdisc
 # may have been rebuilt without them - see reapply_throttles, BUG-022).
-# After a reboot /tmp is empty: pull the state back from the mirror
+# After a reboot /run is empty: pull the state back from the mirror
 # first (U-11), or reapply has nothing to work with.
 restore_throttle_state
 reapply_throttles
@@ -7378,8 +8210,8 @@ while true; do
     # Keep the persistent throttle mirror current (U-11).
     mirror_throttle_state
 
-    # Every ~5 min: pick up any newly assigned own IPs (E-3), then
-    # unban expired IPs and subnets
+    # Every 150 s (75 cycles x 2 s): pick up any newly assigned own
+    # IPs (E-3), then unban expired IPs and subnets
     [ $((CYCLE % 75)) -eq 0 ] && refresh_self_ips && unban_expired && unban_subnet_expired
 
     # Every cycle: enforce self-IP immunity (cheap; iptables -S scan)
@@ -7396,7 +8228,7 @@ while true; do
                if (lp !~ /^[0-9]+$/) next;
                if (lp >= 32768) next;
                print $5 }' | \
-        { grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+'; grep -oE '\[[0-9a-fA-F:]+\]' | tr -d '[]'; } | \
+        nx_extract_peer_ips | \
         sort | uniq -c | sort -rn | head -100 || true)
     if [ -n "$SS_OUT" ]; then
         while IFS= read -r line; do
@@ -7414,7 +8246,7 @@ while true; do
                if (lp !~ /^[0-9]+$/) next;
                if (lp >= 32768) next;
                print $5 }' | \
-        { grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+'; grep -oE '\[[0-9a-fA-F:]+\]' | tr -d '[]'; } | \
+        nx_extract_peer_ips | \
         sort | uniq -c | sort -rn | head -100 || true)
     if [ -n "$SS_SYN" ]; then
         while IFS= read -r line; do
@@ -7443,6 +8275,16 @@ while true; do
         # Reputation scoring: adjust score for this sample and enforce band.
         # Uses the connection count and the interval since the last sample.
         update_score "$ip" "$count" "${SYN_COUNT[$ip]:-0}" "$SAMPLE_INTERVAL"
+
+        # M1: update_score's REP-BAN path already throttled, banned and
+        # recorded the strike for this IP. Without this guard the
+        # instant/watch blocks below would ban and strike a SECOND
+        # time for the same offence (the pre-check above ran before
+        # update_score, so it cannot see this cycle's REP-BAN).
+        if state_has_ip "$BANNED_LIST" "$ip"; then
+            state_del_ip "$WATCH_LIST" "$ip"
+            continue
+        fi
 
         # Immediate action if way over limit (≥ BAN_CONN_THRESHOLD conns)
         if [ "${count:-0}" -ge "$BAN_CONN_THRESHOLD" ]; then
@@ -7606,7 +8448,7 @@ AUTOBAN_EOF
     # Staged activation (BUG-025): never truncate the live daemon script
     if ! bash -n "$AUTOBAN_SCRIPT.nxnew" 2>/dev/null; then
         rm -f "$AUTOBAN_SCRIPT.nxnew"
-        error "generated auto-ban script failed its syntax check - keeping the previous one"
+        err "generated auto-ban script failed its syntax check - keeping the previous one"
         return 1
     fi
     [ -f "$AUTOBAN_SCRIPT" ] && cp -a "$AUTOBAN_SCRIPT" "$AUTOBAN_SCRIPT.prev" 2>/dev/null || true
@@ -8469,7 +9311,17 @@ static int parse_cidr(const char *text, int *family, int *prefix, uint8_t *addr)
     snprintf(buf, sizeof buf, "%s", text);
     char *slash = strchr(buf, '/');
     int pfx = -1;
-    if (slash) { *slash = 0; pfx = atoi(slash + 1); }
+    if (slash) {
+        /* L1: the old atoi() accepted junk - "/abc" became /0 (a
+         * whole-Internet ban), "/-1" silently became /32, and
+         * "/32junk" passed. A prefix must be all digits in range;
+         * anything else is a bad line, not a guessed entry. */
+        char *end = NULL;
+        long v = strtol(slash + 1, &end, 10);
+        if (end == slash + 1 || *end != '\0' || v < 0) return -1;
+        *slash = 0;
+        pfx = (int)v;
+    }
     if (strchr(buf, ':')) {
         if (inet_pton(AF_INET6, buf, addr) != 1) return -1;
         if (pfx < 0) pfx = 128;
@@ -8774,6 +9626,26 @@ setup_tc() {
         done < "$WHITELIST_FILE"
     fi
 
+    # HIGH-2: re-apply live daemon throttles (BUG-022). The qdisc
+    # delete above just destroyed every throttle filter the daemon
+    # recorded - the boot script re-applies them, but the LIVE path
+    # never did, so every proxy Install/Update and every whitelist
+    # change silently gave throttled attackers full speed until the
+    # daemon restarted. Same loop as the boot script, reading the
+    # live file first: it is fresher than the mirror, which lags up
+    # to one daemon cycle, and a stale mirror entry must never
+    # resurrect a filter the daemon already replaced.
+    while read -r TIP TPRIO _TS TBAND; do
+        [ -z "$TIP" ] && continue
+        TFLOW=1:30; [ "$TBAND" = "hard" ] && TFLOW=1:40
+        case "$TIP" in
+            *:*) tc filter add dev "$MAIN_IF" parent 1: protocol ip6 prio $TPRIO \
+                     u32 match ip6 dst "$TIP" flowid $TFLOW 2>/dev/null || true ;;
+            *)   tc filter add dev "$MAIN_IF" parent 1: protocol ip prio $TPRIO \
+                     u32 match ip dst "$TIP/32" flowid $TFLOW 2>/dev/null || true ;;
+        esac
+    done < <(cat "${THROTTLE_LIST:-/run/nexoshield/autoban_throttle}" /etc/antiddos/throttled.list 2>/dev/null | awk '!seen[$1]++')
+
     # ── WARP / WireGuard awareness ──────────────────────────
     if ip link show 2>/dev/null | grep -qE '^\s*[0-9]+:\s+(wg|utm|warp)[0-9]*[:@]'; then
         warn "WARP/WireGuard tunnel detected — tc shapes '${MAIN_IF}' (default route)."
@@ -8802,6 +9674,135 @@ if [ -f /etc/antiddos/cloudflare-ipv4.list ]; then
 else
     echo "WARN: /etc/antiddos/cloudflare-ipv4.list missing - CF whitelist empty" >&2
 fi
+list_self_ips() {
+    { ip -4 addr show 2>/dev/null | grep -oP '(?<=inet )\d+\.\d+\.\d+\.\d+'
+      hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'
+    } | sort -u | grep -v '^$'
+}
+
+# list_self_ips6 - every local IPv6 address (incl. ::1), one per line.
+list_self_ips6() {
+    { ip -6 addr show 2>/dev/null | grep -oP '(?<=inet6 )[0-9a-fA-F:]+'
+      echo "::1"
+    } | sort -u | grep -v '^$'
+}
+
+# ── Public-IP discovery for NAT / cloud servers ─────────────────
+# On cloud VMs (Azure, most NAT setups) the server's public IPv4
+# exists only in the provider's NAT - it is on NO interface, so
+# list_self_ips can never see it, yet it is unmistakably one of the
+# server's own addresses (FR-2). Discovery asks the cloud metadata
+# service (link-local, no internet involved); only when no metadata
+# service answers does it fall back to an external echo service.
+# Every candidate passes nx_is_public_ipv4: metadata/echo replies
+# are untrusted input, and a private/documentation/garbage answer
+# must never widen the immune set.
+NX_PUBLIC_IPS_FILE="${NX_PUBLIC_IPS_FILE:-/etc/antiddos/public-ips.list}"
+
+nx_is_public_ipv4() {
+    local ip="${1:-}" o1 o2 o3 o4 extra _o
+    case "$ip" in *[!0-9.]*) return 1 ;; esac
+    IFS='.' read -r o1 o2 o3 o4 extra <<< "$ip"
+    [ -z "${extra:-}" ] || return 1
+    for _o in "$o1" "$o2" "$o3" "$o4"; do
+        case "$_o" in ''|*[!0-9]*) return 1 ;; esac
+        [ "${#_o}" -le 3 ] || return 1
+        (( 10#$_o <= 255 )) || return 1
+    done
+    case "$o1" in
+        0|10|127) return 1 ;;
+        100) [ "$o2" -ge 64 ] && [ "$o2" -le 127 ] && return 1 ;;
+        169) [ "$o2" = 254 ] && return 1 ;;
+        172) [ "$o2" -ge 16 ] && [ "$o2" -le 31 ] && return 1 ;;
+        192) [ "$o2" = 168 ] && return 1
+             { [ "$o2" = 0 ] && { [ "$o3" = 0 ] || [ "$o3" = 2 ]; }; } && return 1 ;;
+        198) case "$o2" in 18|19|51) return 1 ;; esac ;;
+        203) { [ "$o2" = 0 ] && [ "$o3" = 113 ]; } && return 1 ;;
+    esac
+    [ "$o1" -ge 224 ] && return 1
+    return 0
+}
+
+nx_metadata_public_ips() {
+    command -v curl >/dev/null 2>&1 || return 0
+    local _ip _tok _base="http://169.254.169.254"
+    # Azure IMDS (first two addresses on the primary NIC)
+    for _idx in 0 1; do
+        _ip=$(curl -s -m 2 -H "Metadata: true" \
+            "$_base/metadata/instance/network/interface/0/ipv4/ipAddress/$_idx/publicIpAddress?api-version=2021-02-01&format=text" 2>/dev/null)
+        nx_is_public_ipv4 "$_ip" && echo "$_ip"
+    done
+    # AWS EC2 IMDS (token first, plain fallback)
+    _tok=$(curl -s -m 2 -X PUT -H "X-aws-ec2-metadata-token-ttl-seconds: 60" \
+        "$_base/latest/api/token" 2>/dev/null)
+    if [ -n "$_tok" ]; then
+        _ip=$(curl -s -m 2 -H "X-aws-ec2-metadata-token: $_tok" \
+            "$_base/latest/meta-data/public-ipv4" 2>/dev/null)
+    else
+        _ip=$(curl -s -m 2 "$_base/latest/meta-data/public-ipv4" 2>/dev/null)
+    fi
+    nx_is_public_ipv4 "$_ip" && echo "$_ip"
+    # GCP
+    _ip=$(curl -s -m 2 -H "Metadata-Flavor: Google" \
+        "http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/access-configs/0/external-ip" 2>/dev/null)
+    nx_is_public_ipv4 "$_ip" && echo "$_ip"
+    # DigitalOcean
+    _ip=$(curl -s -m 2 "$_base/metadata/v1/interfaces/public/0/ipv4/address" 2>/dev/null)
+    nx_is_public_ipv4 "$_ip" && echo "$_ip"
+    # Hetzner Cloud
+    _ip=$(curl -s -m 2 "$_base/hetzner/v1/metadata/public-ipv4" 2>/dev/null)
+    nx_is_public_ipv4 "$_ip" && echo "$_ip"
+    return 0
+}
+
+nx_external_public_ip() {
+    command -v curl >/dev/null 2>&1 || return 0
+    local _ip _url
+    for _url in "https://api.ipify.org" "https://checkip.amazonaws.com" "https://ifconfig.me/ip"; do
+        _ip=$(curl -s -m 3 "$_url" 2>/dev/null | tr -d ' \r\n')
+        nx_is_public_ipv4 "$_ip" && { echo "$_ip"; return 0; }
+    done
+    return 0
+}
+
+# Echo the server's public IPv4s that are NOT on any interface
+# (metadata first; external echo only as a last resort).
+discover_public_ips() {
+    local _found _ip
+    _found=$(nx_metadata_public_ips | sort -u)
+    [ -z "$_found" ] && _found=$(nx_external_public_ip)
+    for _ip in $_found; do
+        list_self_ips | grep -qxF "$_ip" || echo "$_ip"
+    done
+}
+
+# Refresh the cache file; a failed/empty discovery NEVER wipes a
+# previously discovered set (an offline reinstall must not disarm
+# the immunity). Prints the discovered addresses when any exist.
+nx_refresh_public_ips_cache() {
+    local _found
+    _found=$(discover_public_ips)
+    if [ -n "$_found" ]; then
+        mkdir -p "$(dirname "$NX_PUBLIC_IPS_FILE")" 2>/dev/null || true
+        printf '%s\n' "$_found" > "$NX_PUBLIC_IPS_FILE.tmp" 2>/dev/null && \
+            mv "$NX_PUBLIC_IPS_FILE.tmp" "$NX_PUBLIC_IPS_FILE" 2>/dev/null || true
+        printf '%s\n' "$_found"
+    elif [ -f "$NX_PUBLIC_IPS_FILE" ]; then
+        cat "$NX_PUBLIC_IPS_FILE"
+    fi
+}
+
+# list_self_ips_all - interface addresses PLUS the cached
+# discovered public IPs. This is the feed every enforcement layer
+# uses for "the server's own addresses" (FR-2 complete: local,
+# private, secondary AND NAT-public).
+list_self_ips_all() {
+    { list_self_ips
+      if [ -r "$NX_PUBLIC_IPS_FILE" ]; then
+          grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' "$NX_PUBLIC_IPS_FILE" 2>/dev/null
+      fi
+    } | sort -u | grep -v '^$'
+}
 tc qdisc del dev "$IF" root 2>/dev/null || true
 tc qdisc add dev "$IF" root handle 1: htb default 20
 tc class add dev "$IF" parent 1: classid 1:1  htb rate 1gbit ceil 1gbit
@@ -8822,8 +9823,7 @@ if [ -f /etc/antiddos/cloudflare-ipv6.list ]; then
             u32 match ip6 dst "$CF6" flowid 1:10 2>/dev/null || true; H=$((H+1))
     done < /etc/antiddos/cloudflare-ipv6.list
 fi
-for SIP in $(ip -4 addr show 2>/dev/null | grep 'inet ' | \
-    grep -v '127\.' | awk '{print $2}' | cut -d/ -f1); do
+for SIP in $(list_self_ips_all 2>/dev/null | grep -v '^127\.0\.0\.1$'); do
     tc filter add dev "$IF" parent 1: protocol ip prio $H \
         u32 match ip dst "$SIP/32" flowid 1:10 2>/dev/null || true; H=$((H+1))
 done
@@ -8838,7 +9838,7 @@ fi
 # Re-apply live daemon throttles (BUG-022): rebuilding the qdisc must not
 # silently drop enforcement state recorded by the auto-ban daemon.
 if [ -f /etc/antiddos/throttled.list ]; then
-    while read -r TIP TPRIO TTS TBAND; do
+    while read -r TIP TPRIO _TS TBAND; do
         [ -z "$TIP" ] && continue
         TFLOW=1:30; [ "$TBAND" = "hard" ] && TFLOW=1:40
         case "$TIP" in
@@ -9030,6 +10030,27 @@ show_status() {
 # ════════════════════════════════════════════════
 # Remove all rules
 # ════════════════════════════════════════════════
+# nx_delete_matching <table> <chain> <pattern> — delete every rule whose
+# `iptables -S` text matches the pattern, by rule NUMBER recomputed
+# after each delete (spec-based deletion breaks on quoted arguments,
+# BUG-031/063). Top-level (F1): it used to be nested inside
+# remove_rules(), so flush_autobans() — which calls it directly —
+# aborted with "command not found" in a fresh process under set -e.
+nx_delete_matching() {
+    local _t="$1" _c="$2" _p="$3" _n
+    while true; do
+        # The -- matters: patterns like '--comment "auto-ban"' or
+        # '-j CT' start with a dash, and without it grep parses
+        # them as options, errors, and nothing is ever deleted
+        # (found by the v3.18.0 flush test - the old '-j CT' call
+        # in remove_rules was silently dead for the same reason).
+        _n=$(iptables -t "$_t" -S "$_c" 2>/dev/null | grep -nE -- "$_p" | head -1 | cut -d: -f1 || true)
+        [ -z "$_n" ] && break
+        # -S line 1 is the chain policy (-P): rule number = line - 1
+        iptables -t "$_t" -D "$_c" $((_n - 1)) 2>/dev/null || break
+    done
+}
+
 remove_rules() {
     sep; echo -e "  ${RED}Removing Anti-DDoS rules...${NC}"
     # CONF_R can be pre-set by --remove-force to skip prompt
@@ -9062,15 +10083,6 @@ remove_rules() {
     # untagged rules (loopback, ESTABLISHED accept, flag scans) survived
     # too. Deletion is by rule NUMBER recomputed from -S after each
     # delete - spec-based deletion breaks on quoted arguments.
-    nx_delete_matching() {
-        local _t="$1" _c="$2" _p="$3" _n
-        while true; do
-            _n=$(iptables -t "$_t" -S "$_c" 2>/dev/null | grep -nE "$_p" | head -1 | cut -d: -f1 || true)
-            [ -z "$_n" ] && break
-            # -S line 1 is the chain policy (-P): rule number = line - 1
-            iptables -t "$_t" -D "$_c" $((_n - 1)) 2>/dev/null || break
-        done
-    }
     local RULE_PAT='hashlimit|SYNPROXY|connlimit|cf_whitelist|auto-ban|subnet-ban|self_whitelist|user_whitelist|nx_connlimit|--ctstate INVALID|--tcp-flags| -f -j DROP|! --syn|-i lo|--ctstate ESTABLISHED,RELATED -j ACCEPT'
     nx_delete_matching filter INPUT "$RULE_PAT"
     nx_delete_matching filter FORWARD "$RULE_PAT"
@@ -9133,7 +10145,19 @@ NXRAW
     iptables-save 2>/dev/null | grep '"subnet-ban"' | \
         sed 's/^-A/iptables -D/' | bash 2>/dev/null || true
     # Clean temp files
-    rm -f /tmp/autoban_watch /tmp/autoban_throttle /tmp/autoban_subnet_watch 2>/dev/null || true
+    rm -f "${WATCH_LIST:-/run/nexoshield/autoban_watch}" "${THROTTLE_LIST:-/run/nexoshield/autoban_throttle}" "${SUBNET_WATCH_LIST:-/run/nexoshield/autoban_subnet_watch}" 2>/dev/null || true
+    # M7: "Remove all rules" must also remove the nft backend's table
+    # and the ban memory, or a later reinstall reconciles the
+    # surviving state and resurrects old bans (the daemon's startup
+    # reconcile re-applies banned.list, and its throttle restore
+    # re-applies throttled.list).
+    if command -v nft >/dev/null 2>&1 && nft list table inet nexoshield >/dev/null 2>&1; then
+        nft delete table inet nexoshield 2>/dev/null || true
+    fi
+    : > "$BANNED_LIST" 2>/dev/null || true
+    : > /etc/antiddos/throttled.list 2>/dev/null || true
+    rm -rf /var/lib/antiddos/scores 2>/dev/null || true
+    rm -f /etc/antiddos/adaptive.dat 2>/dev/null || true
     success "Auto-ban service: removed"
 
     # tc
@@ -9222,11 +10246,14 @@ show_thresholds() {
     printf "  %-35s ${WHITE}%s${NC}\n" "New conn rate limit:"   "${NEW_CONN_RATE:-N/A} (burst: ${NEW_CONN_BURST:-N/A})"
     printf "  %-35s ${WHITE}%s${NC}\n" "Per-IP bandwidth cap:"  "${BW_PER_IP_MBIT:-N/A} Mbps"
     printf "  %-35s ${WHITE}%s${NC}\n" "HTTP conns/non-CF IP:"  "$CONN_LIMIT_PER_IP"
-    printf "  %-35s ${WHITE}%s${NC}\n" "Auto-ban watch threshold:"   "120 active conns/IP"
-    printf "  %-35s ${WHITE}%s${NC}\n" "Auto-ban instant-ban:"       "300 active conns/IP"
-    printf "  %-35s ${WHITE}%s${NC}\n" "Auto-ban subnet watch:"      "400 total conns from /24"
-    printf "  %-35s ${WHITE}%s${NC}\n" "Auto-ban subnet ban:"        "1000 total conns from /24"
-    printf "  %-35s ${WHITE}%s${NC}\n" "Auto-ban observe:"           "45s watch before throttle"
+    # L12: daemon gates read through nx_cfg (scoring.conf wins, the
+    # historical constants are the fallback) - the old code printed
+    # the defaults even when the admin had tuned them.
+    printf "  %-35s ${WHITE}%s${NC}\n" "Auto-ban watch threshold:"   "$(nx_cfg conn_threshold 120) active conns/IP"
+    printf "  %-35s ${WHITE}%s${NC}\n" "Auto-ban instant-ban:"       "$(nx_cfg ban_conn_threshold 300) active conns/IP"
+    printf "  %-35s ${WHITE}%s${NC}\n" "Auto-ban subnet watch:"      "$(nx_cfg subnet_threshold 400) total conns from /24"
+    printf "  %-35s ${WHITE}%s${NC}\n" "Auto-ban subnet ban:"        "$(nx_cfg subnet_ban_threshold 1000) total conns from /24"
+    printf "  %-35s ${WHITE}%s${NC}\n" "Auto-ban observe:"           "$(nx_cfg observe_seconds 45)s watch before throttle"
     printf "  %-35s ${WHITE}%s${NC}\n" "Auto-ban throttle:"          "100Mbps"
     printf "  %-35s ${WHITE}%s${NC}\n" "Auto-ban duration:"          "Progressive: 30 min, doubling to 7 days"
     printf "  %-35s ${WHITE}%s${NC}\n" "Reputation scoring:"         "ON (100→0, human-vs-bot)"
@@ -9260,6 +10287,10 @@ valid_ip_or_cidr() {
             ""|*[!0-9]*) return 1 ;;
         esac
         [ "${#o}" -le 3 ] || return 1
+        # L10: leading zeros are octal to some parsers ("010.0.0.1"
+        # is 8.0.0.1 to the kernel), so only a lone "0" may start
+        # with zero - anything else is rejected, not reinterpreted.
+        case "$o" in 0?*) return 1 ;; esac
         (( 10#$o <= 255 )) || return 1
     done
     if [ "$slashed" = 1 ]; then
@@ -9301,11 +10332,26 @@ nx_ip_in_cidr() {
 # are deleted by number from `iptables -S` (nx_delete_matching) and
 # recorded tc throttle filters are removed by their prios.
 flush_autobans() {
-    nx_delete_matching INPUT '--comment "auto-ban"'
-    nx_delete_matching INPUT '--comment "subnet-ban"'
+    # F1: these calls used to pass two arguments to a three-argument
+    # helper (table missing) AND the helper was nested inside
+    # remove_rules(), so in a fresh process this aborted under set -e
+    # before deleting anything. Both are fixed: the helper is
+    # top-level now and the calls carry the table.
+    nx_delete_matching filter INPUT '--comment "auto-ban"'
+    nx_delete_matching filter INPUT '--comment "subnet-ban"'
+    nx_delete_matching6 INPUT '--comment "auto-ban"'
+    nx_delete_matching6 INPUT '--comment "subnet-ban"'
+    # H2: under the nft backend the kernel ban state lives in the
+    # ban4/ban6 sets, not in iptables rules - flush those too, or
+    # the bans persist to their timeouts (up to 7 days) while the
+    # state files below claim they were flushed.
+    if command -v nft >/dev/null 2>&1 && nft list table inet nexoshield >/dev/null 2>&1; then
+        nft flush set inet nexoshield ban4 2>/dev/null || true
+        nft flush set inet nexoshield ban6 2>/dev/null || true
+    fi
     local _iface _f _ip _prio _rest
     _iface=$(ip route show default 2>/dev/null | awk '/default/{print $5}' | head -1)
-    for _f in /tmp/autoban_throttle /etc/antiddos/throttled.list; do
+    for _f in "${THROTTLE_LIST:-/run/nexoshield/autoban_throttle}" /etc/antiddos/throttled.list; do
         [ -f "$_f" ] || continue
         while read -r _ip _prio _rest; do
             if [ -n "${_prio:-}" ] && [ -n "$_iface" ]; then
@@ -9315,8 +10361,9 @@ flush_autobans() {
         : > "$_f" 2>/dev/null || true
     done
     : > /etc/antiddos/banned.list 2>/dev/null || true
-    : > /tmp/autoban_watch 2>/dev/null || true
-    success "All auto-bans flushed (iptables rules + daemon state)"
+    : > "${WATCH_LIST:-/run/nexoshield/autoban_watch}" 2>/dev/null || true
+    : > "${SUBNET_WATCH_LIST:-/run/nexoshield/autoban_subnet_watch}" 2>/dev/null || true
+    success "All auto-bans flushed (iptables + ip6tables + nft + daemon state)"
 }
 
 # valid_ip6_or_cidr - IPv6 counterpart of valid_ip_or_cidr (E-5).
@@ -9455,6 +10502,97 @@ exempt_check() {
     return $rc
 }
 
+# nx_release_ban <ip|cidr> — release ONE ban from every layer: the
+# nft ban-set element, the tagged iptables/ip6tables DROP rules, the
+# recorded tc throttle filter, banned.list, and every fail2ban jail.
+# Returns 0 when anything was actually removed, 1 when the IP was
+# found nowhere — so callers never print "fully unblocked" for a
+# no-op (H2/H3). Shared by the menu Unban option and the
+# whitelist-add release (M2); the menu's nx_unban_ip is the same
+# logic in the menu program (it cannot call this file).
+nx_release_ban() {
+    local _ip="$1" _removed=0 _tf _prio _if _j
+    if command -v nft >/dev/null 2>&1; then
+        case "$_ip" in
+            *:*) nft delete element inet nexoshield ban6 "{ $_ip }" >/dev/null 2>&1 && _removed=1 || true ;;
+            *)   nft delete element inet nexoshield ban4 "{ $_ip }" >/dev/null 2>&1 && _removed=1 || true ;;
+        esac
+    fi
+    case "$_ip" in
+        *:*)
+            ip6tables -D INPUT -s "$_ip" -m comment --comment "auto-ban" -j DROP 2>/dev/null && _removed=1 || true ;;
+        *)
+            if iptables -D INPUT -s "$_ip" -m comment --comment "auto-ban" -j DROP 2>/dev/null; then
+                _removed=1
+            elif iptables -D INPUT -s "$_ip" -m comment --comment "subnet-ban" -j DROP 2>/dev/null; then
+                _removed=1
+            elif iptables -D INPUT -s "$_ip" -j DROP 2>/dev/null; then
+                _removed=1
+            fi ;;
+    esac
+    for _tf in "${THROTTLE_LIST:-/run/nexoshield/autoban_throttle}" /etc/antiddos/throttled.list; do
+        [ -f "$_tf" ] || continue
+        _prio=$(awk -v x="$_ip" '$1==x{print $2}' "$_tf" 2>/dev/null | head -1)
+        if [ -n "$_prio" ]; then
+            _removed=1
+            _if=$(ip route show default 2>/dev/null | awk '/default/{print $5}' | head -1)
+            [ -n "$_if" ] && tc filter del dev "$_if" parent 1: prio "$_prio" 2>/dev/null || true
+        fi
+        awk -v x="$_ip" '$1!=x' "$_tf" > "$_tf.tmp" 2>/dev/null && mv "$_tf.tmp" "$_tf"
+    done
+    if [ -f "$BANNED_LIST" ]; then
+        awk -v x="$_ip" '$1==x{found=1} END{exit !found}' "$BANNED_LIST" 2>/dev/null && _removed=1 || true
+        awk -v x="$_ip" '$1!=x' "$BANNED_LIST" > "$BANNED_LIST.tmp" 2>/dev/null && \
+            mv "$BANNED_LIST.tmp" "$BANNED_LIST"
+    fi
+    fail2ban-client status 2>/dev/null | grep "Jail list" | \
+        sed 's/.*://;s/,/\n/g' | tr -d ' ' | while read -r _j; do
+        [ -z "$_j" ] && continue
+        fail2ban-client set "$_j" unbanip "$_ip" 2>/dev/null || true
+    done
+    [ "$_removed" -eq 1 ]
+}
+
+# _wl_covered <banned-entry> <whitelist-entry> — true when whitelisting
+# the entry releases the banned entry: same value, a plain IP inside
+# a whitelist CIDR, or a banned subnet inside a wider whitelist CIDR.
+# A single whitelisted IP never lifts a subnet ban (the /24 rule
+# still drops it; whitelist the /24 itself to lift it).
+_wl_covered() {
+    local _b="$1" _e="$2"
+    [ "$_b" = "$_e" ] && return 0
+    case "$_e" in */*) : ;; *) return 1 ;; esac
+    case "$_b" in */*) _b="${_b%%/*}" ;; esac
+    case "$_b" in
+        *:*)
+            case "$_e" in *:*) nx_ip6_in_cidr "$_b" "$_e" ;; *) return 1 ;; esac ;;
+        *)
+            case "$_e" in *:* ) return 1 ;; *) nx_ip_in_cidr "$_b" "$_e" ;; esac ;;
+    esac
+}
+
+# wl_release_bans_for <entry> — when an IP/CIDR is newly whitelisted
+# (M2), release every ban it covers. A banned IP that is now exempt
+# must not stay blocked in the kernel until its timeout, and the
+# entry must join the nft exempt set so the kernel path honors it
+# immediately (the daemon skips exempt IPs, but only the kernel
+# state decides what actually gets dropped).
+wl_release_bans_for() {
+    local _entry="$1" _bip
+    # The loop reads an awk snapshot (pipe), so nx_release_ban's
+    # in-place banned.list rewrite cannot disturb the iteration.
+    while IFS= read -r _bip; do
+        [ -z "$_bip" ] && continue
+        _wl_covered "$_bip" "$_entry" && { nx_release_ban "$_bip" || true; }
+    done < <(awk '{print $1}' "$BANNED_LIST" 2>/dev/null || true)
+    if command -v nft >/dev/null 2>&1 && nft list table inet nexoshield >/dev/null 2>&1; then
+        case "$_entry" in
+            *:*) nft add element inet nexoshield exempt6 "{ $_entry }" 2>/dev/null || true ;;
+            *)   nft add element inet nexoshield exempt4 "{ $_entry }" 2>/dev/null || true ;;
+        esac
+    fi
+}
+
 # ── Whitelist manager ──────────────────────────────────────
 manage_whitelist() {
     local WL="$WHITELIST_FILE"
@@ -9497,11 +10635,16 @@ manage_whitelist() {
                     echo -e "  ${YELLOW}No input.${NC}"
                 elif ! valid_ip_or_cidr "$WIP" && ! valid_ip6_or_cidr "$WIP"; then
                     echo -e "  ${RED}Invalid IP/CIDR: $WIP${NC}"
-                elif grep -qF "$WIP" "$WL" 2>/dev/null; then
+                elif grep -qxF "$WIP" "$WL" 2>/dev/null; then
                     echo -e "  ${YELLOW}Already in whitelist.${NC}"
                 else
                     echo "$WIP" >> "$WL"
                     echo -e "  ${GREEN}✓ Added: $WIP${NC}"
+                    # M2: a newly exempt entry must not stay banned in
+                    # the kernel until its timeout - release every ban
+                    # it covers and join the nft exempt set first,
+                    # then re-apply the layers around the new state.
+                    wl_release_bans_for "$WIP" || true
                     # Apply to iptables + tc immediately (re-apply both)
                     apply_iptables >/dev/null 2>&1 || true
                     apply_tc_runtime "$MAIN_IF" >/dev/null 2>&1 || true
@@ -9554,28 +10697,36 @@ apply_tc_runtime() {
 }
 
 # CLI args
+# MED-6: action flags propagate the action's exit code instead of
+# exiting 0 regardless. F6: unknown flags error out instead of
+# silently falling through to the interactive menu.
 case "${1:-}" in
-    --install|-i)    detect_env; do_install; exit 0 ;;
-    --remove|-r)     detect_env; remove_rules; exit 0 ;;
-    --remove-force)  detect_env; CONF_R="y"; remove_rules; exit 0 ;;
-    --status|-s)     detect_env; show_status; exit 0 ;;
+    --install|-i)    detect_env; do_install; exit $? ;;
+    --remove|-r)     detect_env; remove_rules; exit $? ;;
+    --remove-force)  detect_env; CONF_R="y"; remove_rules; exit $? ;;
+    --status|-s)     detect_env; show_status; exit $? ;;
     --exempt-check)  exempt_check "${2:-}"; exit $? ;;
     --flush-autobans) flush_autobans; exit $? ;;
-    --thresholds|-t) detect_env; show_thresholds; exit 0 ;;
-    --sysctl)        detect_env; apply_sysctl_hardening; exit 0 ;;
-    --iptables)      detect_env; apply_iptables; exit 0 ;;
-    --fail2ban)      detect_env; apply_fail2ban; exit 0 ;;
-    --autoban)       detect_env; setup_autoban; exit 0 ;;
-    --whitelist|-w)  detect_env; manage_whitelist; exit 0 ;;
-    --tc)            detect_env; setup_tc; exit 0 ;;
+    --thresholds|-t) detect_env; show_thresholds; exit $? ;;
+    --sysctl)        detect_env; apply_sysctl_hardening; exit $? ;;
+    --iptables)      detect_env; apply_iptables; exit $? ;;
+    --fail2ban)      detect_env; apply_fail2ban; exit $? ;;
+    --autoban)       detect_env; setup_autoban; exit $? ;;
+    --whitelist|-w)  detect_env; manage_whitelist; exit $? ;;
+    --tc)            detect_env; setup_tc; exit $? ;;
     --auto|-y)
         detect_env
         sep
         echo -e "  ${CYAN}${BOLD}Anti-DDoS Full Install v${SCRIPT_VERSION}${NC}"; sep
         echo -e "  ${DIM}RAM: ${RAM_MB}MB | CPU: ${CPU_CORES} | Virt: ${VIRT_TYPE} | IF: ${MAIN_IF}${NC}"
         echo ""
-        apply_sysctl_hardening; apply_iptables; apply_fail2ban
-        setup_autoban; setup_tc; setup_persistence
+        _auto_rc=0
+        apply_sysctl_hardening || _auto_rc=1
+        apply_iptables || _auto_rc=1
+        apply_fail2ban || _auto_rc=1
+        setup_autoban || _auto_rc=1
+        setup_tc || _auto_rc=1
+        setup_persistence || _auto_rc=1
         cat > "$STATE_FILE" << EOF
 DATE=$(date)
 VERSION=${SCRIPT_VERSION}
@@ -9586,12 +10737,23 @@ HASHLIMIT=${HASHLIMIT_OK}
 MAIN_IF=${MAIN_IF}
 EOF
         sep
-        success "Anti-DDoS installation complete!"
-        exit 0 ;;
+        if [ "$_auto_rc" -eq 0 ]; then
+            success "Anti-DDoS installation complete!"
+        else
+            warn "Anti-DDoS installation finished with errors - see above."
+        fi
+        exit "$_auto_rc" ;;
+    *)  if [ -n "${1:-}" ]; then err "Unknown option: $1"; exit 2; fi ;;
 esac
 
 # Interactive menu
 detect_env
+
+# LOW-8: without a terminal the menu loop below cannot read choices.
+if ! : </dev/tty 2>/dev/null; then
+    err "Interactive menu requires a terminal (use CLI flags for scripting)."
+    exit 1
+fi
 
 while true; do
     clear; sep
@@ -9630,31 +10792,20 @@ while true; do
         8) setup_tc; printf '%s\n' "  Press Enter to continue..." >/dev/tty; read -r _PE </dev/tty 2>/dev/null || true ;;
         9) echo -e "  ${CYAN}Unban IP${NC}"; echo ""
            printf '%s' "  Enter IP to unban (iptables + fail2ban): " >/dev/tty; read -r UIP </dev/tty || UIP=""
-           if [ -n "$UIP" ] && ! valid_ip_or_cidr "$UIP"; then
+           if [ -n "$UIP" ] && ! valid_ip_or_cidr "$UIP" && ! valid_ip6_or_cidr "$UIP"; then
                echo -e "  ${RED}✗ Invalid IP/CIDR: $UIP${NC}"
                UIP=""
            fi
            [ -n "$UIP" ] && {
-               # Exact deletes (BUG-038): the daemon's rules carry the
-               # auto-ban/subnet-ban comments, so the old bare-spec
-               # delete never matched them; and the state edit was a
-               # substring sed - unbanning 1.2.3.4 also dropped
-               # 11.2.3.4's entry. Match field 1 exactly instead.
-               iptables -D INPUT -s "$UIP" -m comment --comment "auto-ban" -j DROP 2>/dev/null || \
-               iptables -D INPUT -s "$UIP" -m comment --comment "subnet-ban" -j DROP 2>/dev/null || \
-               iptables -D INPUT -s "$UIP" -j DROP 2>/dev/null || true
-               echo -e "  ${GREEN}✓ iptables unblocked${NC}"
-               if [ -f "$BANNED_LIST" ]; then
-                   awk -v x="$UIP" '$1!=x' "$BANNED_LIST" > "$BANNED_LIST.tmp" 2>/dev/null && \
-                       mv "$BANNED_LIST.tmp" "$BANNED_LIST"
+               # One unban path (H2/H3): nft set element, tagged
+               # iptables/ip6tables rules, throttle filter, state
+               # file and fail2ban - and an honest result: success
+               # is printed only when something was actually removed.
+               if nx_release_ban "$UIP"; then
+                   echo -e "  ${GREEN}✓ $UIP fully unblocked${NC}"
+               else
+                   echo -e "  ${YELLOW}⚠ $UIP was not found in any layer (nothing removed)${NC}"
                fi
-               fail2ban-client status 2>/dev/null | grep "Jail list" | \
-                   sed 's/.*://;s/,/\n/g' | tr -d ' ' | while read -r jail; do
-                   [ -z "$jail" ] && continue
-                   fail2ban-client set "$jail" unbanip "$UIP" 2>/dev/null && \
-                       echo -e "  ${GREEN}✓ fail2ban $jail unblocked${NC}" || true
-               done
-               echo -e "  ${GREEN}✓ $UIP fully unblocked${NC}"
            }
            printf '%s\n' "  Press Enter to continue..." >/dev/tty; read -r _PE </dev/tty 2>/dev/null || true ;;
         w|W) manage_whitelist ;;
@@ -9690,10 +10841,21 @@ chmod +x "$INSTALL_DIR/3proxy-socks5.sh" \
 ok "Files created"
 
 # ── Link shield command ───────────────────────────────────
+# LOW-4: the BUG-058 guard for the old 'proxy' link, applied to the
+# new name too - never silently replace a foreign /usr/local/bin/
+# shield (another tool, a user's script). Replace only when absent,
+# already ours, or a NexoShield menu from a previous install.
 info "Installing shield command..."
-ln -sf "$INSTALL_DIR/proxy-menu.sh" "$BIN_LINK"
-chmod +x "$BIN_LINK"
-ok "Command ${W}shield${NC} installed"
+if [ -e "$BIN_LINK" ] && [ ! -L "$BIN_LINK" ]; then
+    warn "$BIN_LINK exists and is not a symlink - leaving it untouched; run $INSTALL_DIR/proxy-menu.sh directly."
+elif [ -L "$BIN_LINK" ] && [ "$(readlink "$BIN_LINK" 2>/dev/null)" != "$INSTALL_DIR/proxy-menu.sh" ] && \
+     [ "$(readlink "$BIN_LINK" 2>/dev/null)" != "$INSTALL_DIR/proxy-menu.sh.prev" ]; then
+    warn "$BIN_LINK points elsewhere ($(readlink "$BIN_LINK" 2>/dev/null)) - leaving it untouched; run $INSTALL_DIR/proxy-menu.sh directly."
+else
+    ln -sf "$INSTALL_DIR/proxy-menu.sh" "$BIN_LINK"
+    chmod +x "$BIN_LINK"
+    ok "Command ${W}shield${NC} installed"
+fi
 # Pre-v3.11 installs linked the menu as /usr/local/bin/proxy. Drop
 # that link on upgrade - but only if it is OURS (a symlink to this
 # menu); never touch a foreign binary of the same name (BUG-058).

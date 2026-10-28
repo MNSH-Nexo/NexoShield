@@ -30,7 +30,7 @@ AUTOBAN_EOF
     # Staged activation (BUG-025): never truncate the live daemon script
     if ! bash -n "$AUTOBAN_SCRIPT.nxnew" 2>/dev/null; then
         rm -f "$AUTOBAN_SCRIPT.nxnew"
-        error "generated auto-ban script failed its syntax check - keeping the previous one"
+        err "generated auto-ban script failed its syntax check - keeping the previous one"
         return 1
     fi
     [ -f "$AUTOBAN_SCRIPT" ] && cp -a "$AUTOBAN_SCRIPT" "$AUTOBAN_SCRIPT.prev" 2>/dev/null || true

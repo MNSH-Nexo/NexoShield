@@ -83,6 +83,27 @@ show_status() {
 # ════════════════════════════════════════════════
 # Remove all rules
 # ════════════════════════════════════════════════
+# nx_delete_matching <table> <chain> <pattern> — delete every rule whose
+# `iptables -S` text matches the pattern, by rule NUMBER recomputed
+# after each delete (spec-based deletion breaks on quoted arguments,
+# BUG-031/063). Top-level (F1): it used to be nested inside
+# remove_rules(), so flush_autobans() — which calls it directly —
+# aborted with "command not found" in a fresh process under set -e.
+nx_delete_matching() {
+    local _t="$1" _c="$2" _p="$3" _n
+    while true; do
+        # The -- matters: patterns like '--comment "auto-ban"' or
+        # '-j CT' start with a dash, and without it grep parses
+        # them as options, errors, and nothing is ever deleted
+        # (found by the v3.18.0 flush test - the old '-j CT' call
+        # in remove_rules was silently dead for the same reason).
+        _n=$(iptables -t "$_t" -S "$_c" 2>/dev/null | grep -nE -- "$_p" | head -1 | cut -d: -f1 || true)
+        [ -z "$_n" ] && break
+        # -S line 1 is the chain policy (-P): rule number = line - 1
+        iptables -t "$_t" -D "$_c" $((_n - 1)) 2>/dev/null || break
+    done
+}
+
 remove_rules() {
     sep; echo -e "  ${RED}Removing Anti-DDoS rules...${NC}"
     # CONF_R can be pre-set by --remove-force to skip prompt
@@ -115,15 +136,6 @@ remove_rules() {
     # untagged rules (loopback, ESTABLISHED accept, flag scans) survived
     # too. Deletion is by rule NUMBER recomputed from -S after each
     # delete - spec-based deletion breaks on quoted arguments.
-    nx_delete_matching() {
-        local _t="$1" _c="$2" _p="$3" _n
-        while true; do
-            _n=$(iptables -t "$_t" -S "$_c" 2>/dev/null | grep -nE "$_p" | head -1 | cut -d: -f1 || true)
-            [ -z "$_n" ] && break
-            # -S line 1 is the chain policy (-P): rule number = line - 1
-            iptables -t "$_t" -D "$_c" $((_n - 1)) 2>/dev/null || break
-        done
-    }
     local RULE_PAT='hashlimit|SYNPROXY|connlimit|cf_whitelist|auto-ban|subnet-ban|self_whitelist|user_whitelist|nx_connlimit|--ctstate INVALID|--tcp-flags| -f -j DROP|! --syn|-i lo|--ctstate ESTABLISHED,RELATED -j ACCEPT'
     nx_delete_matching filter INPUT "$RULE_PAT"
     nx_delete_matching filter FORWARD "$RULE_PAT"
@@ -186,7 +198,19 @@ NXRAW
     iptables-save 2>/dev/null | grep '"subnet-ban"' | \
         sed 's/^-A/iptables -D/' | bash 2>/dev/null || true
     # Clean temp files
-    rm -f /tmp/autoban_watch /tmp/autoban_throttle /tmp/autoban_subnet_watch 2>/dev/null || true
+    rm -f "${WATCH_LIST:-/run/nexoshield/autoban_watch}" "${THROTTLE_LIST:-/run/nexoshield/autoban_throttle}" "${SUBNET_WATCH_LIST:-/run/nexoshield/autoban_subnet_watch}" 2>/dev/null || true
+    # M7: "Remove all rules" must also remove the nft backend's table
+    # and the ban memory, or a later reinstall reconciles the
+    # surviving state and resurrects old bans (the daemon's startup
+    # reconcile re-applies banned.list, and its throttle restore
+    # re-applies throttled.list).
+    if command -v nft >/dev/null 2>&1 && nft list table inet nexoshield >/dev/null 2>&1; then
+        nft delete table inet nexoshield 2>/dev/null || true
+    fi
+    : > "$BANNED_LIST" 2>/dev/null || true
+    : > /etc/antiddos/throttled.list 2>/dev/null || true
+    rm -rf /var/lib/antiddos/scores 2>/dev/null || true
+    rm -f /etc/antiddos/adaptive.dat 2>/dev/null || true
     success "Auto-ban service: removed"
 
     # tc

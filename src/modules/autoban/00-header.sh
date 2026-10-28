@@ -15,15 +15,36 @@
 
 LOG="/var/log/auto-ban.log"
 BANNED_LIST="/etc/antiddos/banned.list"
-WATCH_LIST="/tmp/autoban_watch"
-THROTTLE_LIST="/tmp/autoban_throttle"
+# F5: live state lives under /run/nexoshield (root-owned tmpfs), not
+# /tmp — /tmp entries are world-writable, so a pre-planted symlink
+# could make a root truncate or append hit an attacker-chosen file.
+# Volatility semantics are unchanged (both are tmpfs, cleared on
+# reboot); the persistent mirrors stay under /etc/antiddos.
+mkdir -p /run/nexoshield 2>/dev/null || true
+# L6: single-instance guard. Two daemons would double-apply bans,
+# double-count strikes and fight over state files. The lock is held
+# for the process lifetime; a second instance exits instead of
+# running. If the lock file cannot be created (or no flock binary
+# exists), the daemon proceeds unguarded - the old behaviour -
+# rather than refusing to start. This runs before log() exists
+# (defined in 10-ip-utils.sh), so failures print to stderr.
+if command -v flock >/dev/null 2>&1; then
+    if exec 9>/run/nexoshield/auto-ban.lock 2>/dev/null; then
+        if ! flock -n 9 2>/dev/null; then
+            echo "auto-ban: another instance is running, exiting" >&2
+            exit 1
+        fi
+    fi
+fi
+WATCH_LIST="/run/nexoshield/autoban_watch"
+THROTTLE_LIST="/run/nexoshield/autoban_throttle"
 # U-11: persistent mirror of the throttle state. The live file sits
-# in /tmp (fast, volatile); the generated tc-setup.sh has always
+# in /run (fast, volatile); the generated tc-setup.sh has always
 # re-applied throttles from /etc/antiddos/throttled.list after a
 # reboot - but nothing ever WROTE that file, so the restore path was
 # dead and every reboot silently dropped all throttles. The daemon
-# now mirrors tmp -> etc once per cycle and restores etc -> tmp at
-# startup when the tmp file is gone.
+# now mirrors run -> etc once per cycle and restores etc -> run at
+# startup when the run file is gone.
 THROTTLE_MIRROR="/etc/antiddos/throttled.list"
 # User whitelist — IPs/CIDRs exempt from ALL anti-DDoS limits.
 # Managed by the user via the menu (never auto-modified). One per line.
@@ -45,8 +66,9 @@ SCORE_FILE="$SCORE_DIR/reputation.dat"
 # Bands (see research: adaptive/graduated enforcement beats one-shot ban):
 #  100-80 NORMAL    no action (only watched if above CONN_THRESHOLD)
 #   79-60 SUSPECT   watch only, no penalty
-#   59-40 THROTTLED move to class 1:30 (100Mbps)
-#   39-20 HARD      move to class 1:40 (50Mbps)
+#   59-40 THROTTLED move to class 1:30 (nominal 100Mbps - setup_tc
+#               scales the tree to LINK/10 on sub-gigabit links)
+#   39-20 HARD      move to class 1:40 (nominal 50Mbps - LINK/20)
 #   <20  BANNED     ban_ip (progressive 30m-7d)
 # (values assigned by nx_load_scoring_config below)
 # Scoring model v2 (docs/SCORING.md): every score movement is rated in
@@ -74,7 +96,10 @@ SCORE_FILE="$SCORE_DIR/reputation.dat"
 # Set CONN_THRESHOLD well above ANY legitimate user so normal speed is never
 # limited, but far below a flood. OBSERVE allows brief legit spikes (a download
 # manager burst) to pass untouched before any action.
-THROTTLE_MBPS=100    # throttle bandwidth in Mbps (must match tc class 1:30 = 100mbit)
+THROTTLE_MBPS=100    # Nominal 1-Gbit-tree value for tc class 1:30;
+                     # setup_tc scales the class to LINK/10 on
+                     # sub-gigabit links, so this is a band label,
+                     # not a guaranteed rate on slow links.
 # CONN_THRESHOLD / BAN_CONN_THRESHOLD / OBSERVE_SECONDS / BAN_HOURS are
 # assigned by nx_load_scoring_config below (defaults 120 / 300 / 45 / 4).
 # Sample cadence. 2s (was 4s): churn rate is already normalized per-second, so
@@ -94,7 +119,7 @@ SAMPLE_INTERVAL=2    # seconds per measurement
 # A very heavy CGNAT node (many legit users) could reach ~400.
 # Botnet with 50 IPs × 100+ conns = 5000 → way above threshold.
 # SUBNET_THRESHOLD / SUBNET_BAN_THRESHOLD assigned below (defaults 400 / 1000).
-SUBNET_WATCH_LIST="/tmp/autoban_subnet_watch"
+SUBNET_WATCH_LIST="/run/nexoshield/autoban_subnet_watch"
 touch "$SUBNET_WATCH_LIST" 2>/dev/null || true
 
 # ── Scoring config loader (Phase 1a) ─────────────────────────────

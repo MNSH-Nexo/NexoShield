@@ -23,6 +23,7 @@ _NX_XDP_WIN_START=0
 _NX_XDP_OVF_WIN=0
 _NX_XDP_SCOOK_WIN=0
 _NX_XDP_BANS_MT=0
+_NX_XDP_LAST_DROPS=""
 
 nx_xdp_init() {
     if [ -x "$NX_XDP_BIN" ] && [ -f "$NX_XDP_OBJ" ]; then
@@ -68,6 +69,7 @@ nx_xdp_attach() {
         "$NX_XDP_BIN" sync-exempt "$NX_XDP_EXEMPT_FILE" >/dev/null 2>&1 || true
         NX_XDP_ATTACHED="$NX_XDP_IFACE"
         _NX_XDP_CALM_SINCE=0
+        _NX_XDP_LAST_DROPS=""
         _NX_XDP_BANS_MT=$(stat -c %Y "$BANNED_LIST" 2>/dev/null || echo 0)
         log " XDP: emergency shield ATTACHED on $NX_XDP_IFACE ($reason) - line-rate SYN relief active"
     else
@@ -77,16 +79,25 @@ nx_xdp_attach() {
 }
 
 nx_xdp_detach() {
-    "$NX_XDP_BIN" unload "$NX_XDP_ATTACHED" >> "${LOG_FILE:-/dev/null}" 2>&1 || true
-    log " XDP: shield detached from $NX_XDP_ATTACHED ($1)"
-    NX_XDP_ATTACHED=""
-    _NX_XDP_HOT=0
-    _NX_XDP_CALM_SINCE=0
+    # L16: the old code cleared NX_XDP_ATTACHED even when the unload
+    # failed, so the daemon believed the shield was gone while it was
+    # still attached - and never retried. Keep the attached state on
+    # failure (fail-closed: the shield keeps dropping) and retry
+    # after a fresh calm window.
+    if "$NX_XDP_BIN" unload "$NX_XDP_ATTACHED" >> "${LOG_FILE:-/dev/null}" 2>&1; then
+        log " XDP: shield detached from $NX_XDP_ATTACHED ($1)"
+        NX_XDP_ATTACHED=""
+        _NX_XDP_HOT=0
+        _NX_XDP_CALM_SINCE=0
+    else
+        log " XDP: detach FAILED on $NX_XDP_ATTACHED - keeping shield attached, will retry"
+        _NX_XDP_CALM_SINCE=$(date +%s)
+    fi
 }
 
 nx_xdp_tick() {
     [ "$NX_XDP_AVAILABLE" = "1" ] || return 0
-    local now rate=0 mt
+    local now rate=0 mt _nxdrops
     now=$(date +%s)
     [ "$_NX_XDP_WIN_START" -eq 0 ] && _NX_XDP_WIN_START=$now
     _NX_XDP_OVF_WIN=$(( _NX_XDP_OVF_WIN + ${NX_OVF_DELTA:-0} ))
@@ -120,6 +131,17 @@ nx_xdp_tick() {
                 "$NX_XDP_BIN" sync-bans "$NX_XDP_BANS_FILE" >/dev/null 2>&1 || true
                 "$NX_XDP_BIN" sync-exempt "$NX_XDP_EXEMPT_FILE" >/dev/null 2>&1 || true
             fi
+        fi
+        # M6: the old calm test ignored what the shield was actually
+        # doing - a flood whose SYNs all die in XDP leaves no
+        # overflows, no syncookies and a low netfilter SYN rate, so
+        # the shield detached mid-flood and re-attached in a loop.
+        # A rising drops counter means the flood is NOT over: reset
+        # the calm timer. An unreadable counter changes nothing.
+        _nxdrops=$("$NX_XDP_BIN" stats 2>/dev/null | sed -n 's/.*drops=\([0-9]*\).*/\1/p' | head -1)
+        if [ -n "$_nxdrops" ]; then
+            [ "$_nxdrops" != "$_NX_XDP_LAST_DROPS" ] && _NX_XDP_CALM_SINCE=0
+            _NX_XDP_LAST_DROPS="$_nxdrops"
         fi
         if [ "${NX_OVF_DELTA:-0}" -eq 0 ] && [ "${NX_SYNCOOK_DELTA:-0}" -eq 0 ] && [ "$rate" -lt 500 ]; then
             [ "$_NX_XDP_CALM_SINCE" -eq 0 ] && _NX_XDP_CALM_SINCE=$now

@@ -60,7 +60,7 @@ uninstall_proxy() {
         # Rate-limit rules for this port - by enumeration (BUG-014:
         # older versions created them with varying hitcounts)
         local _rn
-        for _rn in $(iptables -S INPUT 2>/dev/null | grep -n "3proxy_${PORT}" | cut -d: -f1 | sort -rn); do
+        for _rn in $(iptables -S INPUT 2>/dev/null | grep -n "3proxy_${PORT}[^0-9]" | cut -d: -f1 | sort -rn); do
             iptables -D INPUT $((_rn - 1)) 2>/dev/null || true
         done
         # connlimit rule for this port
@@ -89,16 +89,34 @@ uninstall_proxy() {
         echo -e "${YELLOW}⚠ Could not detect port — skipping port-specific iptables rules${NC}"
     fi
 
-    # Remove auto-ban iptables rules (tagged with "auto-ban")
-    iptables -S INPUT 2>/dev/null | grep '"auto-ban"' | while read -r rule; do
-        # shellcheck disable=SC2086  # intentional: $rule expands to multiple iptables arguments
-        iptables -D INPUT ${rule#-A INPUT } 2>/dev/null || true
-    done
+    # MED-2: the ruleset changed - rewrite the persistent saves from
+    # the cleaned live state (same filter antiddos remove uses), or
+    # the next boot resurrects the removed proxy rules. The
+    # antiddos save is refreshed only if antiddos already owns one.
+    if [ -d /etc/iptables ]; then
+        iptables-save 2>/dev/null | grep -v -e '"auto-ban"' -e '"subnet-ban"' -e 'f2b-' -e 'fail2ban-' > /etc/iptables/rules.v4 2>/dev/null || true
+    fi
+    if [ -f /etc/antiddos/iptables-antiddos.rules ]; then
+        iptables-save 2>/dev/null | grep -v -e '"auto-ban"' -e '"subnet-ban"' -e 'f2b-' -e 'fail2ban-' > /etc/antiddos/iptables-antiddos.rules 2>/dev/null || true
+    fi
+
+    # LOW-1: NO auto-ban cleanup here. The loop this replaces fed
+    # `iptables -S` output (comments rendered quoted) through
+    # word-splitting, so it never matched anything - and making it
+    # work would mass-unban every daemon ban while the daemon keeps
+    # running. Daemon bans belong to the daemon (BUG-037): it
+    # expires them itself.
 
     # ── Remove tc bandwidth shaping ───────────────────────
     if [ ! -f /etc/antiddos/state.conf ]; then
         MAIN_IF=$(ip route show default 2>/dev/null | awk '/default/{print $5}' | head -1)
         MAIN_IF=${MAIN_IF:-eth0}
+        # LOW-13: the recorded pre-existing qdisc is dropped, not
+        # restored - exact restore is infeasible from the one-line
+        # record, so say so instead of silently dropping it.
+        if [ -s /etc/antiddos/tc-qdisc-before.txt ]; then
+            echo -e "${YELLOW}Note: the pre-existing qdisc ($(cat /etc/antiddos/tc-qdisc-before.txt 2>/dev/null)) is dropped on uninstall (exact restore is not possible from the one-line record).${NC}"
+        fi
         tc qdisc del dev "$MAIN_IF" root 2>/dev/null || true
         rm -f /etc/systemd/system/tc-proxy-limit.service
         rm -f /etc/network/if-up.d/tc-proxy-limit
@@ -133,6 +151,14 @@ uninstall_proxy() {
     rm -f /etc/systemd/system/nx-proxy-traffic-accum.timer
     rm -f /usr/local/bin/nx-proxy-traffic-accum
 
+    # ── Remove the proxy's own restore unit (MED-3) ──────
+    # Anti-DDoS's restore service, when present, owns rules.v4
+    # instead; this unit self-disables there, but uninstall removes
+    # it outright.
+    systemctl stop    nx-3proxy-restore.service 2>/dev/null || true
+    systemctl disable nx-3proxy-restore.service 2>/dev/null || true
+    rm -f /etc/systemd/system/nx-3proxy-restore.service
+
     # ── Remove systemd service files ─────────────────────
     rm -f "$SERVICE_FILE"
     [ -f /etc/antiddos/state.conf ] || rm -f /etc/systemd/system/tc-proxy-limit.service
@@ -151,7 +177,8 @@ uninstall_proxy() {
     rm -f  /etc/logrotate.d/3proxy
     # BUG-015: /etc/antiddos, /var/lib/antiddos, the daemon log and its
     # state files belong to the Anti-DDoS module and are NOT touched.
-    # Remove the nexoproxy user only if nothing else uses it.
+    # Remove the dedicated nexoproxy user (created by this module for
+    # the proxy service; the service is already stopped above).
     id nexoproxy >/dev/null 2>&1 && \
         userdel nexoproxy 2>/dev/null || true
 

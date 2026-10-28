@@ -24,7 +24,11 @@ expect_invalid() {
 }
 
 # Valid: plain IPs
-for v in 1.2.3.4 0.0.0.0 255.255.255.255 192.168.0.1 8.8.8.8 01.2.3.4; do expect_valid "$v"; done
+for v in 1.2.3.4 0.0.0.0 255.255.255.255 192.168.0.1 8.8.8.8; do expect_valid "$v"; done
+# L10 (v3.18.0): leading-zero octets are rejected - "010.0.0.1" is
+# octal to some parsers, so validation must not bless an address
+# other layers would read differently. A lone "0" stays valid.
+for v in 01.2.3.4 010.0.0.1 00.0.0.0; do expect_invalid "$v"; done
 # Valid: CIDRs
 for v in 1.2.3.0/24 0.0.0.0/0 1.2.3.4/32 10.0.0.0/8 172.16.0.0/12; do expect_valid "$v"; done
 # Invalid: structure

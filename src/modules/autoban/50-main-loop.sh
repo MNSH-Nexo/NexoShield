@@ -60,26 +60,42 @@ reconcile_bans() {
 # remove it and log loudly. "Never block our own IPs" is a monitored
 # invariant, not a hope.
 self_guard() {
-    local _sip _esc _rule
+    local _sip _esc _n _removed=0
     for _sip in "${SELF_IPS[@]}"; do
         [ -z "$_sip" ] && continue
         _esc=$(printf '%s' "$_sip" | sed 's/\./\\./g')
-        while IFS= read -r _rule; do
-            [ -z "$_rule" ] && continue
-            # _rule is an "INPUT ..." spec derived from iptables -S output.
-            # shellcheck disable=SC2086  # word splitting IS the mechanism
-            iptables -D $_rule 2>/dev/null && \
-                log " SELF-GUARD: removed DROP rule hitting own IP $_sip"
-        done < <(iptables -S INPUT 2>/dev/null | grep -E -- "-s ${_esc}(/32)?[[:space:]]" | grep -- '-j DROP' | sed 's/^-A /INPUT /')
+        # M3: delete by RULE NUMBER, not by re-parsing the spec. The
+        # old word-split delete passed the -S rendering's literal
+        # quote characters (every daemon ban is comment-tagged), so
+        # it never matched a real rule; -S line 1 is the policy, so
+        # rule number = line number - 1 (same math as
+        # nx_delete_matching). The DROP must end the line, or a
+        # comment merely mentioning "-j DROP" would false-match.
+        while true; do
+            _n=$(iptables -S INPUT 2>/dev/null | grep -nE -- "-s ${_esc}(/32)?[[:space:]].*-j DROP$" | head -1 | cut -d: -f1 || true)
+            [ -z "$_n" ] && break
+            iptables -D INPUT $((_n - 1)) 2>/dev/null || break
+            _removed=1
+            log " SELF-GUARD: removed DROP rule hitting own IP $_sip"
+        done
+        nx_ban_remove_fw "$_sip"
         state_del_ip "$BANNED_LIST" "$_sip"
     done
-    # IPv6 self sweep (Wave 9): the same hard guarantee for v6
-    local _sip6
+    # IPv6 self sweep (Wave 9): the same hard guarantee for v6,
+    # including the comment-tagged rules the old bare -C/-D sweep
+    # never matched, plus the nft ban6 set.
+    local _sip6 _esc6
     for _sip6 in "${SELF6_IPS[@]}"; do
-        if ip6tables -C INPUT -s "$_sip6" -j DROP 2>/dev/null; then
-            ip6tables -D INPUT -s "$_sip6" -j DROP 2>/dev/null || true
+        [ -z "$_sip6" ] && continue
+        _esc6=$(printf '%s' "$_sip6" | sed 's/\./\\./g')
+        while true; do
+            _n=$(ip6tables -S INPUT 2>/dev/null | grep -nE -- "-s ${_esc6}(/128)?[[:space:]].*-j DROP$" | head -1 | cut -d: -f1 || true)
+            [ -z "$_n" ] && break
+            ip6tables -D INPUT $((_n - 1)) 2>/dev/null || break
+            _removed=1
             log " SELF-GUARD: removed DROP rule for own IPv6 $_sip6"
-        fi
+        done
+        nx_ban_remove_fw "$_sip6"
         state_del_ip "$BANNED_LIST" "$_sip6"
     done
     if [ -f "$THROTTLE_LIST" ]; then
@@ -89,8 +105,23 @@ self_guard() {
                 _prio=$(state_get_field "$THROTTLE_LIST" "$_sip" 2)
                 [ -n "$_prio" ] && tc filter del dev "$IF" parent 1: prio "$_prio" 2>/dev/null || true
                 state_del_ip "$THROTTLE_LIST" "$_sip"
+                _removed=1
                 log " SELF-GUARD: removed throttle state for own IP $_sip"
             fi
+        done
+    fi
+    # L8: a self IP blocked in fail2ban is the same violation, but
+    # asking fail2ban every cycle is expensive - sweep the jails only
+    # when this call actually removed something above.
+    if [ "$_removed" -eq 1 ] && command -v fail2ban-client >/dev/null 2>&1; then
+        local _j
+        fail2ban-client status 2>/dev/null | grep "Jail list" | \
+            sed 's/.*://;s/,/\n/g' | tr -d ' ' | while read -r _j; do
+            [ -z "$_j" ] && continue
+            for _sip in "${SELF_IPS[@]}" "${SELF6_IPS[@]}"; do
+                [ -z "$_sip" ] && continue
+                fail2ban-client set "$_j" unbanip "$_sip" 2>/dev/null || true
+            done
         done
     fi
 }
@@ -110,7 +141,7 @@ nx_xdp_init
 
 # Restore throttle filters recorded before a restart/reboot (the qdisc
 # may have been rebuilt without them - see reapply_throttles, BUG-022).
-# After a reboot /tmp is empty: pull the state back from the mirror
+# After a reboot /run is empty: pull the state back from the mirror
 # first (U-11), or reapply has nothing to work with.
 restore_throttle_state
 reapply_throttles
@@ -129,8 +160,8 @@ while true; do
     # Keep the persistent throttle mirror current (U-11).
     mirror_throttle_state
 
-    # Every ~5 min: pick up any newly assigned own IPs (E-3), then
-    # unban expired IPs and subnets
+    # Every 150 s (75 cycles x 2 s): pick up any newly assigned own
+    # IPs (E-3), then unban expired IPs and subnets
     [ $((CYCLE % 75)) -eq 0 ] && refresh_self_ips && unban_expired && unban_subnet_expired
 
     # Every cycle: enforce self-IP immunity (cheap; iptables -S scan)
@@ -147,7 +178,7 @@ while true; do
                if (lp !~ /^[0-9]+$/) next;
                if (lp >= 32768) next;
                print $5 }' | \
-        { grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+'; grep -oE '\[[0-9a-fA-F:]+\]' | tr -d '[]'; } | \
+        nx_extract_peer_ips | \
         sort | uniq -c | sort -rn | head -100 || true)
     if [ -n "$SS_OUT" ]; then
         while IFS= read -r line; do
@@ -165,7 +196,7 @@ while true; do
                if (lp !~ /^[0-9]+$/) next;
                if (lp >= 32768) next;
                print $5 }' | \
-        { grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+'; grep -oE '\[[0-9a-fA-F:]+\]' | tr -d '[]'; } | \
+        nx_extract_peer_ips | \
         sort | uniq -c | sort -rn | head -100 || true)
     if [ -n "$SS_SYN" ]; then
         while IFS= read -r line; do
@@ -194,6 +225,16 @@ while true; do
         # Reputation scoring: adjust score for this sample and enforce band.
         # Uses the connection count and the interval since the last sample.
         update_score "$ip" "$count" "${SYN_COUNT[$ip]:-0}" "$SAMPLE_INTERVAL"
+
+        # M1: update_score's REP-BAN path already throttled, banned and
+        # recorded the strike for this IP. Without this guard the
+        # instant/watch blocks below would ban and strike a SECOND
+        # time for the same offence (the pre-check above ran before
+        # update_score, so it cannot see this cycle's REP-BAN).
+        if state_has_ip "$BANNED_LIST" "$ip"; then
+            state_del_ip "$WATCH_LIST" "$ip"
+            continue
+        fi
 
         # Immediate action if way over limit (≥ BAN_CONN_THRESHOLD conns)
         if [ "${count:-0}" -ge "$BAN_CONN_THRESHOLD" ]; then

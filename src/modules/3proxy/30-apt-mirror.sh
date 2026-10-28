@@ -60,9 +60,13 @@ pick_apt_mirror() {
 # selected mirror. The original config is kept as *.bak so nothing is lost.
 configure_apt_mirror() {
     local os="$1" code="$2" mirror="$3"
-    [ -f /etc/apt/sources.list ] && cp -a /etc/apt/sources.list /etc/apt/sources.list.bak 2>/dev/null || true
+    # LOW-7: never overwrite an existing .bak - the first backup is
+    # the pre-NexoShield original; later runs must preserve it, or
+    # an uninstall restore would hand back OUR mirror list.
+    [ -f /etc/apt/sources.list ] && [ ! -f /etc/apt/sources.list.bak ] && \
+        cp -a /etc/apt/sources.list /etc/apt/sources.list.bak 2>/dev/null || true
     for _f in /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list; do
-        [ -e "$_f" ] && cp -a "$_f" "$_f.bak" 2>/dev/null || true
+        [ -e "$_f" ] && [ ! -f "$_f.bak" ] && cp -a "$_f" "$_f.bak" 2>/dev/null || true
     done
     # On modern Ubuntu the default is deb822 (ubuntu.sources); use classic list.
     rm -f /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || true

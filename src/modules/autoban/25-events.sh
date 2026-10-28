@@ -14,17 +14,28 @@ NX_EV_OK=0
 NX_EV_BASE=""
 NX_EV_TOT_DSYN=0
 NX_EV_TOT_DEST=0
+# L4: nxcountd's own loss counters (emitted in the header since
+# Phase 2 but never read). NX_EV_DROPPED is the cumulative count of
+# netlink messages the helper dropped (ENOBUFS) and
+# NX_EV_FLOWS_DROPPED the flows lost with them; NX_EV_DROP_DELTA is
+# the increase since the previous cycle. A nonzero delta is logged
+# so a lossy cycle is never silently read as "low arrivals".
+NX_EV_DROPPED=0
+NX_EV_FLOWS_DROPPED=0
+NX_EV_DROP_DELTA=0
 NX_EV_DT=2
 _NX_EV_PREV_TS=""
 _NX_EV_PREV_TOTSYN=""
 _NX_EV_PREV_TOTEST=""
+_NX_EV_PREV_DROPPED=""
+_NX_EV_PREV_FLOWS_DROPPED=""
 
 nx_load_event_counters() {
     NX_EV_OK=0
     NX_EV_TOT_DSYN=0
     NX_EV_TOT_DEST=0
     [ -f "$NX_COUNTERS_FILE" ] || return 0
-    local hdr kv ts="" base="" totsyn="" totest="" now
+    local hdr kv ts="" base="" totsyn="" totest="" now dropped="" flows_dropped=""
     hdr=$(head -n 1 "$NX_COUNTERS_FILE" 2>/dev/null) || return 0
     case "$hdr" in "# nxcountd 1 "*) ;; *) return 0 ;; esac
     for kv in $hdr; do
@@ -33,6 +44,8 @@ nx_load_event_counters() {
             base=*) base="${kv#base=}" ;;
             totalsyn=*) totsyn="${kv#totalsyn=}" ;;
             totalest=*) totest="${kv#totalest=}" ;;
+            dropped=*) dropped="${kv#dropped=}" ;;
+            flows_dropped=*) flows_dropped="${kv#flows_dropped=}" ;;
         esac
     done
     ts="${ts//[^0-9]/}"; [ -n "$ts" ] || return 0
@@ -46,6 +59,8 @@ nx_load_event_counters() {
         NX_EV_BASE="$base"
         EV_PSYN=(); EV_PEST=()
         _NX_EV_PREV_TOTSYN=""
+        _NX_EV_PREV_DROPPED=""
+        _NX_EV_PREV_FLOWS_DROPPED=""
         log " EVENTS: nxcountd counters (re)based - arrival windows re-arming"
     fi
     totsyn="${totsyn//[^0-9]/}"; totest="${totest//[^0-9]/}"
@@ -57,6 +72,22 @@ nx_load_event_counters() {
     fi
     _NX_EV_PREV_TOTSYN="${totsyn:-}"
     _NX_EV_PREV_TOTEST="${totest:-}"
+    # L4: surface the helper's loss counters (same delta discipline
+    # as the arrival totals - clamped, re-based on restart).
+    dropped="${dropped//[^0-9]/}"; flows_dropped="${flows_dropped//[^0-9]/}"
+    NX_EV_DROPPED="${dropped:-0}"; NX_EV_FLOWS_DROPPED="${flows_dropped:-0}"
+    NX_EV_DROP_DELTA=0
+    if [ -n "$_NX_EV_PREV_DROPPED" ] && [ -n "$dropped" ]; then
+        NX_EV_DROP_DELTA=$(( dropped - _NX_EV_PREV_DROPPED ))
+        [ "$NX_EV_DROP_DELTA" -lt 0 ] && NX_EV_DROP_DELTA=0
+        if [ "$NX_EV_DROP_DELTA" -gt 0 ]; then
+            local _fd=$(( ${flows_dropped:-0} - ${_NX_EV_PREV_FLOWS_DROPPED:-0} ))
+            [ "$_fd" -lt 0 ] && _fd=0
+            log " EVENTS: nxcountd lost $NX_EV_DROP_DELTA netlink messages ($_fd flows) since last cycle - arrival counts are a lower bound (cumulative: $NX_EV_DROPPED messages, $NX_EV_FLOWS_DROPPED flows)"
+        fi
+    fi
+    _NX_EV_PREV_DROPPED="${dropped:-}"
+    _NX_EV_PREV_FLOWS_DROPPED="${flows_dropped:-}"
     if [ -n "$_NX_EV_PREV_TS" ]; then
         local _ddt=$(( ts - _NX_EV_PREV_TS ))
         [ "$_ddt" -ge 1 ] && [ "$_ddt" -le 30 ] && NX_EV_DT="$_ddt"

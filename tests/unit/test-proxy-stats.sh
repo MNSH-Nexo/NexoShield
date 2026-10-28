@@ -102,6 +102,12 @@ nx_pin_proxy_stats_rules 1080
 [ "$(first_kind INPUT)" = "in" ] && [ "$(first_kind OUTPUT)" = "out" ] && ok || bad "missing rules not created on top"
 
 # (d) Accumulator lifecycle: first run, growth, rule recreation.
+# MED-8: the old test asserted the LEAKY value here. The true
+# sequence is: snapshot at 2600, traffic grows to 3000 BEFORE the
+# rebuild (the accumulator has not run yet), then the rebuild
+# recreates the rules and they count 50 more. Total must be 3050,
+# not 2650 - the 400 bytes between snapshot and recreation are
+# real traffic, and MED-1's snapshot-before-delete preserves them.
 # add_rule args are KIND PKTS BYTES; the accumulator tracks BYTES.
 reset_chains
 add_rule INPUT in 1000 2000; add_rule OUTPUT out 1000 2000
@@ -110,16 +116,21 @@ nx_proxy_traffic_accum
 set_counters INPUT in 1500 2600; set_counters OUTPUT out 1500 2600
 nx_proxy_traffic_accum
 [ "$(cat "$STATE_DIR/traffic-total.state")" = "2600 2600 2600 2600" ] && ok || bad "growth accum wrong: $(cat "$STATE_DIR/traffic-total.state" 2>/dev/null)"
+# Traffic between the last tick and the rebuild: counters reach
+# 3000, and the snapshot-before-delete records it.
+set_counters INPUT in 1600 3000; set_counters OUTPUT out 1600 3000
+nx_proxy_traffic_accum
+[ "$(cat "$STATE_DIR/traffic-total.state")" = "3000 3000 3000 3000" ] && ok || bad "pre-rebuild snapshot wrong: $(cat "$STATE_DIR/traffic-total.state" 2>/dev/null)"
 # Rule recreation: counters restart at 0 and grow a little.
 reset_chains
 add_rule INPUT in 100 50; add_rule OUTPUT out 100 50
 nx_proxy_traffic_accum
-[ "$(cat "$STATE_DIR/traffic-total.state")" = "50 50 2650 2650" ] && ok || bad "recreation accum wrong: $(cat "$STATE_DIR/traffic-total.state" 2>/dev/null)"
+[ "$(cat "$STATE_DIR/traffic-total.state")" = "50 50 3050 3050" ] && ok || bad "recreation accum wrong: $(cat "$STATE_DIR/traffic-total.state" 2>/dev/null)"
 
 # (e) Missing rules leave totals untouched.
 reset_chains
 nx_proxy_traffic_accum
-[ "$(cat "$STATE_DIR/traffic-total.state")" = "50 50 2650 2650" ] && ok || bad "missing rules changed totals"
+[ "$(cat "$STATE_DIR/traffic-total.state")" = "50 50 3050 3050" ] && ok || bad "missing rules changed totals"
 
 # (f) Accumulator self-heals shadowing (after the snapshot).
 reset_chains
@@ -137,6 +148,66 @@ _SAVE_LINE=$(grep -n 'save_static_rules "$IPTABLES_SAVE_FILE"' "$MOD/antiddos.sh
 grep -q 'nx-proxy-traffic-accum.timer' "$MOD/3proxy-socks5.sh" && ok || bad "accumulator timer not installed by install_proxy"
 grep -q 'Total recorded (cumulative)' "$MOD/3proxy-socks5.sh" && ok || bad "show_stats has no cumulative display"
 grep -q 'nx-proxy-traffic-accum' "$MOD/3proxy-socks5.sh" && grep -q 'systemctl disable nx-proxy-traffic-accum.timer' "$MOD/3proxy-socks5.sh" && ok || bad "uninstall does not remove accumulator"
+
+# (h) MED-1 ordering: the snapshot call must precede the first
+# stats delete/pin in each rebuild path. On old code there is no
+# snapshot call at all, so this fails there by construction.
+snapshot_first() { # NAME FILE
+    local body accum_line stats_line
+    body=$(extract_fn "$1" "$2")
+    accum_line=$(printf '%s\n' "$body" | grep -n 'nx_proxy_traffic_accum' | head -1 | cut -d: -f1)
+    stats_line=$(printf '%s\n' "$body" | grep -n -E '3proxy_stats_in|3proxy_stats_out|nx_pin_proxy_stats_rules' | head -1 | cut -d: -f1)
+    [ -n "$accum_line" ] && [ -n "$stats_line" ] && [ "$accum_line" -lt "$stats_line" ]
+}
+snapshot_first setup_iptables_for_port "$MOD/3proxy-socks5.sh" && ok || bad "setup_iptables_for_port does not snapshot before the stats delete"
+snapshot_first remove_proxy_port_rules "$MOD/3proxy-socks5.sh" && ok || bad "remove_proxy_port_rules does not snapshot before the stats delete"
+snapshot_first apply_iptables "$MOD/antiddos.sh" && ok || bad "apply_iptables does not snapshot before the pin"
+
+# (i) MED-1 behavioural: a real setup_iptables_for_port run must
+# preserve traffic counted since the last tick. On old code the
+# setup deletes the 3000-byte counters first and the total comes
+# out 50, not 3050. Uses a fresh state file so earlier tests in
+# this file cannot mask the result.
+for fn in setup_iptables_for_port nx_3proxy_save_rules; do
+    extract_fn "$fn" "$MOD/3proxy-socks5.sh" >> "$MOD/fn2.sh"
+done
+# shellcheck disable=SC1091
+. "$MOD/fn2.sh"
+list_self_ips_all() { :; }
+CF_RANGES=("1.2.3.0/24")
+export NX_3PROXY_SAVE_DIR="$STATE_DIR/save"
+export NX_PROXY_TRAFFIC_STATE="$STATE_DIR/i.state"
+rm -f "$STATE_DIR/i.state"
+reset_chains
+add_rule INPUT in 1600 3000; add_rule OUTPUT out 1600 3000
+setup_iptables_for_port 1080
+[ "$(cat "$STATE_DIR/i.state" 2>/dev/null)" = "3000 3000 3000 3000" ] && ok || bad "setup lost pre-rebuild traffic: $(cat "$STATE_DIR/i.state" 2>/dev/null)"
+set_counters INPUT in 100 50; set_counters OUTPUT out 100 50
+nx_proxy_traffic_accum
+[ "$(cat "$STATE_DIR/i.state" 2>/dev/null)" = "50 50 3050 3050" ] && ok || bad "post-setup accum wrong: $(cat "$STATE_DIR/i.state" 2>/dev/null)"
+
+# (j) LOW-2: port-aware matching. A stale other-port rule at
+# position 1 must NOT satisfy the pin check for this port.
+reset_chains
+add_rule INPUT in 10 20; add_rule OUTPUT out 10 20
+nx_proxy_stats_top INPUT "3proxy_stats_in" 1080 && ok || bad "port-aware top check rejects the own-port rule"
+nx_proxy_stats_top INPUT "3proxy_stats_in" 1081 && bad "port-aware top check accepts a foreign-port rule" || ok
+[ "$(nx_proxy_stats_bytes INPUT "3proxy_stats_in" 1080)" = "20" ] && ok || bad "port-aware bytes read wrong: $(nx_proxy_stats_bytes INPUT "3proxy_stats_in" 1080)"
+[ -z "$(nx_proxy_stats_bytes INPUT "3proxy_stats_in" 1081)" ] && ok || bad "port-aware bytes read a foreign-port row"
+
+# (k) LOW-3: a contended lock defers the run instead of corrupting
+# the state (the next tick picks it up).
+export NX_PROXY_TRAFFIC_STATE="$STATE_DIR/k.state"
+printf '100 100 100 100\n' > "$STATE_DIR/k.state"
+reset_chains
+add_rule INPUT in 10 200; add_rule OUTPUT out 10 200
+( exec 9>"$STATE_DIR/k.state.lock"; flock -n 9 || exit 1; sleep 2 ) &
+sleep 0.5
+nx_proxy_traffic_accum
+wait
+[ "$(cat "$STATE_DIR/k.state")" = "100 100 100 100" ] && ok || bad "contended accum overwrote state: $(cat "$STATE_DIR/k.state")"
+nx_proxy_traffic_accum
+[ "$(cat "$STATE_DIR/k.state")" = "200 200 200 200" ] && ok || bad "post-contention accum wrong: $(cat "$STATE_DIR/k.state")"
 
 echo "proxy stats: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

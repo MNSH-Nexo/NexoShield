@@ -25,10 +25,21 @@ chmod +x "$INSTALL_DIR/3proxy-socks5.sh" \
 ok "Files created"
 
 # ── Link shield command ───────────────────────────────────
+# LOW-4: the BUG-058 guard for the old 'proxy' link, applied to the
+# new name too - never silently replace a foreign /usr/local/bin/
+# shield (another tool, a user's script). Replace only when absent,
+# already ours, or a NexoShield menu from a previous install.
 info "Installing shield command..."
-ln -sf "$INSTALL_DIR/proxy-menu.sh" "$BIN_LINK"
-chmod +x "$BIN_LINK"
-ok "Command ${W}shield${NC} installed"
+if [ -e "$BIN_LINK" ] && [ ! -L "$BIN_LINK" ]; then
+    warn "$BIN_LINK exists and is not a symlink - leaving it untouched; run $INSTALL_DIR/proxy-menu.sh directly."
+elif [ -L "$BIN_LINK" ] && [ "$(readlink "$BIN_LINK" 2>/dev/null)" != "$INSTALL_DIR/proxy-menu.sh" ] && \
+     [ "$(readlink "$BIN_LINK" 2>/dev/null)" != "$INSTALL_DIR/proxy-menu.sh.prev" ]; then
+    warn "$BIN_LINK points elsewhere ($(readlink "$BIN_LINK" 2>/dev/null)) - leaving it untouched; run $INSTALL_DIR/proxy-menu.sh directly."
+else
+    ln -sf "$INSTALL_DIR/proxy-menu.sh" "$BIN_LINK"
+    chmod +x "$BIN_LINK"
+    ok "Command ${W}shield${NC} installed"
+fi
 # Pre-v3.11 installs linked the menu as /usr/local/bin/proxy. Drop
 # that link on upgrade - but only if it is OURS (a symlink to this
 # menu); never touch a foreign binary of the same name (BUG-058).

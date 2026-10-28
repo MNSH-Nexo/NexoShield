@@ -90,7 +90,7 @@ throttle_ip() {
 # not yet confirmed as an attack. Keeps the connection open (legit heavy user
 # stays online) while crushing throughput so a flood can't starve the box.
 # Class 1:40 must exist (added by install alongside 1:30). If it does not,
-# fall back to 100Mbps class 1:30 rather than failing.
+# fall back to the (nominal 100Mbps) class 1:30 rather than failing.
 hard_throttle_ip() {
     local ip="$1"
     is_exempt "$ip" && return 0
@@ -304,7 +304,13 @@ ban_ip() {
     local DUR="${2:-$(rep_ban_duration_secs "$ip")}"
     local UNBAN_TIME
     UNBAN_TIME=$(date -d "+${DUR} seconds" '+%H:%M:%S' 2>/dev/null || echo "N/A")
-    nx_ban_apply "$ip" "$DUR" "auto-ban"
+    # M5: never record state for a ban the kernel refused - ban_subnet
+    # already refuses this way, and an unrecorded ban is retried by
+    # the next cycle instead of sitting in state while unenforced.
+    if ! nx_ban_apply "$ip" "$DUR" "auto-ban"; then
+        log " BAN FAILED: $ip - backend refused; state NOT recorded"
+        return 1
+    fi
     echo "$ip $(date +%s) $DUR" >> "$BANNED_LIST"
     # Remove ONLY this IP's throttle/hard-throttle tc filter.
     # NOTE: never run 'tc filter del dev "$IF" parent 1:' here — that deletes
@@ -368,15 +374,21 @@ ban_ip6() {
     for _s6 in "${SELF6_IPS[@]}"; do
         if ip6_in_cidr "$ip" "$_s6/128"; then
             log " REFUSED: $ip is a server IPv6 address (self-IP immunity)"
-            return 0
+            return 1
         fi
     done
     state_has_ip "$BANNED_LIST" "$ip" && return 0
+    # M5: same refusal as ban_ip - no state for a refused ban. The
+    # throttle cleanup runs only after a successful ban (as in
+    # ban_ip): a failed ban must not also strip the throttle.
+    if ! nx_ban_apply "$ip" "$DUR" "auto-ban"; then
+        log " BAN FAILED (v6): $ip - backend refused; state NOT recorded"
+        return 1
+    fi
+    echo "$ip $(date +%s) $DUR" >> "$BANNED_LIST"
     local _PRIO
     _PRIO=$(state_get_field "$THROTTLE_LIST" "$ip" 2)
     [ -n "$_PRIO" ] && tc filter del dev "$IF" parent 1: protocol ip6 prio "$_PRIO" 2>/dev/null || true
     state_del_ip "$THROTTLE_LIST" "$ip"
-    nx_ban_apply "$ip" "$DUR" "auto-ban"
-    echo "$ip $(date +%s) $DUR" >> "$BANNED_LIST"
     log " BANNED (v6): $ip for $((DUR / 60))min (progressive)"
 }

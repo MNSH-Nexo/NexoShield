@@ -1,8 +1,7 @@
-# get_server_ips - the ONLY copy in the repository (included at build time).
+# get_server_ips was removed in v3.18.0 (F9): defined here but never
+# called anywhere - the sweep over src/ and tests/ found only these
+# comments mentioning it. Display lookups live in
+# modules/3proxy/00-header.sh (get_server_ip); enforcement uses
+# list_self_ips_all in lib/self-ips.sh.
 # @lib-body
-get_server_ips() {
-    # All public IPs of this server (for auto-whitelist)
-    ip -4 addr show 2>/dev/null | grep 'inet ' | \
-        grep -v '127\.\|10\.\|192\.168\.\|172\.\(1[6-9]\|2[0-9]\|3[01]\)\.' | \
-        awk '{print $2}' | cut -d/ -f1
-}
+# (intentionally empty: the only function this lib held was removed - see above)

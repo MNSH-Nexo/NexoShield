@@ -19,7 +19,8 @@
 
 The auto-ban daemon scores every non-exempt IP from 100 down. Bands:
 `<80` suspect (watch), `<60` throttle 100 Mbps, `<40` hard throttle
-50 Mbps, `<20` ban 4 h. Every ban ends in PROBATION (score 50, 30 min
+50 Mbps, `<20` ban (progressive: 30 min, doubling per repeat
+offence, cap 7 days). Every ban ends in PROBATION (score 50, 30 min
 window) — see the D3 state machine in `docs/FIX-PLAN.md`.
 
 ## Phase 2 addendum — model v3 (v3.9.0, DPI upgrade)

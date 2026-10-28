@@ -1,7 +1,7 @@
 # @part modules/3proxy/60-cli-menu.sh - show_info, show_stats, show_menu, CLI dispatch + standalone loop
 # Assembled into 3proxy-socks5.sh by tools/build.py - not a standalone script.
 show_info() {
-    [ ! -f /etc/3proxy/install.info ] && echo -e "${RED}Not installed.${NC}" && return
+    [ ! -f /etc/3proxy/install.info ] && echo -e "${RED}Not installed.${NC}" && return 1
     local _INFO_USER _INFO_PASS _INFO_PORT
     _INFO_USER=$(grep '^USER=' /etc/3proxy/install.info 2>/dev/null | cut -d= -f2- || echo "?")
     _INFO_PASS=$(grep '^PASS=' /etc/3proxy/install.info 2>/dev/null | cut -d= -f2- || echo "?")
@@ -20,9 +20,12 @@ show_info() {
 
 show_stats() {
     PORT=$(get_current_port || true)
-    [ -z "$PORT" ] && echo -e "${RED}Not installed.${NC}" && return
+    [ -z "$PORT" ] && echo -e "${RED}Not installed.${NC}" && return 1
     sep; echo -e "  ${CYAN}Stats - port $PORT${NC}"; sep
-    ACTIVE=$(ss -tnp state established 2>/dev/null | grep -c ":$PORT " || true)
+    # LOW-10: count only flows whose LOCAL side is the proxy port.
+    # The old grep matched the peer side too (":$PORT " appears in
+    # either column), inflating the count with outbound flows.
+    ACTIVE=$(ss -tnp state established 2>/dev/null | awk -v p=":$PORT" '$5 ~ p"$" {c++} END {print c+0}')
     ACTIVE="${ACTIVE:-0}"
     echo -e "  Active connections: ${GREEN}$ACTIVE${NC}"
 
@@ -179,28 +182,37 @@ set_proxy_password() {
 }
 
 # ── CLI flags (called from proxy-menu.sh) ────────────────
+# MED-6: every flag propagates the action's exit code (the old code
+# exited 0 regardless, so wrappers and monitoring could not detect
+# a failed install/remove). F6: unknown flags error out instead of
+# silently falling through to the interactive menu.
 case "${1:-}" in
-    --install|-i) install_proxy;  exit 0 ;;
-    --remove|-r)  uninstall_proxy; exit 0 ;;
-    --stats|-s)   show_stats;      exit 0 ;;
-    --info)       show_info; printf '%s\n' "  Press Enter to continue..." >/dev/tty; read -r _PE </dev/tty 2>/dev/null || true; exit 0 ;;
-    --restart)    systemctl restart 3proxy 2>/dev/null && \
-                      echo -e "${GREEN}Restarted${NC}" || echo -e "${RED}Error${NC}"; exit 0 ;;
-    --stop)       systemctl stop 3proxy 2>/dev/null && \
-                      echo -e "${GREEN}Stopped${NC}" || echo -e "${RED}Error${NC}"; exit 0 ;;
-    --start)      systemctl start 3proxy 2>/dev/null && \
-                      echo -e "${GREEN}Started${NC}" || echo -e "${RED}Error${NC}"; exit 0 ;;
+    --install|-i) install_proxy;  exit $? ;;
+    --remove|-r)  uninstall_proxy; exit $? ;;
+    --stats|-s)   show_stats;      exit $? ;;
+    --info)       show_info; _rc=$?; printf '%s\n' "  Press Enter to continue..." >/dev/tty; read -r _PE </dev/tty 2>/dev/null || true; exit "$_rc" ;;
+    --restart)    if systemctl restart 3proxy 2>/dev/null; then echo -e "${GREEN}Restarted${NC}"; exit 0; else echo -e "${RED}Error${NC}"; exit 1; fi ;;
+    --stop)       if systemctl stop 3proxy 2>/dev/null; then echo -e "${GREEN}Stopped${NC}"; exit 0; else echo -e "${RED}Error${NC}"; exit 1; fi ;;
+    --start)      if systemctl start 3proxy 2>/dev/null; then echo -e "${GREEN}Started${NC}"; exit 0; else echo -e "${RED}Error${NC}"; exit 1; fi ;;
     --delete-user) delete_proxy_user; exit $? ;;
     --log)        tail -f "$PROXY_LOG_DIR"/access.log.* 2>/dev/null || \
-                      journalctl -u 3proxy -f --no-pager; exit 0 ;;
+                      journalctl -u 3proxy -f --no-pager; exit $? ;;
     --tc-status)  MAIN_IF=$(ip route show default 2>/dev/null | awk '/default/{print $5}' | head -1)
                   echo -e "${CYAN}tc classes on ${MAIN_IF:-eth0}:${NC}"
                   tc class show dev "${MAIN_IF:-eth0}" 2>/dev/null || echo "tc not configured"
                   printf '%s\n' "  Press Enter to continue..." >/dev/tty; read -r _PE </dev/tty 2>/dev/null || true; exit 0 ;;
     --change-pass) set_proxy_password; exit $? ;;
+    --regen-accumulator) regen_proxy_traffic_accum; exit $? ;;
+    *)  if [ -n "${1:-}" ]; then echo "Unknown option: $1 (usage: 3proxy-socks5.sh [--install|--remove|--stats|--info|--restart|--stop|--start|--log|--tc-status|--delete-user|--change-pass])" >&2; exit 2; fi ;;
 esac
 
 # Standalone mode (run directly without args): show own menu
+# LOW-8: without a terminal every /dev/tty read below fails
+# instantly and the loop spins forever - refuse plainly instead.
+if ! : </dev/tty 2>/dev/null; then
+    echo "3proxy menu requires a terminal (use CLI flags for scripting)." >&2
+    exit 1
+fi
 while true; do
     show_menu
     printf '%s' "  Enter choice: " >/dev/tty; read -r CH </dev/tty || CH=""

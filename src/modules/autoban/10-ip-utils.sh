@@ -132,6 +132,16 @@ nx_ban() { case "$1" in *:*) ban_ip6 "$1" ;; *) ban_ip "$1" ;; esac; }
 nx_throttle() { case "$1" in *:*) throttle_ip6 "$1" ;; *) throttle_ip "$1" ;; esac; }
 nx_hard_throttle() { case "$1" in *:*) hard_throttle_ip6 "$1" ;; *) hard_throttle_ip "$1" ;; esac; }
 
+# nx_extract_peer_ips — peer column (stdin) -> one IP per line, v4+v6.
+# Single-pass extraction (H1): the old `{ grep v4; grep v6; }` pair ran
+# on one stdin, so the second grep always read EOF and no IPv6 peer
+# ever entered the daemon's counters. A v4-mapped ::ffff:a.b.c.d peer
+# is normalized back to its v4 form, preserving the old counting.
+nx_extract_peer_ips() {
+    grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+|\[[0-9a-fA-F:]+\]' | tr -d '[]' | \
+        sed -E 's/^::ffff:([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)$/\1/'
+}
+
 # subnet_overlaps_cf <a.b.c> — TRUE range-overlap test between a /24 and
 # every CF range (BUG-011: the old check tested only the .1 address, so
 # a CF range starting mid-/24 was missed).
@@ -227,8 +237,8 @@ is_exempt() {
 
 # Reserved tc filter priority bands (must never overlap):
 #   whitelist (CF + server-own + user)  : 10 .. <10000  (allocated in tc-setup.sh)
-#   throttle (100Mbps class 1:30)       : 10000 ..
-#   hard-throttle (50Mbps class 1:40)   : 20000 ..
+#   throttle (nominal 100Mbps class 1:30) : 10000 ..
+#   hard-throttle (nominal 50Mbps class 1:40): 20000 ..
 # This guarantees a throttle filter can NEVER collide with a Cloudflare/server
 # whitelist filter, so CF and the server itself stay exempt even at ban time
 # (ban_ip deletes only the recorded throttle-band prio).

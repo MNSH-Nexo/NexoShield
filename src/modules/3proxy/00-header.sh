@@ -39,9 +39,22 @@ SERVICE_FILE="/etc/systemd/system/3proxy.service"
 # @include lib/proxy-stats.sh
 
 get_server_ip() {
-    curl -s -4 --max-time 5 https://api.ipify.org 2>/dev/null || \
-    curl -s -4 --max-time 5 https://ifconfig.me 2>/dev/null || \
-    hostname -I 2>/dev/null | awk '{print $1}'
+    # Display only (the socks5:// line) - never enforcement, which
+    # uses list_self_ips_all. NIT-3: the old hostname -I fallback
+    # took the FIRST address, which on NAT/cloud boxes is often a
+    # private address useless to the reader - prefer a public IPv4
+    # from the local list, and only then fall back to the first.
+    local _ip
+    _ip=$(curl -s -4 --max-time 5 https://api.ipify.org 2>/dev/null || \
+          curl -s -4 --max-time 5 https://ifconfig.me 2>/dev/null || true)
+    if [ -z "$_ip" ]; then
+        _ip=$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | \
+              grep -v -E '^(127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|100\.64\.)' | head -1 || true)
+    fi
+    if [ -z "$_ip" ]; then
+        _ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+    fi
+    printf '%s' "$_ip"
 }
 
 get_server_ipv6() { curl -s -6 --max-time 5 https://api64.ipify.org 2>/dev/null || true; }

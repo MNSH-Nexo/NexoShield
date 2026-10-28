@@ -53,8 +53,15 @@ menu_antiddos() {
                    # The shared engine-grade unban (U-2): exact tagged
                    # deletes (BUG-038), exact state edits, throttle
                    # cleanup, fail2ban - one implementation everywhere.
-                   nx_unban_ip "$UIP"
-                   ok "$UIP unblocked (all layers)"
+                   # F11: honest result - success only when something
+                   # was actually removed.
+                   if nx_unban_ip "$UIP"; then
+                       ok "$UIP unblocked (all layers)"
+                   elif [ "$?" -eq 2 ]; then
+                       warn "Invalid IP/CIDR: $UIP"
+                   else
+                       warn "$UIP was not found in any layer (nothing removed)"
+                   fi
                else
                    warn "No IP entered"
                fi

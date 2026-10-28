@@ -54,9 +54,14 @@ menu_security() {
                    # fail2ban). The old inline copy deleted a rule
                    # spec the daemon never creates and never touched
                    # banned.list, so the IP was re-banned on the
-                   # daemon's next reconcile.
-                   nx_unban_ip "$UIP"
-                   ok "$UIP unblocked (all layers)"
+                   # daemon's next reconcile. F11: honest result.
+                   if nx_unban_ip "$UIP"; then
+                       ok "$UIP unblocked (all layers)"
+                   elif [ "$?" -eq 2 ]; then
+                       warn "Invalid IP/CIDR: $UIP"
+                   else
+                       warn "$UIP was not found in any layer (nothing removed)"
+                   fi
                else
                    warn "No IP entered"
                fi
@@ -183,7 +188,7 @@ nx_update_nexoshield() {
     fi
     if ! bash -n "$_tmp/install.sh" 2>/dev/null || \
        ! grep -q "NexoShield" "$_tmp/install.sh" || \
-       ! grep -q "^VERSION=\"$_latest\"" "$_tmp/install.sh"; then
+       ! grep -qF "VERSION=\"$_latest\"" "$_tmp/install.sh"; then
         warn "Downloaded installer failed verification - nothing was changed."
         rm -rf "$_tmp"; return 1
     fi
@@ -199,7 +204,25 @@ nx_update_nexoshield() {
         warn "Installer exited with an error - the previous install was left untouched."
         return 1
     fi
+    # MED-7: the installer swaps module scripts but does not activate
+    # them - services and rules still run the previous version until
+    # each module is re-applied. Regenerate the one derived file a
+    # timer executes directly (the accumulator script), and say
+    # plainly what still needs a re-run.
+    if [ -f /etc/3proxy/install.info ] && [ -x "$SCRIPT_DIR/3proxy-socks5.sh" ]; then
+        if "$SCRIPT_DIR/3proxy-socks5.sh" --regen-accumulator 2>/dev/null; then
+            echo -e "  ${DIM}Proxy traffic accumulator regenerated for v$_latest.${NC}"
+        else
+            warn "Could not regenerate the proxy traffic accumulator - re-run the proxy Install/Update to refresh it."
+        fi
+    fi
     ok "Updated to NexoShield v$_latest."
+    _STALE=""
+    [ -f /etc/3proxy/install.info ] && _STALE="3proxy"
+    [ -f /etc/antiddos/state.conf ] && _STALE="${_STALE:+$_STALE, }Anti-DDoS"
+    if [ -n "$_STALE" ]; then
+        echo -e "  ${YELLOW}Note: running services and firewall rules still use the previous version until you re-apply each installed module ($_STALE: re-run its Install/Update).${NC}"
+    fi
     if [ -z "${NX_UI_STDIN:-}" ] && ui_confirm "Restart the menu now to use v$_latest?"; then
         exec bash "$SCRIPT_DIR/proxy-menu.sh"
     fi

@@ -47,6 +47,16 @@ SELF_IPS_FILE="/etc/antiddos/self-ips.list"
 PUBLIC_IPS_FILE="/etc/antiddos/public-ips.list"
 EXEMPT_FILE="/etc/antiddos/exempt.list"
 
+# Daemon live state (F5): /run/nexoshield, not /tmp — /tmp entries are
+# world-writable, so a pre-planted symlink could make a root truncate
+# or append hit an attacker-chosen file. /run is root-owned tmpfs
+# (same volatility semantics as /tmp); the persistent mirrors stay
+# under /etc/antiddos. The daemon uses the same defaults.
+WATCH_LIST="${WATCH_LIST:-/run/nexoshield/autoban_watch}"
+THROTTLE_LIST="${THROTTLE_LIST:-/run/nexoshield/autoban_throttle}"
+SUBNET_WATCH_LIST="${SUBNET_WATCH_LIST:-/run/nexoshield/autoban_subnet_watch}"
+mkdir -p /run/nexoshield 2>/dev/null || true
+
 [ "$EUID" -ne 0 ] && echo -e "${RED}Root required${NC}" && exit 1
 
 

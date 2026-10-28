@@ -75,6 +75,26 @@ setup_tc() {
         done < "$WHITELIST_FILE"
     fi
 
+    # HIGH-2: re-apply live daemon throttles (BUG-022). The qdisc
+    # delete above just destroyed every throttle filter the daemon
+    # recorded - the boot script re-applies them, but the LIVE path
+    # never did, so every proxy Install/Update and every whitelist
+    # change silently gave throttled attackers full speed until the
+    # daemon restarted. Same loop as the boot script, reading the
+    # live file first: it is fresher than the mirror, which lags up
+    # to one daemon cycle, and a stale mirror entry must never
+    # resurrect a filter the daemon already replaced.
+    while read -r TIP TPRIO _TS TBAND; do
+        [ -z "$TIP" ] && continue
+        TFLOW=1:30; [ "$TBAND" = "hard" ] && TFLOW=1:40
+        case "$TIP" in
+            *:*) tc filter add dev "$MAIN_IF" parent 1: protocol ip6 prio $TPRIO \
+                     u32 match ip6 dst "$TIP" flowid $TFLOW 2>/dev/null || true ;;
+            *)   tc filter add dev "$MAIN_IF" parent 1: protocol ip prio $TPRIO \
+                     u32 match ip dst "$TIP/32" flowid $TFLOW 2>/dev/null || true ;;
+        esac
+    done < <(cat "${THROTTLE_LIST:-/run/nexoshield/autoban_throttle}" /etc/antiddos/throttled.list 2>/dev/null | awk '!seen[$1]++')
+
     # ── WARP / WireGuard awareness ──────────────────────────
     if ip link show 2>/dev/null | grep -qE '^\s*[0-9]+:\s+(wg|utm|warp)[0-9]*[:@]'; then
         warn "WARP/WireGuard tunnel detected — tc shapes '${MAIN_IF}' (default route)."
@@ -90,6 +110,7 @@ setup_tc() {
 IF="${1:-$(ip route show default 2>/dev/null | awk '/default/{print $5}' | head -1)}"
 IF="${IF:-eth0}"
 # @include lib/cloudflare-loader.sh
+# @include lib/self-ips.sh
 tc qdisc del dev "$IF" root 2>/dev/null || true
 tc qdisc add dev "$IF" root handle 1: htb default 20
 tc class add dev "$IF" parent 1: classid 1:1  htb rate 1gbit ceil 1gbit
@@ -110,8 +131,7 @@ if [ -f /etc/antiddos/cloudflare-ipv6.list ]; then
             u32 match ip6 dst "$CF6" flowid 1:10 2>/dev/null || true; H=$((H+1))
     done < /etc/antiddos/cloudflare-ipv6.list
 fi
-for SIP in $(ip -4 addr show 2>/dev/null | grep 'inet ' | \
-    grep -v '127\.' | awk '{print $2}' | cut -d/ -f1); do
+for SIP in $(list_self_ips_all 2>/dev/null | grep -v '^127\.0\.0\.1$'); do
     tc filter add dev "$IF" parent 1: protocol ip prio $H \
         u32 match ip dst "$SIP/32" flowid 1:10 2>/dev/null || true; H=$((H+1))
 done
@@ -126,7 +146,7 @@ fi
 # Re-apply live daemon throttles (BUG-022): rebuilding the qdisc must not
 # silently drop enforcement state recorded by the auto-ban daemon.
 if [ -f /etc/antiddos/throttled.list ]; then
-    while read -r TIP TPRIO TTS TBAND; do
+    while read -r TIP TPRIO _TS TBAND; do
         [ -z "$TIP" ] && continue
         TFLOW=1:30; [ "$TBAND" = "hard" ] && TFLOW=1:40
         case "$TIP" in

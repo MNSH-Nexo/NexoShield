@@ -9,11 +9,14 @@ show_thresholds() {
     printf "  %-35s ${WHITE}%s${NC}\n" "New conn rate limit:"   "${NEW_CONN_RATE:-N/A} (burst: ${NEW_CONN_BURST:-N/A})"
     printf "  %-35s ${WHITE}%s${NC}\n" "Per-IP bandwidth cap:"  "${BW_PER_IP_MBIT:-N/A} Mbps"
     printf "  %-35s ${WHITE}%s${NC}\n" "HTTP conns/non-CF IP:"  "$CONN_LIMIT_PER_IP"
-    printf "  %-35s ${WHITE}%s${NC}\n" "Auto-ban watch threshold:"   "120 active conns/IP"
-    printf "  %-35s ${WHITE}%s${NC}\n" "Auto-ban instant-ban:"       "300 active conns/IP"
-    printf "  %-35s ${WHITE}%s${NC}\n" "Auto-ban subnet watch:"      "400 total conns from /24"
-    printf "  %-35s ${WHITE}%s${NC}\n" "Auto-ban subnet ban:"        "1000 total conns from /24"
-    printf "  %-35s ${WHITE}%s${NC}\n" "Auto-ban observe:"           "45s watch before throttle"
+    # L12: daemon gates read through nx_cfg (scoring.conf wins, the
+    # historical constants are the fallback) - the old code printed
+    # the defaults even when the admin had tuned them.
+    printf "  %-35s ${WHITE}%s${NC}\n" "Auto-ban watch threshold:"   "$(nx_cfg conn_threshold 120) active conns/IP"
+    printf "  %-35s ${WHITE}%s${NC}\n" "Auto-ban instant-ban:"       "$(nx_cfg ban_conn_threshold 300) active conns/IP"
+    printf "  %-35s ${WHITE}%s${NC}\n" "Auto-ban subnet watch:"      "$(nx_cfg subnet_threshold 400) total conns from /24"
+    printf "  %-35s ${WHITE}%s${NC}\n" "Auto-ban subnet ban:"        "$(nx_cfg subnet_ban_threshold 1000) total conns from /24"
+    printf "  %-35s ${WHITE}%s${NC}\n" "Auto-ban observe:"           "$(nx_cfg observe_seconds 45)s watch before throttle"
     printf "  %-35s ${WHITE}%s${NC}\n" "Auto-ban throttle:"          "100Mbps"
     printf "  %-35s ${WHITE}%s${NC}\n" "Auto-ban duration:"          "Progressive: 30 min, doubling to 7 days"
     printf "  %-35s ${WHITE}%s${NC}\n" "Reputation scoring:"         "ON (100→0, human-vs-bot)"
@@ -47,6 +50,10 @@ valid_ip_or_cidr() {
             ""|*[!0-9]*) return 1 ;;
         esac
         [ "${#o}" -le 3 ] || return 1
+        # L10: leading zeros are octal to some parsers ("010.0.0.1"
+        # is 8.0.0.1 to the kernel), so only a lone "0" may start
+        # with zero - anything else is rejected, not reinterpreted.
+        case "$o" in 0?*) return 1 ;; esac
         (( 10#$o <= 255 )) || return 1
     done
     if [ "$slashed" = 1 ]; then
@@ -88,11 +95,26 @@ nx_ip_in_cidr() {
 # are deleted by number from `iptables -S` (nx_delete_matching) and
 # recorded tc throttle filters are removed by their prios.
 flush_autobans() {
-    nx_delete_matching INPUT '--comment "auto-ban"'
-    nx_delete_matching INPUT '--comment "subnet-ban"'
+    # F1: these calls used to pass two arguments to a three-argument
+    # helper (table missing) AND the helper was nested inside
+    # remove_rules(), so in a fresh process this aborted under set -e
+    # before deleting anything. Both are fixed: the helper is
+    # top-level now and the calls carry the table.
+    nx_delete_matching filter INPUT '--comment "auto-ban"'
+    nx_delete_matching filter INPUT '--comment "subnet-ban"'
+    nx_delete_matching6 INPUT '--comment "auto-ban"'
+    nx_delete_matching6 INPUT '--comment "subnet-ban"'
+    # H2: under the nft backend the kernel ban state lives in the
+    # ban4/ban6 sets, not in iptables rules - flush those too, or
+    # the bans persist to their timeouts (up to 7 days) while the
+    # state files below claim they were flushed.
+    if command -v nft >/dev/null 2>&1 && nft list table inet nexoshield >/dev/null 2>&1; then
+        nft flush set inet nexoshield ban4 2>/dev/null || true
+        nft flush set inet nexoshield ban6 2>/dev/null || true
+    fi
     local _iface _f _ip _prio _rest
     _iface=$(ip route show default 2>/dev/null | awk '/default/{print $5}' | head -1)
-    for _f in /tmp/autoban_throttle /etc/antiddos/throttled.list; do
+    for _f in "${THROTTLE_LIST:-/run/nexoshield/autoban_throttle}" /etc/antiddos/throttled.list; do
         [ -f "$_f" ] || continue
         while read -r _ip _prio _rest; do
             if [ -n "${_prio:-}" ] && [ -n "$_iface" ]; then
@@ -102,8 +124,9 @@ flush_autobans() {
         : > "$_f" 2>/dev/null || true
     done
     : > /etc/antiddos/banned.list 2>/dev/null || true
-    : > /tmp/autoban_watch 2>/dev/null || true
-    success "All auto-bans flushed (iptables rules + daemon state)"
+    : > "${WATCH_LIST:-/run/nexoshield/autoban_watch}" 2>/dev/null || true
+    : > "${SUBNET_WATCH_LIST:-/run/nexoshield/autoban_subnet_watch}" 2>/dev/null || true
+    success "All auto-bans flushed (iptables + ip6tables + nft + daemon state)"
 }
 
 # valid_ip6_or_cidr - IPv6 counterpart of valid_ip_or_cidr (E-5).
@@ -242,6 +265,97 @@ exempt_check() {
     return $rc
 }
 
+# nx_release_ban <ip|cidr> — release ONE ban from every layer: the
+# nft ban-set element, the tagged iptables/ip6tables DROP rules, the
+# recorded tc throttle filter, banned.list, and every fail2ban jail.
+# Returns 0 when anything was actually removed, 1 when the IP was
+# found nowhere — so callers never print "fully unblocked" for a
+# no-op (H2/H3). Shared by the menu Unban option and the
+# whitelist-add release (M2); the menu's nx_unban_ip is the same
+# logic in the menu program (it cannot call this file).
+nx_release_ban() {
+    local _ip="$1" _removed=0 _tf _prio _if _j
+    if command -v nft >/dev/null 2>&1; then
+        case "$_ip" in
+            *:*) nft delete element inet nexoshield ban6 "{ $_ip }" >/dev/null 2>&1 && _removed=1 || true ;;
+            *)   nft delete element inet nexoshield ban4 "{ $_ip }" >/dev/null 2>&1 && _removed=1 || true ;;
+        esac
+    fi
+    case "$_ip" in
+        *:*)
+            ip6tables -D INPUT -s "$_ip" -m comment --comment "auto-ban" -j DROP 2>/dev/null && _removed=1 || true ;;
+        *)
+            if iptables -D INPUT -s "$_ip" -m comment --comment "auto-ban" -j DROP 2>/dev/null; then
+                _removed=1
+            elif iptables -D INPUT -s "$_ip" -m comment --comment "subnet-ban" -j DROP 2>/dev/null; then
+                _removed=1
+            elif iptables -D INPUT -s "$_ip" -j DROP 2>/dev/null; then
+                _removed=1
+            fi ;;
+    esac
+    for _tf in "${THROTTLE_LIST:-/run/nexoshield/autoban_throttle}" /etc/antiddos/throttled.list; do
+        [ -f "$_tf" ] || continue
+        _prio=$(awk -v x="$_ip" '$1==x{print $2}' "$_tf" 2>/dev/null | head -1)
+        if [ -n "$_prio" ]; then
+            _removed=1
+            _if=$(ip route show default 2>/dev/null | awk '/default/{print $5}' | head -1)
+            [ -n "$_if" ] && tc filter del dev "$_if" parent 1: prio "$_prio" 2>/dev/null || true
+        fi
+        awk -v x="$_ip" '$1!=x' "$_tf" > "$_tf.tmp" 2>/dev/null && mv "$_tf.tmp" "$_tf"
+    done
+    if [ -f "$BANNED_LIST" ]; then
+        awk -v x="$_ip" '$1==x{found=1} END{exit !found}' "$BANNED_LIST" 2>/dev/null && _removed=1 || true
+        awk -v x="$_ip" '$1!=x' "$BANNED_LIST" > "$BANNED_LIST.tmp" 2>/dev/null && \
+            mv "$BANNED_LIST.tmp" "$BANNED_LIST"
+    fi
+    fail2ban-client status 2>/dev/null | grep "Jail list" | \
+        sed 's/.*://;s/,/\n/g' | tr -d ' ' | while read -r _j; do
+        [ -z "$_j" ] && continue
+        fail2ban-client set "$_j" unbanip "$_ip" 2>/dev/null || true
+    done
+    [ "$_removed" -eq 1 ]
+}
+
+# _wl_covered <banned-entry> <whitelist-entry> — true when whitelisting
+# the entry releases the banned entry: same value, a plain IP inside
+# a whitelist CIDR, or a banned subnet inside a wider whitelist CIDR.
+# A single whitelisted IP never lifts a subnet ban (the /24 rule
+# still drops it; whitelist the /24 itself to lift it).
+_wl_covered() {
+    local _b="$1" _e="$2"
+    [ "$_b" = "$_e" ] && return 0
+    case "$_e" in */*) : ;; *) return 1 ;; esac
+    case "$_b" in */*) _b="${_b%%/*}" ;; esac
+    case "$_b" in
+        *:*)
+            case "$_e" in *:*) nx_ip6_in_cidr "$_b" "$_e" ;; *) return 1 ;; esac ;;
+        *)
+            case "$_e" in *:* ) return 1 ;; *) nx_ip_in_cidr "$_b" "$_e" ;; esac ;;
+    esac
+}
+
+# wl_release_bans_for <entry> — when an IP/CIDR is newly whitelisted
+# (M2), release every ban it covers. A banned IP that is now exempt
+# must not stay blocked in the kernel until its timeout, and the
+# entry must join the nft exempt set so the kernel path honors it
+# immediately (the daemon skips exempt IPs, but only the kernel
+# state decides what actually gets dropped).
+wl_release_bans_for() {
+    local _entry="$1" _bip
+    # The loop reads an awk snapshot (pipe), so nx_release_ban's
+    # in-place banned.list rewrite cannot disturb the iteration.
+    while IFS= read -r _bip; do
+        [ -z "$_bip" ] && continue
+        _wl_covered "$_bip" "$_entry" && { nx_release_ban "$_bip" || true; }
+    done < <(awk '{print $1}' "$BANNED_LIST" 2>/dev/null || true)
+    if command -v nft >/dev/null 2>&1 && nft list table inet nexoshield >/dev/null 2>&1; then
+        case "$_entry" in
+            *:*) nft add element inet nexoshield exempt6 "{ $_entry }" 2>/dev/null || true ;;
+            *)   nft add element inet nexoshield exempt4 "{ $_entry }" 2>/dev/null || true ;;
+        esac
+    fi
+}
+
 # ── Whitelist manager ──────────────────────────────────────
 manage_whitelist() {
     local WL="$WHITELIST_FILE"
@@ -284,11 +398,16 @@ manage_whitelist() {
                     echo -e "  ${YELLOW}No input.${NC}"
                 elif ! valid_ip_or_cidr "$WIP" && ! valid_ip6_or_cidr "$WIP"; then
                     echo -e "  ${RED}Invalid IP/CIDR: $WIP${NC}"
-                elif grep -qF "$WIP" "$WL" 2>/dev/null; then
+                elif grep -qxF "$WIP" "$WL" 2>/dev/null; then
                     echo -e "  ${YELLOW}Already in whitelist.${NC}"
                 else
                     echo "$WIP" >> "$WL"
                     echo -e "  ${GREEN}✓ Added: $WIP${NC}"
+                    # M2: a newly exempt entry must not stay banned in
+                    # the kernel until its timeout - release every ban
+                    # it covers and join the nft exempt set first,
+                    # then re-apply the layers around the new state.
+                    wl_release_bans_for "$WIP" || true
                     # Apply to iptables + tc immediately (re-apply both)
                     apply_iptables >/dev/null 2>&1 || true
                     apply_tc_runtime "$MAIN_IF" >/dev/null 2>&1 || true
@@ -341,28 +460,36 @@ apply_tc_runtime() {
 }
 
 # CLI args
+# MED-6: action flags propagate the action's exit code instead of
+# exiting 0 regardless. F6: unknown flags error out instead of
+# silently falling through to the interactive menu.
 case "${1:-}" in
-    --install|-i)    detect_env; do_install; exit 0 ;;
-    --remove|-r)     detect_env; remove_rules; exit 0 ;;
-    --remove-force)  detect_env; CONF_R="y"; remove_rules; exit 0 ;;
-    --status|-s)     detect_env; show_status; exit 0 ;;
+    --install|-i)    detect_env; do_install; exit $? ;;
+    --remove|-r)     detect_env; remove_rules; exit $? ;;
+    --remove-force)  detect_env; CONF_R="y"; remove_rules; exit $? ;;
+    --status|-s)     detect_env; show_status; exit $? ;;
     --exempt-check)  exempt_check "${2:-}"; exit $? ;;
     --flush-autobans) flush_autobans; exit $? ;;
-    --thresholds|-t) detect_env; show_thresholds; exit 0 ;;
-    --sysctl)        detect_env; apply_sysctl_hardening; exit 0 ;;
-    --iptables)      detect_env; apply_iptables; exit 0 ;;
-    --fail2ban)      detect_env; apply_fail2ban; exit 0 ;;
-    --autoban)       detect_env; setup_autoban; exit 0 ;;
-    --whitelist|-w)  detect_env; manage_whitelist; exit 0 ;;
-    --tc)            detect_env; setup_tc; exit 0 ;;
+    --thresholds|-t) detect_env; show_thresholds; exit $? ;;
+    --sysctl)        detect_env; apply_sysctl_hardening; exit $? ;;
+    --iptables)      detect_env; apply_iptables; exit $? ;;
+    --fail2ban)      detect_env; apply_fail2ban; exit $? ;;
+    --autoban)       detect_env; setup_autoban; exit $? ;;
+    --whitelist|-w)  detect_env; manage_whitelist; exit $? ;;
+    --tc)            detect_env; setup_tc; exit $? ;;
     --auto|-y)
         detect_env
         sep
         echo -e "  ${CYAN}${BOLD}Anti-DDoS Full Install v${SCRIPT_VERSION}${NC}"; sep
         echo -e "  ${DIM}RAM: ${RAM_MB}MB | CPU: ${CPU_CORES} | Virt: ${VIRT_TYPE} | IF: ${MAIN_IF}${NC}"
         echo ""
-        apply_sysctl_hardening; apply_iptables; apply_fail2ban
-        setup_autoban; setup_tc; setup_persistence
+        _auto_rc=0
+        apply_sysctl_hardening || _auto_rc=1
+        apply_iptables || _auto_rc=1
+        apply_fail2ban || _auto_rc=1
+        setup_autoban || _auto_rc=1
+        setup_tc || _auto_rc=1
+        setup_persistence || _auto_rc=1
         cat > "$STATE_FILE" << EOF
 DATE=$(date)
 VERSION=${SCRIPT_VERSION}
@@ -373,12 +500,23 @@ HASHLIMIT=${HASHLIMIT_OK}
 MAIN_IF=${MAIN_IF}
 EOF
         sep
-        success "Anti-DDoS installation complete!"
-        exit 0 ;;
+        if [ "$_auto_rc" -eq 0 ]; then
+            success "Anti-DDoS installation complete!"
+        else
+            warn "Anti-DDoS installation finished with errors - see above."
+        fi
+        exit "$_auto_rc" ;;
+    *)  if [ -n "${1:-}" ]; then err "Unknown option: $1"; exit 2; fi ;;
 esac
 
 # Interactive menu
 detect_env
+
+# LOW-8: without a terminal the menu loop below cannot read choices.
+if ! : </dev/tty 2>/dev/null; then
+    err "Interactive menu requires a terminal (use CLI flags for scripting)."
+    exit 1
+fi
 
 while true; do
     clear; sep
@@ -417,31 +555,20 @@ while true; do
         8) setup_tc; printf '%s\n' "  Press Enter to continue..." >/dev/tty; read -r _PE </dev/tty 2>/dev/null || true ;;
         9) echo -e "  ${CYAN}Unban IP${NC}"; echo ""
            printf '%s' "  Enter IP to unban (iptables + fail2ban): " >/dev/tty; read -r UIP </dev/tty || UIP=""
-           if [ -n "$UIP" ] && ! valid_ip_or_cidr "$UIP"; then
+           if [ -n "$UIP" ] && ! valid_ip_or_cidr "$UIP" && ! valid_ip6_or_cidr "$UIP"; then
                echo -e "  ${RED}✗ Invalid IP/CIDR: $UIP${NC}"
                UIP=""
            fi
            [ -n "$UIP" ] && {
-               # Exact deletes (BUG-038): the daemon's rules carry the
-               # auto-ban/subnet-ban comments, so the old bare-spec
-               # delete never matched them; and the state edit was a
-               # substring sed - unbanning 1.2.3.4 also dropped
-               # 11.2.3.4's entry. Match field 1 exactly instead.
-               iptables -D INPUT -s "$UIP" -m comment --comment "auto-ban" -j DROP 2>/dev/null || \
-               iptables -D INPUT -s "$UIP" -m comment --comment "subnet-ban" -j DROP 2>/dev/null || \
-               iptables -D INPUT -s "$UIP" -j DROP 2>/dev/null || true
-               echo -e "  ${GREEN}✓ iptables unblocked${NC}"
-               if [ -f "$BANNED_LIST" ]; then
-                   awk -v x="$UIP" '$1!=x' "$BANNED_LIST" > "$BANNED_LIST.tmp" 2>/dev/null && \
-                       mv "$BANNED_LIST.tmp" "$BANNED_LIST"
+               # One unban path (H2/H3): nft set element, tagged
+               # iptables/ip6tables rules, throttle filter, state
+               # file and fail2ban - and an honest result: success
+               # is printed only when something was actually removed.
+               if nx_release_ban "$UIP"; then
+                   echo -e "  ${GREEN}✓ $UIP fully unblocked${NC}"
+               else
+                   echo -e "  ${YELLOW}⚠ $UIP was not found in any layer (nothing removed)${NC}"
                fi
-               fail2ban-client status 2>/dev/null | grep "Jail list" | \
-                   sed 's/.*://;s/,/\n/g' | tr -d ' ' | while read -r jail; do
-                   [ -z "$jail" ] && continue
-                   fail2ban-client set "$jail" unbanip "$UIP" 2>/dev/null && \
-                       echo -e "  ${GREEN}✓ fail2ban $jail unblocked${NC}" || true
-               done
-               echo -e "  ${GREEN}✓ $UIP fully unblocked${NC}"
            }
            printf '%s\n' "  Press Enter to continue..." >/dev/tty; read -r _PE </dev/tty 2>/dev/null || true ;;
         w|W) manage_whitelist ;;
