@@ -75,7 +75,19 @@ SC=$(score_of 7.7.7.7)
 seed 8.8.8.8 100 1000 2;  update_score 8.8.8.8 1030 0 2
 SD=$(score_of 8.8.8.8); FD=$(frac_of 8.8.8.8)
 [ "${SC:-100}" -le 90 ] && ok || bad "dt=30 at 15/s should drop >=10 (got $SC)"
-[ "${SD:-0}" -eq 100 ] && [ "${FD:-0}" -le -50 ] && ok || bad "dt=2 same rate: sub-point drop must sit in frac (score $SD frac $FD)"
+# dt is wall-clock (update_score measures now - ts, clamped): the 2s
+# seed elapses as 3s when the seed->update window straddles a second
+# boundary. Proven by direct probe: ago=2 deterministically yields
+# (100, -88) while ago=3 deterministically yields (99, -18) - the
+# exact signature of this flake (2/20 under CPU load). The
+# load-bearing facts are the drop sizes for dt in {2,3}: accept both
+# legal outcomes, like assertion 5 does for recovery (frac 20-30).
+if { [ "${SD:-0}" -eq 100 ] && [ "${FD:-0}" -le -50 ]; } || \
+   { [ "${SD:-0}" -eq 99 ] && [ "${FD:-0}" -ge -25 ] && [ "${FD:-0}" -le -10 ]; }; then
+    ok
+else
+    bad "dt=2 same rate: sub-point drop must sit in frac (score $SD frac $FD)"
+fi
 
 # ── 3) fractional accumulation: 4/s is below every v1 step (drop 0) ──
 seed 9.9.9.9 100 100 2
