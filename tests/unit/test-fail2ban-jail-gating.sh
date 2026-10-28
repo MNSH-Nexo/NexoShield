@@ -162,8 +162,19 @@ run_apply; rc=$?
 check_apply_rc "$rc"
 [ "$(jail_enabled 3proxy-ddos)" = "false" ] \
     && ok || bad "3proxy-ddos not disabled without a log file"
-[ "$(jail_enabled http-flood)" = "false" ] \
-    && ok || bad "http-flood gating regressed (no web log present)"
+# http-flood gating follows the environment (T-1): enabled iff a web
+# access log exists. The sandbox has none, but CI runner images ship
+# one (their /var/log/nginx/access.log) - an unconditional "false"
+# assertion failed in CI while the product behaved correctly, which
+# is exactly what the CI log showed (4 passed, 1 failed, only this
+# line). Assert the gate follows the environment instead.
+if [ -f /var/log/nginx/access.log ] || [ -f /var/log/apache2/access.log ]; then
+    EXPECT_HTTP="true"
+else
+    EXPECT_HTTP="false"
+fi
+[ "$(jail_enabled http-flood)" = "$EXPECT_HTTP" ] \
+    && ok || bad "http-flood gating does not follow web-log presence (want $EXPECT_HTTP)"
 # End-to-end: the generated config must pass the faithful -t. If it
 # fails on a NON-3proxy jail, that is an environment gap (syslog files
 # missing), not this regression - skip, don't fail.
