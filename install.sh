@@ -6054,6 +6054,20 @@ journalmatch = _TRANSPORT=kernel'
         info "http-flood jail disabled: no nginx/apache access log on this server"
     fi
 
+    # 2026-10-28 live finding (box 18.118.217.55): the 3proxy-ddos jail
+    # was enabled UNCONDITIONALLY while 3proxy itself was gone from the
+    # box (no binary, no /etc/3proxy, no logs), so its logpath glob
+    # matched zero files and fail2ban-client -t failed the WHOLE config
+    # ("Have not found any log file for 3proxy-ddos") - no new jails
+    # applied at all. Same class as T-1, which gated http-flood but left
+    # this jail ungated. Gate it exactly like http-flood: an enabled
+    # jail must never point at zero files.
+    local PROXY_ENABLED="true"
+    if ! ls /var/log/3proxy/access.log.* >/dev/null 2>&1; then
+        PROXY_ENABLED="false"
+        info "3proxy-ddos jail disabled: no 3proxy access log (proxy not installed or not logging yet)"
+    fi
+
     cat > "$F2B_JAIL_DIR/antiddos.conf" << EOF
 # Anti-DDoS fail2ban jails — generated $(date)
 # CF IPs are ignored via ignoreip (no false bans)
@@ -6063,7 +6077,7 @@ journalmatch = _TRANSPORT=kernel'
 ignoreip = ${_F2B_IGNORE}
 
 [3proxy-ddos]
-enabled   = true
+enabled   = ${PROXY_ENABLED}
 filter    = 3proxy-ddos
 # 3proxy rotates daily: the live file is access.log.YYYY.MM.DD (T-2).
 logpath   = /var/log/3proxy/access.log.*
